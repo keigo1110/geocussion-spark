@@ -1,0 +1,233 @@
+version: "1.0"
+meta:
+  project: "Geocussion-SP リアルタイム処理パイプライン"
+  author: "AI assistant"
+  created: "2025-06-19"
+  description: "深度カメラ入力から音響生成までを 40 ms 以内で実行するリアルタイム処理パイプラインの実装計画。Open3D ビューワはデバッグ用途として維持し、全フェーズの可視化をサポートする。"
+  frame_budget_ms: 40  # 1 フレームあたりの目標最大処理時間
+
+# ライブラリ／外部依存
+requirements:
+  python: ">=3.10"
+  pip:
+    - pyorbbecsdk  # センサ入力
+    - open3d
+    - mediapipe
+    - opencv-python
+    - numpy
+    - scipy        # Delaunay 分割等
+    - shapely      # ジオメトリ判定補助
+    - pyo          # 音響生成（代替: pyopenal, pygame.mixer 等）
+
+# 共通開発指針
+conventions:
+  - "PEP8 + isort + black 準拠"
+  - "型ヒント必須 (mypy strict)"
+  - "処理ごとに src/<phase>/ ディレクトリを作成"
+  - "パフォーマンス計測は time.perf_counter() ベースの簡易プロファイルデコレータを使用"
+  - "全フェーズで numpy 配列を共有しゼロコピー転送を優先"
+  - "Open3D ビューワは常時オン／オフ可能なデバッグパネルとして維持"
+
+# マイルストーン定義
+milestones:
+  - id: input
+    title: "入力フェーズ"
+    budget_ms: 5
+    description: |
+      深度および RGB フレームをカメラから取得し、ノイズ除去後に点群へ変換する。
+    deliverables:
+      - src/input/stream.py           # Orbbec カメラ抽象化クラス
+      - src/input/depth_filter.py     # ノイズフィルタ (median / bilateral / temporal)
+      - src/input/pointcloud.py       # depth_to_pointcloud 関数のリファクタリング
+      - tests/input_test.py
+    tasks:
+      - id: refactor_pipeline
+        desc: "point_cloud_realtime_viewer.py からフレーム取得処理と点群変換処理を切り出し、再利用可能なクラスに分離する"
+      - id: depth_noise_filter
+        desc: "バイラテラル + temporal 平滑化を実装し、残像低減・エッジ保持を評価する"
+      - id: pointcloud_conversion
+        desc: "既存 depth_to_pointcloud 関数を numpy 入力/出力に全面対応させる"
+
+  - id: detection
+    title: "手検出フェーズ"
+    budget_ms: 10
+    description: |
+      MediaPipe による 2D 手検出 → 深度マップ参照による 3D 座標化 → カルマンフィルタによる平滑化＆速度推定。
+    depends_on: [input]
+    deliverables:
+      - src/detection/hands2d.py      # MediaPipeHands ラッパ
+      - src/detection/hands3d.py      # 3D 投影ユーティリティ
+      - src/detection/tracker.py      # カルマンベースのハンドトラッカ
+      - tests/detection_test.py
+    tasks:
+      - id: mediapipe_wrapper
+        desc: "GPU オプションと batch 処理に対応した MediaPipe Hands ラッパを実装"
+      - id: project_to_3d
+        desc: "2D 手ランドマークを深度バッファ経由で 3D 点へマッピング"
+      - id: kalman_filter
+        desc: "3D 手位置と速度を推定するカルマンフィルタを実装"
+
+  - id: mesh
+    title: "地形メッシュ生成フェーズ"
+    budget_ms: 15
+    description: |
+      点群を 2D 投影し Delaunay 三角形分割で地形メッシュを構築。簡略化後に法線・曲率・勾配を計算し、空間インデックスを生成する。
+    depends_on: [input]
+    deliverables:
+      - src/mesh/projection.py        # XY 平面への 2D 投影
+      - src/mesh/delaunay.py          # scipy.spatial.Delaunay ラッパ
+      - src/mesh/simplify.py          # Open3D simplification API 使用
+      - src/mesh/attributes.py        # 法線／曲率／勾配計算
+      - src/mesh/index.py             # BVH or KDTree 構築
+      - tests/mesh_test.py
+    tasks:
+      - id: project_pointcloud
+        desc: "点群を XY 平面へ射影し密度マップを生成 (height map)"
+      - id: delaunay_triangulation
+        desc: "密度マップから等高線を抽出し Delaunay 分割で三角形メッシュを生成"
+      - id: mesh_simplification
+        desc: "Open3D を用いたメッシュ簡略化 (Quadric Error Simplification)"
+      - id: compute_attributes
+        desc: "各頂点/面の法線・曲率・勾配を計算しメッシュへ付与"
+      - id: spatial_index
+        desc: "バウンディングボリューム階層 (BVH) で高速検索を実装"
+
+  - id: collision
+    title: "衝突検出フェーズ"
+    budget_ms: 5
+    description: |
+      カーソル（球体モデル化された手）と地形メッシュの球-三角形衝突判定を行い、接触点情報を生成する。
+    depends_on: [detection, mesh]
+    deliverables:
+      - src/collision/search.py       # 空間検索 (BVH 利用)
+      - src/collision/sphere_tri.py   # 球-三角形判定 & 接触点計算
+      - src/collision/events.py       # 衝突イベント生成 & キューイング
+      - tests/collision_test.py
+    tasks:
+      - id: kd_bvh_query
+        desc: "mesh.index.BVH を使用し近傍三角形を効率的に探索"
+      - id: sphere_triangle_test
+        desc: "球-三角形の最短距離と接触点を計算し衝突判定"
+      - id: contact_event
+        desc: "衝突強度・速度・面属性をイベントにエンコード"
+
+  - id: sound
+    title: "音響生成フェーズ"
+    budget_ms: 5
+    description: |
+      衝突イベントを基に楽器・音高・音量を決定し、ボイス割当と空間配置を行うリアルタイム音響合成。
+    depends_on: [collision]
+    deliverables:
+      - src/sound/synth.py            # pyo を使用した物理モデリング or サンプラー
+      - src/sound/mapping.py          # 属性→音高/音量/楽器マッピング
+      - src/sound/voice_mgr.py        # ボイス管理とステレオ配置
+      - tests/sound_test.py
+    tasks:
+      - id: instrument_pool
+        desc: "複数楽器プリセット (マリンバ, シンセパッド 等) を定義"
+      - id: pitch_mapping
+        desc: "Y 座標→MIDI ノート番号変換 + スケール制約"
+      - id: volume_calc
+        desc: "衝突速度→dB 変換し log スケールで音量設定"
+      - id: voice_allocation
+        desc: "ポリフォニー上限とボイススティール戦略を実装"
+      - id: spatialization
+        desc: "X 座標に応じたパンニング (等電圧) を適用"
+
+# デバッグ & 可視化
+debug:
+  open3d_viewer:
+    description: |
+      既存の Open3D ビューワをデバッグモードで維持。下記レイヤをトグル表示可能にする：
+        - 点群 (Input)
+        - 手 3D 位置 (Detection)
+        - メッシュ (Mesh)
+        - 接触点 (Collision)
+    file: src/debug/viewer.py
+  perf_logger:
+    description: "各フェーズの処理時間を rolling 平均で表示 (terminal + log)"
+    file: src/debug/profiler.py
+
+'timeline':
+  - week: 1
+    focus: [input]
+  - week: 2
+    focus: [detection]
+  - week: 3
+    focus: [mesh]
+  - week: 4
+    focus: [collision]
+  - week: 5
+    focus: [sound]
+  - week: 6
+    focus: [integration, performance_tuning]
+
+# 完了基準
+acceptance_criteria:
+  - "各フェーズ単体テストが pass する"
+  - "End-to-end デモが 25–30 fps で動作"
+  - "Open3D デバッグビューワで全レイヤが正しく表示"
+  - "音響遅延 < 50 ms でグリッチ無し"
+
+flowchart LR
+    %% 入力フェーズ
+    subgraph Input[入力 ~5ms]
+        D1[深度画像取得]
+        D2[ノイズフィルタ]
+        D3[点群変換]
+        
+        R1[RGB画像取得]
+        R2[前処理]
+        
+        D1 --> D2 --> D3
+        R1 --> R2
+    end
+
+    %% 手検出フェーズ
+    subgraph Detection[手検出 ~10ms]
+        H1[2D手検出<br/>MediaPipe]
+        H2[3D投影]
+        H3[Kalmanフィルタ]
+        H4[速度計算]
+        
+        H1 --> H2 --> H3 --> H4
+    end
+
+    %% 地形メッシュ生成フェーズ
+    subgraph Mesh[地形メッシュ生成 ~15ms]
+        M1[2D投影]
+        M2[Delaunay三角形分割]
+        M3[簡略化]
+        M4[属性計算<br/>法線/曲率/勾配]
+        M5[空間インデックス構築]
+        
+        M1 --> M2 --> M3 --> M4 --> M5
+    end
+
+    %% 衝突検出フェーズ
+    subgraph Collision[衝突検出 ~5ms]
+        C1[空間検索]
+        C2[球-三角形判定]
+        C3[接触点計算]
+        C4[イベント生成]
+        
+        C1 --> C2 --> C3 --> C4
+    end
+
+    %% 音響生成フェーズ
+    subgraph Sound[音響生成 ~5ms]
+        S1[楽器選択]
+        S2[音高マッピング]
+        S3[音量計算]
+        S4[ボイス割当]
+        S5[空間配置]
+        
+        S1 --> S2 --> S3 --> S4 --> S5
+    end
+
+    %% フロー接続
+    Input --> Detection
+    Input --> Mesh
+    Detection --> Collision
+    Mesh --> Collision
+    Collision --> Sound
