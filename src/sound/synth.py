@@ -83,8 +83,7 @@ class AudioSynthesizer:
         self.active_voices: Dict[str, Dict] = {}  # voice_id -> voice_data
         
         # エフェクト
-        self.reverb: Optional[pyo.Freeverb] = None
-        self.master_mix: Optional[pyo.Mixer] = None
+        self.reverb: Optional[Callable[[Any], pyo.Freeverb]] = None
         
         # パフォーマンス統計
         self.stats = {
@@ -125,9 +124,9 @@ class AudioSynthesizer:
                 audio=self.config.audio_driver
             )
             
-            # サーバー開始
-            self.server.start()
+            # サーバー起動順序修正: boot() -> start()
             self.server.boot()
+            self.server.start()
             
             # 楽器とエフェクトの初期化
             self._initialize_instruments()
@@ -238,8 +237,8 @@ class AudioSynthesizer:
     def update_master_volume(self, volume: float):
         """マスターボリューム更新"""
         self.config.master_volume = max(0.0, min(1.0, volume))
-        if self.master_mix:
-            self.master_mix.setAmp(self.config.master_volume)
+        if self.server:
+            self.server.setAmp(self.config.master_volume)
     
     def _initialize_instruments(self):
         """楽器を初期化"""
@@ -256,26 +255,16 @@ class AudioSynthesizer:
             return
         
         try:
-            # リバーブエフェクト
-            self.reverb = pyo.Freeverb(
-                input=None,  # 後で設定
+            # リバーブエフェクト (後で入力を渡すファクトリとして保持)
+            self.reverb = lambda inp: pyo.Freeverb(
+                inp,
                 size=0.8,
                 damp=0.6,
                 bal=self.config.reverb_level
             )
             
-            # マスターミキサー
-            self.master_mix = pyo.Mixer(
-                outs=self.config.channels,
-                chnls=self.config.max_polyphony,
-                time=0.025
-            )
-            
-            # マスターボリューム設定
-            self.master_mix.setAmp(self.config.master_volume)
-            
-            # 出力に接続
-            self.master_mix.out()
+            # サーバーのマスターボリュームを設定
+            self.server.setAmp(self.config.master_volume)
             
         except Exception as e:
             print(f"Error initializing effects: {e}")
