@@ -173,7 +173,7 @@ class DualViewer:
                 print("Initializing 3D projector...")
                 self.projector_3d = Hand3DProjector(
                     camera_intrinsics=self.camera.depth_intrinsics,
-                    interpolation_method=DepthInterpolationMethod.LINEAR,
+                    interpolation_method=DepthInterpolationMethod.NEAREST,
                     min_confidence_3d=0.3
                 )
             else:

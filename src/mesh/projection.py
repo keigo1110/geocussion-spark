@@ -187,21 +187,39 @@ class PointCloudProjector:
         # 出力配列初期化
         height_map = np.full((grid_height, grid_width), np.nan, dtype=np.float32)
         density_map = np.zeros((grid_height, grid_width), dtype=np.int32)
-        
-        # グリッドセルごとの点をグループ化
+
+        # ------------------------------------------------------------------
+        # ベクトル化による密度マップ計算 (Python ループ → NumPy へ)
+        # ------------------------------------------------------------------
+        # セルごとの点数を高速に集計
+        np.add.at(density_map, (grid_y, grid_x), 1)
+
+        # 投影方式が DENSITY の場合は高度値も密度をそのまま使用
+        if self.method == ProjectionMethod.DENSITY:
+            height_map[density_map > 0] = density_map[density_map > 0]
+            valid_mask = density_map > 0
+            return height_map, density_map, valid_mask
+
+        # 高度統計用にセルインデックスを作成
         coords = grid_y * grid_width + grid_x
-        unique_coords, inverse_indices = np.unique(coords, return_inverse=True)
-        
+        sort_idx = np.argsort(coords)
+        coords_sorted = coords[sort_idx]
+        heights_sorted = heights[sort_idx]
+
+        # 連続区間を検出してセル単位で統計量を算出
+        unique_coords, start_indices = np.unique(coords_sorted, return_index=True)
+
         for i, coord in enumerate(unique_coords):
-            mask = inverse_indices == i
-            cell_heights = heights[mask]
-            
+            start = start_indices[i]
+            end = start_indices[i + 1] if i + 1 < len(start_indices) else len(coords_sorted)
+            cell_heights = heights_sorted[start:end]
+
             if len(cell_heights) < self.min_points_per_cell:
                 continue
-                
+
             row = coord // grid_width
             col = coord % grid_width
-            
+
             # 投影方式に応じて高度計算
             if self.method == ProjectionMethod.MIN_HEIGHT:
                 height_value = np.min(cell_heights)
@@ -211,11 +229,10 @@ class PointCloudProjector:
                 height_value = np.mean(cell_heights)
             elif self.method == ProjectionMethod.MEDIAN_HEIGHT:
                 height_value = np.median(cell_heights)
-            else:  # DENSITY
-                height_value = len(cell_heights)
-            
+            else:
+                height_value = np.mean(cell_heights)
+
             height_map[row, col] = height_value
-            density_map[row, col] = len(cell_heights)
         
         valid_mask = ~np.isnan(height_map)
         return height_map, density_map, valid_mask

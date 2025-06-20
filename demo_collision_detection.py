@@ -124,6 +124,7 @@ class FullPipelineViewer(DualViewer):
         # 状態管理
         self.current_mesh = None
         self.current_collision_points = []
+        self.current_tracked_hands = []  # 直近フレームのトラッキング結果
         self.frame_counter = 0
         self.last_mesh_update = 0
         
@@ -280,7 +281,7 @@ class FullPipelineViewer(DualViewer):
         pipeline_start = time.perf_counter()
         
         # 既存の手検出処理
-        hands_2d, hands_3d = self.process_hands(color_image, depth_image)
+        hands_2d, hands_3d, tracked_hands = self._process_hands_internal(color_image, depth_image)
         
         # フレームカウンタ更新
         self.frame_counter += 1
@@ -305,11 +306,11 @@ class FullPipelineViewer(DualViewer):
         collision_events = []
         if (self.enable_collision_detection and 
             self.current_mesh is not None and 
-            hands_3d and len(hands_3d) > 0):
+            tracked_hands and len(tracked_hands) > 0):
             
             collision_start = time.perf_counter()
             try:
-                collision_events = self._detect_collisions(hands_3d)
+                collision_events = self._detect_collisions(tracked_hands)
             except Exception as e:
                 print(f"衝突検出エラー: {e}")
             
@@ -342,7 +343,48 @@ class FullPipelineViewer(DualViewer):
         # パフォーマンス情報をRGB画像に描画
         self._draw_performance_info(color_image, collision_events)
         
+        # 可視化用に保持
+        self.current_tracked_hands = tracked_hands
+        self.current_hands_3d = hands_3d
         return hands_2d, hands_3d, collision_events
+    
+    def _process_hands_internal(self, color_image, depth_image):
+        """RGB/Depth から 2D→3D→トラッキングまでを実行し結果を返す。
+
+        DualViewer 本体ではフレーム取得と同時に検出処理を行うが、本クラスでは
+        update_frame() から直接 RGB / Depth 行列を受け取る設計なので、必要最小限
+        の処理をここで再実装する。"""
+
+        hands_2d, hands_3d, tracked_hands = [], [], []
+
+        if (not self.enable_hand_detection) or (self.hands_2d is None):
+            return hands_2d, hands_3d, tracked_hands
+
+        try:
+            # 2D 手検出 (MediaPipe は BGR 入力)
+            bgr_image = cv2.cvtColor(color_image, cv2.COLOR_RGB2BGR)
+            hands_2d = self.hands_2d.detect_hands(bgr_image)
+
+            # 2D 検出信頼度でフィルタ
+            from src.detection.hands2d import filter_hands_by_confidence
+            hands_2d = filter_hands_by_confidence(hands_2d, min_confidence=self.min_detection_confidence)
+
+            # 3D 投影
+            if hands_2d and self.projector_3d is not None:
+                hands_3d = self.projector_3d.project_hands_batch(hands_2d, depth_image)
+
+            # カルマンフィルタトラッキング
+            if hands_3d and self.enable_tracking and self.tracker is not None:
+                from src.detection.tracker import filter_stable_hands
+                tracked_hands = self.tracker.update(hands_3d)
+                tracked_hands = filter_stable_hands(tracked_hands, min_confidence=0.7)
+
+        except Exception as e:
+            print(f"_process_hands_internal error: {e}")
+
+        # 可視化用に保持
+        self.current_tracked_hands = tracked_hands
+        return hands_2d, hands_3d, tracked_hands
     
     def _update_terrain_mesh(self, points_3d):
         """地形メッシュを更新"""
@@ -386,25 +428,24 @@ class FullPipelineViewer(DualViewer):
             import traceback
             traceback.print_exc()
     
-    def _detect_collisions(self, hands_3d):
+    def _detect_collisions(self, tracked_hands):
         """衝突検出を実行"""
         if (self.collision_searcher is None or 
             self.collision_tester is None or 
-            not hands_3d):
+            not tracked_hands):
             return []
         
         collision_events = []
         self.current_collision_points = []
         
-        for i, hand_pos in enumerate(hands_3d):
-            if hand_pos is None:
+        for i, tracked in enumerate(tracked_hands):
+            hand_pos = tracked.position
+            if hand_pos is None or len(hand_pos) != 3:
                 continue
             
             try:
-                # 1. 空間検索
-                search_result = self.collision_searcher._search_point(
-                    hand_pos, self.sphere_radius
-                )
+                # 1. 空間検索 (公開API使用)
+                search_result = self.collision_searcher.search_near_hand(tracked, override_radius=self.sphere_radius)
                 
                 if len(search_result.triangle_indices) == 0:
                     continue
@@ -416,9 +457,11 @@ class FullPipelineViewer(DualViewer):
                 
                 if collision_info.has_collision:
                     # 3. イベント生成
-                    hand_velocity = np.array([0.01, 0.0, 0.0])  # ダミー速度
                     event = self.event_queue.create_event(
-                        collision_info, f"hand_{i}", hand_pos, hand_velocity
+                        collision_info,
+                        tracked.id,
+                        hand_pos,
+                        tracked.velocity.copy() if hasattr(tracked, 'velocity') else None
                     )
                     
                     if event:
@@ -430,11 +473,11 @@ class FullPipelineViewer(DualViewer):
                                 'position': contact.position,
                                 'normal': contact.normal,
                                 'depth': contact.depth,
-                                'hand_id': f"hand_{i}"
+                                'hand_id': tracked.id
                             })
             
             except Exception as e:
-                print(f"手{i}の衝突検出でエラー: {e}")
+                print(f"Hand {tracked.id[:8]} collision error: {e}")
         
         return collision_events
     
@@ -509,13 +552,13 @@ class FullPipelineViewer(DualViewer):
                 self.collision_geometries.extend([contact_sphere, normal_line])
             
             # 衝突球を可視化（手の位置）
-            if hasattr(self, 'tracked_hands') and self.tracked_hands:
-                for hand_id, hand_data in self.tracked_hands.items():
-                    if hand_data['position_3d'] is not None:
+            if self.current_tracked_hands:
+                for tracked in self.current_tracked_hands:
+                    if tracked.position is not None:
                         hand_sphere = o3d.geometry.TriangleMesh.create_sphere(
                             radius=self.sphere_radius
                         )
-                        hand_sphere.translate(hand_data['position_3d'])
+                        hand_sphere.translate(tracked.position)
                         hand_sphere.paint_uniform_color([0.0, 1.0, 0.0])  # 緑色（半透明）
                         
                         # ワイヤーフレーム表示
