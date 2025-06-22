@@ -839,12 +839,12 @@ class FullPipelineViewer(DualViewer):
                 # 衝突イベントを音響パラメータにマッピング
                 audio_params = self.audio_mapper.map_collision_event(event)
                 
-                # 空間位置設定
+                # 空間位置設定（numpy.float64 → Python float変換）
                 spatial_position = np.array([
-                    event.contact_position[0],
+                    float(event.contact_position[0]),
                     0.0,
-                    event.contact_position[2]
-                ])
+                    float(event.contact_position[2])
+                ], dtype=float)
                 
                 # 音響再生
                 voice_id = allocate_and_play(

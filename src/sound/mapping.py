@@ -184,22 +184,22 @@ class AudioMapper:
             self._update_adaptive_params(event)
         
         audio_params = AudioParameters(
-            pitch=pitch,
-            velocity=velocity,
-            duration=duration,
+            pitch=float(pitch),
+            velocity=float(velocity),
+            duration=float(duration),
             instrument=instrument,
-            timbre=timbre,
-            brightness=brightness,
-            pan=pan,
-            distance=distance,
-            reverb=reverb,
-            attack=attack,
-            decay=decay,
-            sustain=sustain,
-            release=release,
+            timbre=float(timbre),
+            brightness=float(brightness),
+            pan=float(pan),
+            distance=float(distance),
+            reverb=float(reverb),
+            attack=float(attack),
+            decay=float(decay),
+            sustain=float(sustain),
+            release=float(release),
             event_id=event.event_id,
             hand_id=event.hand_id,
-            timestamp=event.timestamp
+            timestamp=float(event.timestamp)
         )
         
         # パフォーマンス統計更新
@@ -347,7 +347,7 @@ class AudioMapper:
     def _map_pan(self, event: CollisionEvent) -> float:
         """X座標をステレオパンニングにマッピング"""
         x_min, x_max = self.adaptive_params['x_range']
-        x_pos = event.contact_position[0]
+        x_pos = float(event.contact_position[0])  # numpy.float64 → float変換
         
         if x_max > x_min:
             normalized_x = (x_pos - x_min) / (x_max - x_min)
@@ -356,7 +356,7 @@ class AudioMapper:
         
         # -1.0（左）～ 1.0（右）にマッピング
         pan = (normalized_x - 0.5) * 2.0
-        return max(-1.0, min(1.0, pan))
+        return float(max(-1.0, min(1.0, pan)))  # 確実にPython floatで返す
     
     def _map_distance(self, event: CollisionEvent) -> float:
         """距離感をマッピング"""

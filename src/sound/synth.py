@@ -348,31 +348,31 @@ class AudioSynthesizer:
         try:
             instrument_template = self.instruments[params.instrument]
             
-            # 基本周波数
-            freq = params.frequency
+            # 基本周波数（型変換確実に）
+            freq = float(params.frequency)
             
-            # エンベロープ
+            # エンベロープ（型変換確実に）
             envelope = pyo.Adsr(
-                attack=params.attack,
-                decay=params.decay,
-                sustain=params.sustain,
-                release=params.release,
-                dur=params.duration
+                attack=float(params.attack),
+                decay=float(params.decay),
+                sustain=float(params.sustain),
+                release=float(params.release),
+                dur=float(params.duration)
             )
             
             # 楽器に応じたオシレーター生成
             oscillator = self._create_oscillator(params, instrument_template, freq)
             
-            # 音量適用
-            voice = oscillator * envelope * params.velocity
+            # 音量適用（型変換確実に）
+            voice = oscillator * envelope * float(params.velocity)
             
-            # パンニング適用
+            # パンニング適用（型変換を確実に）
             if self.enable_spatial_audio and self.config.channels == 2:
-                voice = pyo.Pan(voice, outs=2, pan=params.pan)
+                voice = pyo.Pan(voice, outs=2, pan=float(params.pan))
             
-            # エフェクト適用
+            # エフェクト適用（型変換確実に）
             if self.enable_effects and self.reverb:
-                reverb_send = voice * params.reverb
+                reverb_send = voice * float(params.reverb)
                 reverb_out = self.reverb(reverb_send)
                 voice = voice + reverb_out
             

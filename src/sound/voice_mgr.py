@@ -201,7 +201,7 @@ class VoiceManager:
                     start_time=time.perf_counter(),
                     state=VoiceState.ATTACK,
                     priority=priority,
-                    spatial_position=spatial_position or np.array([0.0, 0.0, 0.0]),
+                    spatial_position=spatial_position if spatial_position is not None else np.array([0.0, 0.0, 0.0]),
                     current_volume=audio_params.velocity,
                     current_pan=audio_params.pan,
                     current_reverb=audio_params.reverb
@@ -226,7 +226,9 @@ class VoiceManager:
                 return voice_id
                 
             except Exception as e:
+                import traceback
                 print(f"Error allocating voice: {e}")
+                print(f"Traceback: {traceback.format_exc()}")
                 return None
     
     def deallocate_voice(self, voice_id: str, fade_out: bool = True):
@@ -395,8 +397,9 @@ class VoiceManager:
         Returns:
             空間処理が適用された音響パラメータ
         """
-        # パラメータをコピー
-        processed_params = audio_params
+        # パラメータを深いコピー
+        from copy import deepcopy
+        processed_params = deepcopy(audio_params)
         
         if self.spatial_config.mode == SpatialMode.STEREO_PAN:
             # ステレオパンニング
