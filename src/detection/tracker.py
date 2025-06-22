@@ -236,7 +236,7 @@ class Hand3DTracker:
         Returns:
             {track_id: detection_index or None}
         """
-        if not hands_3d or not self.tracked_hands:
+        if not hands_3d:
             return {}
         
         # アクティブなトラックのリスト
@@ -246,6 +246,8 @@ class Hand3DTracker:
         ]
         
         if not active_tracks:
+            # 初回検出時はアクティブトラックが存在しないため、空の辞書を返す
+            # この後_create_new_tracksで新しいトラックが作成される
             return {}
         
         # コスト行列作成
@@ -270,8 +272,17 @@ class Hand3DTracker:
                 if distance <= self.max_assignment_distance:
                     cost_matrix[i, j] = total_cost
         
+        # 全ての要素がinfの場合は空の辞書を返す
+        if np.all(cost_matrix == np.inf):
+            return {track_id: None for track_id, _ in active_tracks}
+        
         # ハンガリアンアルゴリズムで最適割り当て
-        row_indices, col_indices = linear_sum_assignment(cost_matrix)
+        try:
+            row_indices, col_indices = linear_sum_assignment(cost_matrix)
+        except ValueError as e:
+            # cost matrixに問題がある場合は全てをNoneに設定
+            print(f"Assignment algorithm failed: {e}, resetting assignments")
+            return {track_id: None for track_id, _ in active_tracks}
         
         assignments = {}
         used_detections = set()

@@ -105,7 +105,7 @@ class FullPipelineViewer(DualViewer):
         self.enable_collision_detection = kwargs.pop('enable_collision_detection', True)
         self.enable_collision_visualization = kwargs.pop('enable_collision_visualization', True)
         self.sphere_radius = kwargs.pop('sphere_radius', 0.05)  # 5cm
-        self.mesh_update_interval = kwargs.pop('mesh_update_interval', 30)  # 30フレーム毎
+        self.mesh_update_interval = kwargs.pop('mesh_update_interval', 5)  # 5フレーム毎に短縮（テスト用）
         
         # 音響生成関連の設定を追加
         self.enable_audio_synthesis = kwargs.pop('enable_audio_synthesis', False)
@@ -152,7 +152,7 @@ class FullPipelineViewer(DualViewer):
         self.current_collision_points = []
         self.current_tracked_hands = []  # 直近フレームのトラッキング結果
         self.frame_counter = 0
-        self.last_mesh_update = 0
+        self.last_mesh_update = -999  # 初回メッシュ生成を確実にするため負の値で初期化
         
         # メッシュとコリジョンの可視化オブジェクト
         self.mesh_geometries = []

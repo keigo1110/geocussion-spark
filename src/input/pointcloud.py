@@ -51,7 +51,7 @@ class PointCloudConverter:
         
         # カメラ座標系への変換係数を事前計算
         self.x_coeff = (self.pixel_x - self.depth_intrinsics.cx) / self.depth_intrinsics.fx
-        self.y_coeff = (self.pixel_y - self.depth_intrinsics.cy) / self.depth_intrinsics.fy
+        self.y_coeff = -(self.pixel_y - self.depth_intrinsics.cy) / self.depth_intrinsics.fy  # 手の3D投影と座標系統一
     
     def depth_to_pointcloud(
         self,
@@ -191,7 +191,7 @@ class PointCloudConverter:
         
         # 3D座標計算
         x = self.x_coeff * z
-        y = self.y_coeff * z
+        y = self.y_coeff * z  # 既にy_coeffでマイナス符号適用済み
         
         # 点群作成
         points = np.column_stack([
