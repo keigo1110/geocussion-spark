@@ -285,6 +285,10 @@ final_status:
     
     ✅ 重要発見: MediaPipeは深度画像では手検出できません！
     カラーフレーム必須の修正により、デュアルビューワーとの一貫性が確保されました。
+    
+    🚨 新たな重要問題発見: 座標系の不整合により衝突検出が機能しない
+    メッシュZ範囲[0.704-1.609]と手Z位置[0.56-0.74]がほとんど重複せず、
+    空間検索で三角形が見つからない根本原因が判明しました。
   
   completed_fixes:
     - "P-DETECTION-003: NaN座標の適切な処理を実装 (src/detection/hands3d.py)"
@@ -296,49 +300,91 @@ final_status:
     - "enable_hand_tracking属性の追加"
     - "🎯 MediaPipe手検出: カラーフレーム必須の修正（深度画像では検出不可）"
     - "手検出信頼度: 0.7 → 0.1 に調整してテスト感度向上"
+    - "✅ 点群→メッシュ生成タイミング同期問題: 修正完了"
+    - "✅ CollisionSearcherメソッド名修正: search_near_point → search_near_hand"
+    - "✅ メッシュ生成成功: 7000+三角形の地形メッシュ生成を確認"
+  
+  newly_discovered_critical_issue:
+    title: "P-COORDINATES-001: 座標系不整合による衝突検出失敗"
+    status: "🔴 CRITICAL - 衝突音が鳴らない根本原因"
+    description: |
+      詳細デバッグにより座標系の重大な不整合を発見:
+      
+      🔍 実測データ:
+      - メッシュ頂点範囲: X[-0.733,1.627] Y[-0.934,0.666] Z[0.704,1.609]
+      - 手検出位置範囲: X[0.35,0.37] Y[-0.25,-0.21] Z[0.56,0.74]
+      
+      ❌ 問題: Z軸方向で手(56-74cm)とメッシュ(70-160cm)がほぼ重複しない
+      → 空間検索で三角形が0個発見される
+      → 衝突検出が不可能
+      
+      🎯 原因分析の必要箇所:
+      1. 手の3D投影座標変換の正確性
+      2. 点群→メッシュ座標変換の整合性  
+      3. カメラ座標系とワールド座標系の統一
+      4. 深度値解釈の一貫性
+    
+    immediate_action_required: |
+      P-COLLISION-001の距離計算修正より優先して、
+      この座標系不整合を解決する必要があります。
+      
+      修正候補:
+      - 手の3D投影時のZ座標計算見直し
+      - メッシュ生成時の座標オフセット調整
+      - 座標系統一のための変換行列追加
   
   current_pipeline_status:
     camera_initialization: "✅ 正常（Color: 1280x720@30fps, Depth対応）"
     hand_detection_2d: "✅ 正常（カラーフレーム利用、信頼度10%）"
-    hand_projection_3d: "✅ 正常（NaN処理含む）"
+    hand_projection_3d: "🟡 動作中（座標系要調査）"
     hand_tracking: "✅ 正常"
-    mesh_generation: "✅ 正常"
-    collision_detection: "✅ 正常"
-    audio_synthesis: "✅ 正常（--no-audioでテスト済み）"
+    mesh_generation: "✅ 正常（7000+三角形生成）"
+    collision_detection: "🔴 座標系不整合により0衝突"
+    audio_synthesis: "✅ 待機中（衝突イベント待ち）"
   
   verification:
     import_test: "✅ 全モジュールのインポート成功"
     demo_startup: "✅ 正常起動、ビューワー表示"
-    hand_detection_ready: "✅ カラーフレーム待機→検出準備完了"
-    environment_setup: "✅ run_demo.sh スクリプト作成"
+    hand_detection_ready: "✅ カラーフレーム→手検出→3D投影→トラッキング"
+    mesh_generation_verified: "✅ 36万点→7千三角形メッシュ生成"
+    spatial_search_functional: "✅ BVH構築成功、API動作"
+    coordinate_mismatch_identified: "🔴 手とメッシュのZ座標不整合を確認"
   
-  ready_for_testing:
-    description: "カメラの前で手を動かして完全なパイプラインテストが可能"
-    expected_flow: |
-      1. 手をカメラ前に出す → 2D検出（1+ raw）
-      2. 3D投影 → 3D projection successful
-      3. トラッキング → 1+ tracked hands
-      4. メッシュ生成 → UPDATING TERRAIN MESH
-      5. 衝突検出 → CHECKING COLLISIONS
-      6. 音響生成 → GENERATING AUDIO（音有りモード時）
+  ready_for_debugging:
+    description: "座標系不整合の根本修正が最優先課題"
+    debug_focus: |
+      1. 手の3D投影における深度→Z座標変換の検証
+      2. 点群データからメッシュへの座標保持確認  
+      3. 統一座標系での手とメッシュ位置整合
+      4. 修正後の衝突検出テスト
   
   next_steps:
-    - "✅ カメラの前で手を動かして衝突音響システムのテスト"
-    - "必要に応じてP-MESH-001, P-COLLISION-001の最適化実装"
-    - "音響出力のより詳細なテスト（--no-audioフラグを外す）"
+    priority_1: "✅ 座標系診断ログによる問題特定完了"
+    priority_2: "🔄 手3D投影のZ座標計算式検証・修正"
+    priority_3: "🔄 メッシュ生成時の座標変換統一"
+    priority_4: "最終テスト：手地形接触→衝突音生成"
   
   technical_notes:
-    mediapipe_discovery: |
-      重要な発見: MediaPipeは深度画像（グレースケール）では手を検出できません。
-      カラーフレームが必須です。これが「デュアルビューワーでは手が検出されるが
-      コリジョンデモでは検出されない」問題の根本原因でした。
+    coordinate_discovery: |
+      重要な発見: デバッグログにより座標系不整合が判明
+      手Z[0.56-0.74m] vs メッシュZ[0.704-1.609m]
+      → わずか3cmの重複により衝突検出不可能
+      
+      この問題は next.yaml P-COLLISION-001で予測されていた
+      「重心距離計算の不正確性」より根本的で、
+      座標系統一なしに衝突検出は機能しません。
     pythonpath_fix: |
       error_orbbec.mdの手順に従い、以下の環境変数設定が必要:
       export PYTHONPATH=$PYTHONPATH:$(pwd)/pyorbbecsdk/install/lib/
     run_script: |
       便利なラッパースクリプトを作成しました:
       ./run_demo.sh --no-audio
-    debugging_completed: |
-      next.yamlで特定された全ての重要な問題が解決され、
-      手-地形衝突検出システムは完全に機能するようになりました。
-      MediaPipeの制約も解決され、システムは製品レベルの動作を示しています。
+    debugging_methodology: |
+      段階的デバッグにより以下の順序で問題を特定:
+      1. MediaPipe手検出（カラーフレーム必須）→ ✅
+      2. メッシュ生成（点群→三角形）→ ✅  
+      3. 空間インデックス（BVH構築）→ ✅
+      4. 衝突検索（API呼び出し）→ ✅
+      5. 座標系整合（手とメッシュ位置）→ 🔴 根本問題発見
+      
+      プロ級デバッグにより最終的な根本原因を特定しました。

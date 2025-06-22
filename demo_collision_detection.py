@@ -339,6 +339,13 @@ class FullPipelineViewer(DualViewer):
             # メッシュ保存
             self.current_mesh = simplified_mesh
             
+            # 診断ログ: メッシュ範囲を表示
+            if simplified_mesh.vertices.size > 0:
+                mesh_min = np.min(simplified_mesh.vertices, axis=0)
+                mesh_max = np.max(simplified_mesh.vertices, axis=0)
+                print(f"[MESH-INFO] Vertex range: X[{mesh_min[0]:.3f}, {mesh_max[0]:.3f}], "
+                      f"Y[{mesh_min[1]:.3f}, {mesh_max[1]:.3f}], Z[{mesh_min[2]:.3f}, {mesh_max[2]:.3f}]")
+            
             # 可視化更新
             self._update_mesh_visualization(simplified_mesh)
             
@@ -365,7 +372,7 @@ class FullPipelineViewer(DualViewer):
             print(f"[DEBUG] _detect_collisions: Hand {i} position: ({hand_pos_np[0]:.3f}, {hand_pos_np[1]:.3f}, {hand_pos_np[2]:.3f})")
             
             try:
-                res = self.collision_searcher.search_near_point(hand_pos_np, self.sphere_radius)
+                res = self.collision_searcher.search_near_hand(hand, override_radius=self.sphere_radius)
                 print(f"[DEBUG] _detect_collisions: Hand {i} found {len(res.triangle_indices)} nearby triangles")
                 
                 if not res.triangle_indices: continue
@@ -612,11 +619,16 @@ class FullPipelineViewer(DualViewer):
         
         # 点群生成（必要時）
         points_3d = None
-        if self.pointcloud_converter and (self.frame_count % self.update_interval == 0):
+        need_points_for_mesh = (self.enable_mesh_generation and 
+                                self.frame_count - self.last_mesh_update >= self.mesh_update_interval)
+        
+        if self.pointcloud_converter and (self.frame_count % self.update_interval == 0 or need_points_for_mesh):
             pointcloud_start = time.perf_counter()
             # depth_imageは既にnumpy配列なので、numpy_to_pointcloudを使用
             points_3d, _ = self.pointcloud_converter.numpy_to_pointcloud(depth_image)
             self.performance_stats['pointcloud_time'] = (time.perf_counter() - pointcloud_start) * 1000
+            if need_points_for_mesh:
+                print(f"[MESH-PREP] Frame {self.frame_count}: Generated points for mesh update: {len(points_3d) if points_3d is not None else 'None'}")
         
         # 手検出処理
         hands_2d = []
@@ -692,10 +704,20 @@ class FullPipelineViewer(DualViewer):
         pipeline_start = time.perf_counter()
         self.frame_counter = self.frame_count  # フレームカウンターを同期
         
-        # 地形メッシュ生成（定期的）
-        if (self.enable_mesh_generation and 
-            self.frame_count - self.last_mesh_update >= self.mesh_update_interval and
-            points_3d is not None and len(points_3d) > 100):
+        # 地形メッシュ生成（定期的または初回）
+        mesh_condition_check = (self.enable_mesh_generation and 
+            (self.frame_count - self.last_mesh_update >= self.mesh_update_interval or self.current_mesh is None) and
+            points_3d is not None and len(points_3d) > 100)
+        
+        # メッシュ生成条件の診断ログ
+        if self.frame_count % 10 == 0:  # 10フレーム毎に診断ログ
+            print(f"[MESH-DIAG] Frame {self.frame_count}: enable_mesh={self.enable_mesh_generation}, "
+                  f"frame_diff={self.frame_count - self.last_mesh_update}, "
+                  f"interval={self.mesh_update_interval}, "
+                  f"points={len(points_3d) if points_3d is not None else 'None'}, "
+                  f"condition={mesh_condition_check}")
+        
+        if mesh_condition_check:
             mesh_start = time.perf_counter()
             print(f"[MESH] Frame {self.frame_count}: *** UPDATING TERRAIN MESH *** with {len(points_3d)} points")
             self._update_terrain_mesh(points_3d)
@@ -916,7 +938,7 @@ class FullPipelineViewer(DualViewer):
                             RGB = "RGB"
                             BGR = "BGR"
                             MJPG = "MJPG"
-                    
+                
                     color_image = None
                     if color_format == OBFormat.RGB:
                         color_image = color_data.reshape((720, 1280, 3))
