@@ -22,7 +22,7 @@ import os
 import argparse
 import time
 import threading
-from typing import Optional, List, Dict
+from typing import Optional, List, Dict, Tuple
 import numpy as np
 
 # プロジェクトルートをパスに追加
@@ -35,7 +35,8 @@ try:
     from src.input.depth_filter import FilterType
     
     # Orbbec SDK
-    from pyorbbecsdk import Pipeline
+    from pyorbbecsdk import Pipeline, FrameSet, Config, OBSensorType, OBFormat
+    from pyorbbecsdk import OBError
     
     # 地形メッシュ生成
     from src.mesh.projection import PointCloudProjector, ProjectionMethod
@@ -66,29 +67,62 @@ try:
     import open3d as o3d
     import cv2
     
+    # 新しいモジュール
+    from dataclasses import dataclass
+    from src.input.stream import OrbbecCamera
+    from src.detection.hands2d import MediaPipeHandsWrapper, HandednessType, filter_hands_by_confidence
+    from src.detection.hands3d import Hand3DProjector, Hand3DResult
+    from src.detection.tracker import Hand3DTracker, TrackedHand
+    from src.sound.synth import create_audio_synthesizer
+    from src.sound.mapping import AudioMapper, ScaleType, InstrumentType
+    from src.sound.voice_mgr import create_voice_manager, allocate_and_play, StealStrategy
+    
 except ImportError as e:
     print(f"Import error: {e}")
     print("Please ensure all dependencies are installed and the project structure is correct.")
     sys.exit(1)
 
+@dataclass
+class Hand3D:
+    id: str
+    landmarks_3d: List[Tuple[float, float, float]]
+    palm_center_3d: Tuple[float, float, float]
+    handedness: HandednessType
+    confidence: float = 0.0
+    
+    @property
+    def position(self):
+        return self.palm_center_3d
 
 class FullPipelineViewer(DualViewer):
     """全フェーズ統合拡張DualViewer（手検出+メッシュ生成+衝突検出+音響生成）"""
     
     def __init__(self, **kwargs):
-        """初期化"""
+        print("初期化中...")
+        
+        # パフォーマンス統計
+        self.perf_stats = {
+            'frame_count': 0,
+            'mesh_generation_time': 0.0,
+            'collision_detection_time': 0.0,
+            'audio_synthesis_time': 0.0,
+            'collision_events_count': 0,
+            'audio_notes_played': 0,
+            'total_pipeline_time': 0.0
+        }
+        
         # 衝突検出関連の設定を追加
         self.enable_mesh_generation = kwargs.pop('enable_mesh_generation', True)
         self.enable_collision_detection = kwargs.pop('enable_collision_detection', True)
         self.enable_collision_visualization = kwargs.pop('enable_collision_visualization', True)
-        self.mesh_update_interval = kwargs.pop('mesh_update_interval', 10)  # フレーム
         self.sphere_radius = kwargs.pop('sphere_radius', 0.05)  # 5cm
+        self.mesh_update_interval = kwargs.pop('mesh_update_interval', 30)  # 30フレーム毎
         
         # 音響生成関連の設定を追加
-        self.enable_audio_synthesis = kwargs.pop('enable_audio_synthesis', True)
+        self.enable_audio_synthesis = kwargs.pop('enable_audio_synthesis', False)
         self.audio_scale = kwargs.pop('audio_scale', ScaleType.PENTATONIC)
         self.audio_instrument = kwargs.pop('audio_instrument', InstrumentType.MARIMBA)
-        self.audio_polyphony = kwargs.pop('audio_polyphony', 16)
+        self.audio_polyphony = kwargs.pop('audio_polyphony', 4)
         self.audio_master_volume = kwargs.pop('audio_master_volume', 0.7)
         
         # 親クラス初期化
@@ -131,17 +165,6 @@ class FullPipelineViewer(DualViewer):
         self.frame_counter = 0
         self.last_mesh_update = 0
         
-        # パフォーマンス統計
-        self.perf_stats = {
-            'mesh_generation_time': 0.0,
-            'collision_detection_time': 0.0,
-            'audio_synthesis_time': 0.0,
-            'total_pipeline_time': 0.0,
-            'collision_events_count': 0,
-            'audio_notes_played': 0,
-            'frame_count': 0
-        }
-        
         # メッシュとコリジョンの可視化オブジェクト
         self.mesh_geometries = []
         self.collision_geometries = []
@@ -162,6 +185,18 @@ class FullPipelineViewer(DualViewer):
             print(f"    - ポリフォニー: {self.audio_polyphony}")
             print(f"    - 音量: {self.audio_master_volume:.1f}")
             print(f"    - エンジン状態: {'動作中' if self.audio_enabled else '停止中'}")
+        
+        # カメラ初期化は親クラスで行われるため削除
+        self.enable_hand_detection = True
+        self.enable_tracking = True
+        self.min_detection_confidence = 0.7
+        self.hands_2d = MediaPipeHandsWrapper()
+        # projector_3dとtrackerの初期化は親クラスの初期化後に行う
+        self.projector_3d = None
+        self.tracker = None
+        
+        # 初期化完了フラグ
+        self._components_initialized = False
     
     def update_help_text(self):
         """ヘルプテキストを更新（衝突検出機能を追加）"""
@@ -320,58 +355,43 @@ class FullPipelineViewer(DualViewer):
             import traceback
             traceback.print_exc()
     
-    def _detect_collisions(self, tracked_hands):
-        """衝突検出を実行"""
-        if self.collision_searcher is None or self.collision_tester is None:
+    def _detect_collisions(self, tracked_hands: List[TrackedHand]) -> list:
+        if not self.collision_searcher: 
+            print(f"[DEBUG] _detect_collisions: No collision searcher available")
             return []
-        if not tracked_hands:
-            return []
-        
-        collision_events = []
+        events = []
         self.current_collision_points = []
+        print(f"[DEBUG] _detect_collisions: Processing {len(tracked_hands)} hands")
         
-        for i, tracked in enumerate(tracked_hands):
-            hand_pos = tracked.position
-            if hand_pos is None or len(hand_pos) != 3:
+        for i, hand in enumerate(tracked_hands):
+            if hand.position is None: 
+                print(f"[DEBUG] _detect_collisions: Hand {i} has no position")
                 continue
+            hand_pos_np = np.array(hand.position)
+            print(f"[DEBUG] _detect_collisions: Hand {i} position: ({hand_pos_np[0]:.3f}, {hand_pos_np[1]:.3f}, {hand_pos_np[2]:.3f})")
             
             try:
-                # 1. 空間検索 (公開API使用)
-                search_result = self.collision_searcher.search_near_hand(tracked, override_radius=self.sphere_radius)
+                res = self.collision_searcher.search_near_point(hand_pos_np, self.sphere_radius)
+                print(f"[DEBUG] _detect_collisions: Hand {i} found {len(res.triangle_indices)} nearby triangles")
                 
-                if len(search_result.triangle_indices) == 0:
-                    continue
+                if not res.triangle_indices: continue
                 
-                # 2. 衝突判定
-                collision_info = self.collision_tester.test_sphere_collision(
-                    hand_pos, self.sphere_radius, search_result
-                )
+                info = self.collision_tester.test_sphere_collision(hand_pos_np, self.sphere_radius, res)
+                print(f"[DEBUG] _detect_collisions: Hand {i} collision test result: {info.has_collision}")
                 
-                if collision_info.has_collision:
-                    # 3. イベント生成
-                    event = self.event_queue.create_event(
-                        collision_info,
-                        tracked.id,
-                        hand_pos,
-                        tracked.velocity.copy() if hasattr(tracked, 'velocity') else None
-                    )
-                    
+                if info.has_collision:
+                    velocity = np.array(hand.velocity) if hasattr(hand, 'velocity') and hand.velocity is not None else np.zeros(3)
+                    event = self.event_queue.create_event(info, hand.id, hand_pos_np, velocity)
                     if event:
-                        collision_events.append(event)
-                        
-                        # 接触点を記録
-                        for contact in collision_info.contact_points:
-                            self.current_collision_points.append({
-                                'position': contact.position,
-                                'normal': contact.normal,
-                                'depth': contact.depth,
-                                'hand_id': tracked.id
-                            })
-            
+                        events.append(event)
+                        for cp in info.contact_points:
+                           self.current_collision_points.append(cp.position)
+                        print(f"[DEBUG] _detect_collisions: Hand {i} generated collision event with {len(info.contact_points)} contact points")
             except Exception as e:
-                print(f"Hand {tracked.id[:8]} collision error: {e}")
+                print(f"[DEBUG] _detect_collisions: Error processing hand {i}: {e}")
         
-        return collision_events
+        print(f"[DEBUG] _detect_collisions: Total collision events: {len(events)}")
+        return events
     
     def _update_mesh_visualization(self, mesh):
         """メッシュ可視化を更新"""
@@ -408,7 +428,7 @@ class FullPipelineViewer(DualViewer):
         except Exception as e:
             print(f"メッシュ可視化エラー: {e}")
     
-    def _update_collision_visualization(self, collision_events):
+    def _update_collision_visualization(self):
         """衝突可視化を更新"""
         if not hasattr(self, 'vis') or self.vis is None:
             return
@@ -467,7 +487,7 @@ class FullPipelineViewer(DualViewer):
         """可視化全体を更新"""
         if self.current_mesh and self.enable_collision_visualization:
             self._update_mesh_visualization(self.current_mesh)
-        self._update_collision_visualization([])
+        self._update_collision_visualization()
     
     def _force_mesh_update(self):
         """メッシュ強制更新"""
@@ -557,85 +577,187 @@ class FullPipelineViewer(DualViewer):
         
         print("="*50)
     
-    def update_frame(self, color_image, depth_image, points_3d):
+    def _process_frame(self) -> bool:
         """
-        フレーム更新（衝突検出版）
-        DualViewerのメインループから毎フレーム呼び出される。
+        1フレーム処理（衝突検出版オーバーライド）
+        DualViewerのフレーム処理をオーバーライドして衝突検出を統合
         """
-        if color_image is None or depth_image is None:
-            return
-
-        try:
-            # 1. 手検出（2D -> 3D -> トラッキング）
-            hands_2d, hands_3d, tracked_hands = [], [], []
-            if self.enable_hand_detection and self.hands_2d is not None:
-                bgr_image = cv2.cvtColor(color_image, cv2.COLOR_RGB2BGR)
-                from src.detection.hands2d import filter_hands_by_confidence
-                
-                all_hands_2d = self.hands_2d.detect_hands(bgr_image)
-                hands_2d = filter_hands_by_confidence(all_hands_2d, self.min_detection_confidence)
-                
-                if hands_2d and self.projector_3d:
-                    hands_3d = self.projector_3d.project_hands_batch(hands_2d, depth_image)
-                
-                if hands_3d and self.enable_tracking and self.tracker:
-                    # トラッカーに渡す前の最終防衛ラインとして、不正な座標を持つ手を除外
-                    valid_hands_3d = []
-                    for hand in hands_3d:
-                        if hand and hand.position is not None and not np.any(np.isnan(hand.position)):
-                            valid_hands_3d.append(hand)
-                    
-                    if len(valid_hands_3d) > 0:
-                        self.tracker.update(valid_hands_3d)
-
-                    from src.detection.tracker import filter_stable_hands
-                    tracked_hands = filter_stable_hands(self.tracker.get_tracked_hands(), 0.7)
-
-            # 2. フレームカウンタとパイプライン時間計測開始
-            pipeline_start = time.perf_counter()
-            self.frame_counter += 1
-            self.perf_stats['frame_count'] += 1
-
-            # 3. 地形メッシュ生成（定期的）
-            if (self.enable_mesh_generation and 
-                self.frame_counter - self.last_mesh_update >= self.mesh_update_interval and
-                points_3d is not None and len(points_3d) > 100):
-                mesh_start = time.perf_counter()
-                self._update_terrain_mesh(points_3d)
-                self.last_mesh_update = self.frame_counter
-                self.perf_stats['mesh_generation_time'] = (time.perf_counter() - mesh_start) * 1000
-
-            # 4. 衝突検出
-            collision_events = []
-            if (self.enable_collision_detection and self.current_mesh is not None and tracked_hands):
-                collision_start = time.perf_counter()
-                collision_events = self._detect_collisions(tracked_hands)
-                self.perf_stats['collision_detection_time'] = (time.perf_counter() - collision_start) * 1000
-                self.perf_stats['collision_events_count'] += len(collision_events)
-
-            # 5. 音響生成
-            if (self.enable_audio_synthesis and self.audio_enabled and collision_events):
-                audio_start = time.perf_counter()
-                audio_notes = self._generate_audio(collision_events)
-                self.perf_stats['audio_notes_played'] += audio_notes
-                self.perf_stats['audio_synthesis_time'] = (time.perf_counter() - audio_start) * 1000
+        frame_start_time = time.perf_counter()
+        
+        # 3D手検出コンポーネントの遅延初期化
+        if not self._components_initialized and hasattr(self, 'camera') and self.camera is not None:
+            try:
+                print("Setting up 3D hand detection components...")
+                self.projector_3d = Hand3DProjector(self.camera.depth_intrinsics)
+                self.tracker = Hand3DTracker()
+                self._components_initialized = True
+                print("3D hand detection components initialized")
+            except Exception as e:
+                print(f"3D component initialization error: {e}")
+        
+        # フレーム取得
+        frame_data = self.camera.get_frame(timeout_ms=100)
+        if frame_data is None or frame_data.depth_frame is None:
+            return True
+        
+        # 深度画像の抽出
+        depth_data = np.frombuffer(frame_data.depth_frame.get_data(), dtype=np.uint16)
+        depth_image = depth_data.reshape(
+            (self.camera.depth_intrinsics.height, self.camera.depth_intrinsics.width)
+        )
+        
+        # フィルタ適用
+        filter_start_time = time.perf_counter()
+        if self.depth_filter is not None and self.enable_filter:
+            depth_image = self.depth_filter.apply_filter(depth_image)
+        self.performance_stats['filter_time'] = (time.perf_counter() - filter_start_time) * 1000
+        
+        # 点群生成（必要時）
+        points_3d = None
+        if self.pointcloud_converter and (self.frame_count % self.update_interval == 0):
+            pointcloud_start = time.perf_counter()
+            # depth_imageは既にnumpy配列なので、numpy_to_pointcloudを使用
+            points_3d, _ = self.pointcloud_converter.numpy_to_pointcloud(depth_image)
+            self.performance_stats['pointcloud_time'] = (time.perf_counter() - pointcloud_start) * 1000
+        
+        # 手検出処理
+        hands_2d = []
+        if self.enable_hand_detection and self.hands_2d is not None:
+            hand_start_time = time.perf_counter()
             
-            # 6. 可視化情報の更新
-            self.perf_stats['total_pipeline_time'] = (time.perf_counter() - pipeline_start) * 1000
-            self._draw_performance_info(color_image, collision_events)
-            self.draw_hands_2d(color_image, hands_2d)
-            self.draw_performance_overlay(color_image)
+            # カラー画像の処理
+            bgr_image = None
+            if frame_data.color_frame is not None:
+                print(f"[DEBUG] Frame {self.frame_count}: Color frame available")
+                color_data = np.frombuffer(frame_data.color_frame.get_data(), dtype=np.uint8)
+                print(f"[DEBUG] Frame {self.frame_count}: Color data size: {len(color_data)}")
+                color_format = frame_data.color_frame.get_format()
+                print(f"[DEBUG] Frame {self.frame_count}: Color format: {color_format}")
+                
+                # フォーマットに応じた変換
+                try:
+                    from pyorbbecsdk import OBFormat
+                except ImportError:
+                    # テスト用モック
+                    class OBFormat:
+                        RGB = "RGB"
+                        BGR = "BGR"
+                        MJPG = "MJPG"
+                
+                color_image = None
+                if color_format == OBFormat.RGB:
+                    # RGB形式の場合、カラー画像の実際のサイズを取得
+                    total_pixels = len(color_data) // 3
+                    # 1280x720 想定でリシェイプ
+                    color_image = color_data.reshape((720, 1280, 3))
+                elif color_format == OBFormat.BGR:
+                    total_pixels = len(color_data) // 3
+                    color_image = color_data.reshape((720, 1280, 3))
+                    color_image = cv2.cvtColor(color_image, cv2.COLOR_BGR2RGB)
+                elif color_format == OBFormat.MJPG:
+                    color_image = cv2.imdecode(color_data, cv2.IMREAD_COLOR)
+                    if color_image is not None:
+                        color_image = cv2.cvtColor(color_image, cv2.COLOR_BGR2RGB)
+                
+                if color_image is not None:
+                    # 深度画像サイズに合わせてリサイズ
+                    color_image = cv2.resize(color_image, (self.camera.depth_intrinsics.width, self.camera.depth_intrinsics.height))
+                    # RGBからBGRに変換（MediaPipe用）
+                    bgr_image = cv2.cvtColor(color_image, cv2.COLOR_RGB2BGR)
+                    print(f"[DEBUG] Frame {self.frame_count}: Color image processed, size: {bgr_image.shape}")
+            else:
+                print(f"[DEBUG] Frame {self.frame_count}: Color frame is None")
             
-            if self.vis:
-                self.update_point_cloud(points_3d)
-                self.update_hand_3d_visualization(hands_3d)
-                if self.enable_collision_visualization:
-                    self._update_collision_visualization(collision_events)
-
-        except Exception as e:
-            print(f"フレーム更新エラー: {e}")
-            import traceback
-            traceback.print_exc()
+            if bgr_image is None:
+                # カラー画像がない場合は深度画像をグレースケールとして使用
+                bgr_image = cv2.cvtColor(cv2.normalize(depth_image, None, 0, 255, cv2.NORM_MINMAX, dtype=cv2.CV_8U), cv2.COLOR_GRAY2BGR)
+                print(f"[DEBUG] Frame {self.frame_count}: No color frame, using depth as grayscale, size: {bgr_image.shape}")
+            
+            print(f"[DEBUG] Frame {self.frame_count}: Performing 2D hand detection on image size: {bgr_image.shape}")
+            from src.detection.hands2d import filter_hands_by_confidence
+            
+            all_hands_2d = self.hands_2d.detect_hands(bgr_image)
+            hands_2d = filter_hands_by_confidence(all_hands_2d, self.min_detection_confidence)
+            print(f"[DEBUG] Frame {self.frame_count}: 2D detection: {len(all_hands_2d)} raw -> {len(hands_2d)} filtered")
+        
+        # 3D投影
+        hands_3d = []
+        if hands_2d and self.projector_3d is not None:
+            print(f"[DEBUG] Frame {self.frame_count}: Performing 3D projection")
+            hands_3d = self.projector_3d.project_hands_batch(hands_2d, depth_image)
+            print(f"[DEBUG] Frame {self.frame_count}: 3D projection: {len(hands_2d)} input -> {len(hands_3d)} output")
+        
+        # トラッキング
+        tracked_hands = []
+        if hands_3d and self.tracker is not None:
+            print(f"[DEBUG] Frame {self.frame_count}: Performing hand tracking")
+            # Hand3DResultをTrackedHandに変換してトラッキング
+            hands_for_tracking = []
+            for hand_3d in hands_3d:
+                # Hand3DResultをHand3Dに変換
+                hand_converted = Hand3D(
+                    id=hand_3d.id,
+                    landmarks_3d=hand_3d.landmarks_3d,
+                    palm_center_3d=hand_3d.palm_center_3d,
+                    handedness=hand_3d.handedness,
+                    confidence=hand_3d.confidence
+                )
+                hands_for_tracking.append(hand_converted)
+            
+            tracked_hands = self.tracker.update(hands_for_tracking)
+            print(f"[DEBUG] Frame {self.frame_count}: Tracking: {len(hands_3d)} input -> {len(tracked_hands)} tracked")
+        
+        self.performance_stats['hand_detection_time'] = (time.perf_counter() - hand_start_time) * 1000
+        print(f"[DEBUG] Frame {self.frame_count}: Detected {len(hands_2d)} hands in 2D, {len(hands_3d)} in 3D, {len(tracked_hands)} tracked")
+        
+        # 衝突検出とメッシュ生成のパイプライン
+        pipeline_start = time.perf_counter()
+        self.frame_counter = self.frame_count  # フレームカウンターを同期
+        
+        # 地形メッシュ生成（定期的）
+        if (self.enable_mesh_generation and 
+            self.frame_count - self.last_mesh_update >= self.mesh_update_interval and
+            points_3d is not None and len(points_3d) > 100):
+            mesh_start = time.perf_counter()
+            print(f"[DEBUG] Frame {self.frame_count}: Updating terrain mesh with {len(points_3d)} points")
+            self._update_terrain_mesh(points_3d)
+            self.last_mesh_update = self.frame_count
+            self.perf_stats['mesh_generation_time'] = (time.perf_counter() - mesh_start) * 1000
+        
+        # 衝突検出
+        collision_events = []
+        if (self.enable_collision_detection and self.current_mesh is not None and tracked_hands):
+            print(f"[DEBUG] Frame {self.frame_count}: Starting collision detection with {len(tracked_hands)} hands and mesh available")
+            collision_start = time.perf_counter()
+            collision_events = self._detect_collisions(tracked_hands)
+            print(f"[DEBUG] Frame {self.frame_count}: Detected {len(collision_events)} collision events")
+            self.perf_stats['collision_detection_time'] = (time.perf_counter() - collision_start) * 1000
+            self.perf_stats['collision_events_count'] += len(collision_events)
+        
+        # 音響生成
+        if (self.enable_audio_synthesis and self.audio_enabled and collision_events):
+            audio_start = time.perf_counter()
+            print(f"[DEBUG] Frame {self.frame_count}: Generating audio for {len(collision_events)} collision events")
+            audio_notes = self._generate_audio(collision_events)
+            self.perf_stats['audio_notes_played'] += audio_notes
+            self.perf_stats['audio_synthesis_time'] = (time.perf_counter() - audio_start) * 1000
+            print(f"[DEBUG] Frame {self.frame_count}: Generated {audio_notes} audio notes")
+        
+        self.perf_stats['total_pipeline_time'] = (time.perf_counter() - pipeline_start) * 1000
+        
+        # RGB表示処理（既存のDualViewerロジックを使用）
+        if not self._process_rgb_display(frame_data, collision_events):
+            return False
+        
+        # 点群表示処理（間隔制御）
+        if self.frame_count % self.update_interval == 0:
+            if not self._process_pointcloud_display(frame_data):
+                return False
+        
+        self.frame_count += 1
+        self.performance_stats['frame_time'] = (time.perf_counter() - frame_start_time) * 1000
+        
+        return True
 
     def _initialize_audio_system(self):
         """音響システムを初期化"""
@@ -771,6 +893,292 @@ class FullPipelineViewer(DualViewer):
                 self._shutdown_audio_system()
         except Exception as e:
             print(f"デストラクタでエラー: {e}")
+
+    def _process_rgb_display(self, frame_data, collision_events=None) -> bool:
+        """
+        RGB表示処理（衝突検出版オーバーライド）
+        
+        Args:
+            frame_data: フレームデータ
+            collision_events: 衝突イベントリスト（オプション）
+            
+        Returns:
+            継続する場合True
+        """
+        try:
+            # 深度画像をカラーマップで可視化
+            depth_data = np.frombuffer(frame_data.depth_frame.get_data(), dtype=np.uint16)
+            depth_image = depth_data.reshape(
+                (self.camera.depth_intrinsics.height, self.camera.depth_intrinsics.width)
+            )
+            
+            # 深度画像を表示用に正規化
+            depth_normalized = cv2.normalize(depth_image, None, 0, 255, cv2.NORM_MINMAX, dtype=cv2.CV_8U)
+            depth_colored = cv2.applyColorMap(depth_normalized, cv2.COLORMAP_JET)
+            
+            # 手検出処理
+            hands_2d = []
+            if self.enable_hand_detection and self.hands_2d is not None:
+                hand_start_time = time.perf_counter()
+                
+                # カラー画像の処理
+                bgr_image = None
+                if frame_data.color_frame is not None:
+                    print(f"[DEBUG] Frame {self.frame_count}: Color frame available")
+                    color_data = np.frombuffer(frame_data.color_frame.get_data(), dtype=np.uint8)
+                    print(f"[DEBUG] Frame {self.frame_count}: Color data size: {len(color_data)}")
+                    color_format = frame_data.color_frame.get_format()
+                    print(f"[DEBUG] Frame {self.frame_count}: Color format: {color_format}")
+                    
+                    # フォーマットに応じた変換
+                    try:
+                        from pyorbbecsdk import OBFormat
+                    except ImportError:
+                        # テスト用モック
+                        class OBFormat:
+                            RGB = "RGB"
+                            BGR = "BGR"
+                            MJPG = "MJPG"
+                    
+                    color_image = None
+                    if color_format == OBFormat.RGB:
+                        # RGB形式の場合、カラー画像の実際のサイズを取得
+                        total_pixels = len(color_data) // 3
+                        # 1280x720 想定でリシェイプ
+                        color_image = color_data.reshape((720, 1280, 3))
+                    elif color_format == OBFormat.BGR:
+                        total_pixels = len(color_data) // 3
+                        color_image = color_data.reshape((720, 1280, 3))
+                        color_image = cv2.cvtColor(color_image, cv2.COLOR_BGR2RGB)
+                    elif color_format == OBFormat.MJPG:
+                        color_image = cv2.imdecode(color_data, cv2.IMREAD_COLOR)
+                        if color_image is not None:
+                            color_image = cv2.cvtColor(color_image, cv2.COLOR_BGR2RGB)
+                    
+                if color_image is not None:
+                    # 深度画像サイズに合わせてリサイズ
+                    color_image = cv2.resize(color_image, (self.camera.depth_intrinsics.width, self.camera.depth_intrinsics.height))
+                    # RGBからBGRに変換（MediaPipe用）
+                    bgr_image = cv2.cvtColor(color_image, cv2.COLOR_RGB2BGR)
+                    print(f"[DEBUG] Frame {self.frame_count}: Color image processed, size: {bgr_image.shape}")
+                else:
+                    print(f"[DEBUG] Frame {self.frame_count}: Color frame is None")
+            
+            if bgr_image is None:
+                # カラー画像がない場合は深度画像をグレースケールとして使用
+                bgr_image = cv2.cvtColor(cv2.normalize(depth_image, None, 0, 255, cv2.NORM_MINMAX, dtype=cv2.CV_8U), cv2.COLOR_GRAY2BGR)
+                print(f"[DEBUG] Frame {self.frame_count}: No color frame, using depth as grayscale, size: {bgr_image.shape}")
+            
+            print(f"[DEBUG] Frame {self.frame_count}: Performing 2D hand detection on image size: {bgr_image.shape}")
+            from src.detection.hands2d import filter_hands_by_confidence
+            
+            all_hands_2d = self.hands_2d.detect_hands(bgr_image)
+            hands_2d = filter_hands_by_confidence(all_hands_2d, self.min_detection_confidence)
+            print(f"[DEBUG] Frame {self.frame_count}: 2D detection: {len(all_hands_2d)} raw -> {len(hands_2d)} filtered")
+        
+            # 3D投影
+            hands_3d = []
+            if hands_2d and self.projector_3d is not None:
+                print(f"[DEBUG] Frame {self.frame_count}: Performing 3D projection")
+                hands_3d = self.projector_3d.project_hands_batch(hands_2d, depth_image)
+                print(f"[DEBUG] Frame {self.frame_count}: 3D projection: {len(hands_2d)} input -> {len(hands_3d)} output")
+            
+            # トラッキング
+            tracked_hands = []
+            if hands_3d and self.tracker is not None:
+                print(f"[DEBUG] Frame {self.frame_count}: Performing hand tracking")
+                # Hand3DResultをTrackedHandに変換してトラッキング
+                hands_for_tracking = []
+                for hand_3d in hands_3d:
+                    # Hand3DResultをHand3Dに変換
+                    hand_converted = Hand3D(
+                        id=hand_3d.id,
+                        landmarks_3d=hand_3d.landmarks_3d,
+                        palm_center_3d=hand_3d.palm_center_3d,
+                        handedness=hand_3d.handedness,
+                        confidence=hand_3d.confidence
+                    )
+                    hands_for_tracking.append(hand_converted)
+                
+                tracked_hands = self.tracker.update(hands_for_tracking)
+                print(f"[DEBUG] Frame {self.frame_count}: Tracking: {len(hands_3d)} input -> {len(tracked_hands)} tracked")
+            
+            self.performance_stats['hand_detection_time'] = (time.perf_counter() - hand_start_time) * 1000
+            print(f"[DEBUG] Frame {self.frame_count}: Detected {len(hands_2d)} hands in 2D, {len(hands_3d)} in 3D, {len(tracked_hands)} tracked")
+        
+            # カラー画像があれば表示
+            display_images = []
+            
+            # 深度画像（疑似カラー）
+            depth_resized = cv2.resize(depth_colored, self.rgb_window_size)
+            cv2.putText(depth_resized, f"Depth (Frame: {self.frame_count})", 
+                       (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+            display_images.append(depth_resized)
+            
+            # RGB画像
+            color_bgr = None
+            if frame_data.color_frame is not None and self.camera.has_color:
+                color_data = np.frombuffer(frame_data.color_frame.get_data(), dtype=np.uint8)
+                color_format = frame_data.color_frame.get_format()
+                
+                # フォーマットに応じた変換（DualViewerと同じロジック）
+                try:
+                    from pyorbbecsdk import OBFormat
+                except ImportError:
+                    # テスト用モック
+                    class OBFormat:
+                        RGB = "RGB"
+                        BGR = "BGR"
+                        MJPG = "MJPG"
+                
+                color_image = None
+                if color_format == OBFormat.RGB:
+                    # RGB形式の場合、カラー画像の実際のサイズを取得
+                    total_pixels = len(color_data) // 3
+                    # 1280x720 想定でリシェイプ
+                    color_image = color_data.reshape((720, 1280, 3))
+                elif color_format == OBFormat.BGR:
+                    total_pixels = len(color_data) // 3
+                    color_image = color_data.reshape((720, 1280, 3))
+                    color_image = cv2.cvtColor(color_image, cv2.COLOR_BGR2RGB)
+                elif color_format == OBFormat.MJPG:
+                    color_image = cv2.imdecode(color_data, cv2.IMREAD_COLOR)
+                    if color_image is not None:
+                        color_image = cv2.cvtColor(color_image, cv2.COLOR_BGR2RGB)
+                
+                if color_image is not None:
+                    color_resized = cv2.resize(color_image, self.rgb_window_size)
+                    color_bgr = cv2.cvtColor(color_resized, cv2.COLOR_RGB2BGR)
+                    
+                    # 手検出結果を描画
+                    if self.enable_hand_detection and hands_2d:
+                        color_bgr = self._draw_hand_detections(color_bgr, hands_2d, hands_3d, tracked_hands)
+                    
+                    # 衝突検出情報を描画
+                    if collision_events:
+                        self._draw_collision_info(color_bgr, collision_events)
+                    
+                    cv2.putText(color_bgr, f"RGB (FPS: {self.performance_stats['fps']:.1f})", 
+                               (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+                    display_images.append(color_bgr)
+            
+            # 画像を横に並べて表示
+            if len(display_images) > 1:
+                combined_image = np.hstack(display_images)
+            else:
+                combined_image = display_images[0]
+            
+            # パフォーマンス情報をオーバーレイ
+            self._draw_performance_overlay(combined_image)
+            
+            # 衝突検出パフォーマンス情報を追加描画
+            if hasattr(self, 'perf_stats'):
+                self._draw_collision_performance_info(combined_image, collision_events)
+            
+            cv2.imshow("Geocussion-SP Input Viewer", combined_image)
+            
+            # キー入力処理（DualViewerの基本機能 + 衝突検出機能）
+            key = cv2.waitKey(1) & 0xFF
+            
+            # 既存のキー処理
+            if key == ord('q') or key == 27:  # Q or ESC
+                return False
+            elif key == ord('f'):  # Toggle filter
+                self.enable_filter = not self.enable_filter
+                print(f"Depth filter: {'Enabled' if self.enable_filter else 'Disabled'}")
+            elif key == ord('r') and self.depth_filter is not None:  # Reset filter
+                self.depth_filter.reset_temporal_history()
+                print("Filter history reset")
+            elif key == ord('h'):  # Toggle hand detection
+                self.enable_hand_detection = not self.enable_hand_detection
+                print(f"Hand detection: {'Enabled' if self.enable_hand_detection else 'Disabled'}")
+            elif key == ord('t') and self.enable_hand_detection:  # Toggle tracking
+                self.enable_tracking = not self.enable_tracking
+                print(f"Hand tracking: {'Enabled' if self.enable_tracking else 'Disabled'}")
+            elif key == ord('y') and self.tracker is not None:  # Reset tracker
+                self.tracker.reset()
+                print("Hand tracker reset")
+            
+            # 衝突検出のキー処理
+            else:
+                # 衝突検出のキー処理を直接実装
+                if key == ord('m') or key == ord('M'):
+                    self.enable_mesh_generation = not self.enable_mesh_generation
+                    status = "有効" if self.enable_mesh_generation else "無効"
+                    print(f"メッシュ生成: {status}")
+                elif key == ord('c') or key == ord('C'):
+                    self.enable_collision_detection = not self.enable_collision_detection
+                    status = "有効" if self.enable_collision_detection else "無効"
+                    print(f"衝突検出: {status}")
+                elif key == ord('v') or key == ord('V'):
+                    self.enable_collision_visualization = not self.enable_collision_visualization
+                    status = "有効" if self.enable_collision_visualization else "無効"
+                    print(f"衝突可視化: {status}")
+                elif key == ord('n') or key == ord('N'):
+                    print("メッシュを強制更新中...")
+                    self._force_mesh_update()
+                elif key == ord('+') or key == ord('='):
+                    self.sphere_radius = min(self.sphere_radius + 0.01, 0.2)
+                    print(f"球半径: {self.sphere_radius*100:.1f}cm")
+                elif key == ord('-') or key == ord('_'):
+                    self.sphere_radius = max(self.sphere_radius - 0.01, 0.01)
+                    print(f"球半径: {self.sphere_radius*100:.1f}cm")
+                elif key == ord('p') or key == ord('P'):
+                    self._print_performance_stats()
+            
+            return True
+            
+        except Exception as e:
+            print(f"RGB display error: {e}")
+            return True
+
+    def _draw_collision_info(self, image: np.ndarray, collision_events: list) -> None:
+        """衝突情報をRGB画像に描画"""
+        if not collision_events:
+            return
+            
+        # 衝突イベント表示
+        cv2.putText(image, f"COLLISION DETECTED! ({len(collision_events)} events)", 
+                   (10, image.shape[0] - 60),
+                   cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 3)
+        
+        # 音響再生表示
+        if self.enable_audio_synthesis and self.audio_enabled:
+            cv2.putText(image, f"PLAYING AUDIO ({self.audio_instrument.value})", 
+                       (10, image.shape[0] - 30),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+    
+    def _draw_collision_performance_info(self, image: np.ndarray, collision_events: list) -> None:
+        """衝突検出パフォーマンス情報を描画"""
+        if not hasattr(self, 'perf_stats'):
+            return
+            
+        # 右側に衝突検出情報を描画
+        info_lines = [
+            f"Mesh: {self.perf_stats.get('mesh_generation_time', 0):.1f}ms",
+            f"Collision: {self.perf_stats.get('collision_detection_time', 0):.1f}ms",
+            f"Audio: {self.perf_stats.get('audio_synthesis_time', 0):.1f}ms",
+            f"Events: {len(collision_events)}",
+            f"Sphere R: {self.sphere_radius*100:.1f}cm"
+        ]
+        
+        if self.current_mesh:
+            info_lines.append(f"Triangles: {self.current_mesh.num_triangles}")
+        
+        if self.current_collision_points:
+            info_lines.append(f"Contacts: {len(self.current_collision_points)}")
+        
+        # 右側に描画
+        x_offset = image.shape[1] - 200
+        y_offset = 30
+        for i, line in enumerate(info_lines):
+            cv2.putText(image, line, (x_offset, y_offset + i * 25), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+
+    def run(self):
+        """ビューワーを実行"""
+        # 親クラスのrun()を呼び出し
+        super().run()
 
 
 def main():

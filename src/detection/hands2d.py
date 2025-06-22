@@ -46,6 +46,7 @@ class HandLandmark:
 @dataclass
 class HandDetectionResult:
     """手検出結果"""
+    id: str  # 手のID（トラッキング用）
     landmarks: List[HandLandmark]
     handedness: HandednessType
     confidence: float
@@ -255,12 +256,17 @@ class MediaPipeHandsWrapper:
             
             bounding_box = (x_min, y_min, x_max - x_min, y_max - y_min)
             
+            # 手のID生成 (handedness + timestamp)
+            timestamp = time.perf_counter() * 1000
+            hand_id = f"{handedness_type.value}_{int(timestamp)}"
+            
             return HandDetectionResult(
+                id=hand_id,
                 landmarks=hand_landmarks,
                 handedness=handedness_type,
                 confidence=confidence,
                 bounding_box=bounding_box,
-                timestamp_ms=time.perf_counter() * 1000
+                timestamp_ms=timestamp
             )
             
         except Exception as e:
@@ -405,12 +411,14 @@ def create_mock_hand_result() -> HandDetectionResult:
             visibility=1.0
         ))
     
+    timestamp = time.perf_counter() * 1000
     return HandDetectionResult(
+        id=f"Mock_{int(timestamp)}",
         landmarks=landmarks,
         handedness=HandednessType.RIGHT,
         confidence=0.95,
         bounding_box=(100, 100, 200, 200),
-        timestamp_ms=time.perf_counter() * 1000
+        timestamp_ms=timestamp
     )
 
 

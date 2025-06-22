@@ -44,39 +44,15 @@ class Hand3DLandmark:
 @dataclass
 class Hand3DResult:
     """3D手検出結果"""
-    landmarks_3d: List[Hand3DLandmark]
-    handedness: HandednessType
-    confidence_2d: float  # 2D検出信頼度
-    confidence_3d: float  # 3D推定信頼度
+    id: str
+    landmarks_3d: List[Tuple[float, float, float]]
     palm_center_3d: Tuple[float, float, float]
-    timestamp_ms: float
-    
+    handedness: HandednessType
+    confidence: float
+
     @property
-    def valid_landmarks_count(self) -> int:
-        """有効な3Dランドマーク数"""
-        return sum(1 for lm in self.landmarks_3d if lm.depth_valid)
-    
-    @property
-    def palm_normal(self) -> np.ndarray:
-        """手のひらの法線ベクトル推定"""
-        if len(self.landmarks_3d) < 21:
-            return np.array([0, 0, 1])
-        
-        # 手のひらの主要点を使用
-        try:
-            wrist = self.landmarks_3d[0].position
-            mcp_middle = self.landmarks_3d[9].position
-            mcp_pinky = self.landmarks_3d[17].position
-            
-            # 法線ベクトル計算
-            v1 = mcp_middle - wrist
-            v2 = mcp_pinky - wrist
-            normal = np.cross(v1, v2)
-            normal = normal / np.linalg.norm(normal)
-            
-            return normal
-        except:
-            return np.array([0, 0, 1])
+    def position(self):
+        return np.array(self.palm_center_3d)
 
 
 class DepthInterpolationMethod(Enum):
@@ -97,7 +73,9 @@ class Hand3DProjector:
         interpolation_method: DepthInterpolationMethod = DepthInterpolationMethod.LINEAR,
         depth_filter_kernel_size: int = 3,
         max_depth_diff: float = 0.05,  # 5cm
-        min_confidence_3d: float = 0.3
+        min_confidence_3d: float = 0.3,
+        use_guided_filter: bool = False,
+        **guided_filter_params
     ):
         """
         初期化
@@ -109,6 +87,8 @@ class Hand3DProjector:
             depth_filter_kernel_size: 深度フィルタカーネルサイズ
             max_depth_diff: 最大深度差閾値
             min_confidence_3d: 最小3D信頼度
+            use_guided_filter: ガイドフィルタを使用するか
+            **guided_filter_params: ガイドフィルタのパラメータ
         """
         self.camera_intrinsics = camera_intrinsics
         self.depth_scale = depth_scale
@@ -116,6 +96,8 @@ class Hand3DProjector:
         self.depth_filter_kernel_size = depth_filter_kernel_size
         self.max_depth_diff = max_depth_diff
         self.min_confidence_3d = min_confidence_3d
+        self.use_guided_filter = use_guided_filter
+        self.guided_filter_params = guided_filter_params
         
         # パフォーマンス統計
         self.performance_stats = {
@@ -184,12 +166,11 @@ class Hand3DProjector:
             
             # 結果作成
             result = Hand3DResult(
-                landmarks_3d=landmarks_3d,
-                handedness=hand_2d.handedness,
-                confidence_2d=hand_2d.confidence,
-                confidence_3d=confidence_3d,
+                id=hand_2d.id,
+                landmarks_3d=[tuple(lm) for lm in landmarks_3d],
                 palm_center_3d=palm_center_3d,
-                timestamp_ms=time.perf_counter() * 1000
+                handedness=hand_2d.handedness,
+                confidence=hand_2d.confidence
             )
             
             # 統計更新
@@ -257,10 +238,15 @@ class Hand3DProjector:
         y = -(v - self.camera_intrinsics.cy) * depth_z / self.camera_intrinsics.fy
         z = depth_z
         
-        point_3d = np.array([x, y, z])
-        if np.any(np.isnan(point_3d)) or np.any(np.isinf(point_3d)):
-            return None
-
+        # NaNまたは無限大のチェック
+        if np.isnan(x) or np.isnan(y) or np.isnan(z) or np.isinf(x) or np.isinf(y) or np.isinf(z):
+            # 無効な3D座標の場合は無効なランドマークを返す
+            return Hand3DLandmark(
+                x=0.0, y=0.0, z=0.0,
+                confidence=0.0,
+                depth_valid=False
+            )
+        
         # 信頼度計算（MediaPipe可視性スコア × 深度信頼度）
         confidence_3d = landmark_2d.visibility * depth_confidence
         
@@ -481,10 +467,9 @@ def create_mock_hand_3d_result() -> Hand3DResult:
         ))
     
     return Hand3DResult(
-        landmarks_3d=landmarks_3d,
-        handedness=HandednessType.RIGHT,
-        confidence_2d=0.95,
-        confidence_3d=0.85,
+        id="mock_id",
+        landmarks_3d=[tuple(lm.position) for lm in landmarks_3d],
         palm_center_3d=(0.1, 0.0, 0.8),
-        timestamp_ms=time.perf_counter() * 1000
+        handedness=HandednessType.RIGHT,
+        confidence=0.85
     ) 
