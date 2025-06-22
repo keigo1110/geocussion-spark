@@ -1,0 +1,108 @@
+# Geocussion-Spark 設定ファイル
+# このファイルでアプリケーションの主要なパラメータを管理します。
+
+# --- 一般設定 ---
+general:
+  log_level: "INFO"  # DEBUG, INFO, WARNING, ERROR, CRITICAL
+  log_to_file: false
+
+# --- 手検出設定 (src/detection) ---
+hand_detection:
+  min_detection_confidence: 0.7
+  min_tracking_confidence: 0.5
+  use_gpu_mediapipe: true
+
+# --- カルマントラッカー設定 (src/detection) ---
+tracker:
+  max_lost_frames: 5
+  process_noise_scale: 1.0e-2
+  measurement_noise_scale: 1.0e-1
+
+# --- メッシュ生成設定 (src/mesh) ---
+mesh_generation:
+  projection_resolution_cm: 1.0
+  delaunay_max_edge_length: 0.5
+  simplifier_target_reduction: 0.7
+
+# --- 衝突検出設定 (src/collision) ---
+collision_detection:
+  sphere_radius_m: 0.05
+  cache_enabled: true
+
+# --- 音響設定 (src/sound) ---
+audio:
+  enabled: true
+  master_volume: 0.7
+  polyphony: 16
+  default_scale: "PENTATONIC"
+  default_instrument: "MARIMBA"
+  
+  # 音階定義 (ルートからのMIDIノート差)
+  scales:
+    CHROMATIC: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
+    MAJOR: [0, 2, 4, 5, 7, 9, 11]
+    MINOR: [0, 2, 3, 5, 7, 8, 10]
+    PENTATONIC: [0, 2, 4, 7, 9]
+    BLUES: [0, 3, 5, 6, 7, 10]
+    WHOLE_TONE: [0, 2, 4, 6, 8, 10]
+    JAPANESE: [0, 1, 5, 7, 8]
+
+  # 楽器定義
+  instruments:
+    MARIMBA:
+      pyo_object: "PhyMarimba"
+      type: "physical_modeling"
+      default_params:
+        freq: 440
+        stick_hard: 0.5
+        stick_pos: 0.5
+        vib_freq: 5
+        vib_gain: 0
+        detune: 0
+        bow_press: 0
+        bow_pos: 0.2
+        bow_beta: 0
+        mul: 1.0
+      envelope:
+        attack: 0.005
+        decay: 0.5
+        sustain: 0.2
+        release: 1.0
+
+    SYNTH_PAD:
+      pyo_object: "SuperSaw"
+      type: "oscillator"
+      default_params:
+        freq: 440
+        detune: 0.25
+        mul: 0.5
+      envelope:
+        attack: 0.1
+        decay: 0.8
+        sustain: 0.7
+        release: 1.5
+    
+    BELL:
+      pyo_object: "Bell"
+      type: "physical_modeling"
+      default_params:
+        freq: 880
+        mul: 0.8
+      envelope:
+        attack: 0.01
+        decay: 1.0
+        sustain: 0.1
+        release: 2.0
+    
+    CRYSTAL:
+      pyo_object: "Harmonizer"
+      type: "effect" # Harmonizerは特殊な発振器として扱う
+      default_params:
+        transpo: -12
+        feedback: 0.2
+        mul: 0.4
+      envelope:
+        attack: 0.2
+        decay: 1.2
+        sustain: 0.8
+        release: 2.5 

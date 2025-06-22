@@ -14,29 +14,8 @@ import numpy as np
 
 # 他フェーズとの連携
 from ..collision.events import CollisionEvent, CollisionIntensity, EventType
-
-
-class InstrumentType(Enum):
-    """楽器タイプの列挙"""
-    MARIMBA = "marimba"           # マリンバ（木琴）
-    SYNTH_PAD = "synth_pad"       # シンセパッド
-    BELL = "bell"                 # ベル・チャイム
-    CRYSTAL = "crystal"           # クリスタル
-    DRUM = "drum"                 # ドラム・パーカッション
-    WATER_DROP = "water_drop"     # 水滴音
-    WIND = "wind"                 # 風音
-    STRING = "string"             # 弦楽器
-
-
-class ScaleType(Enum):
-    """音階タイプの列挙"""
-    CHROMATIC = "chromatic"       # 半音階
-    MAJOR = "major"               # 長調
-    MINOR = "minor"               # 短調  
-    PENTATONIC = "pentatonic"     # ペンタトニック
-    BLUES = "blues"               # ブルース
-    WHOLE_TONE = "whole_tone"     # 全音階
-    JAPANESE = "japanese"         # 日本音階
+from ..utils import config_manager
+from ..utils.config import settings
 
 
 @dataclass
@@ -48,7 +27,7 @@ class AudioParameters:
     duration: float               # 持続時間（秒）
     
     # 楽器・音色
-    instrument: InstrumentType    # 楽器タイプ
+    instrument: str    # 楽器タイプ (文字列に変更)
     timbre: float                 # 音色変化（0.0-1.0）
     brightness: float             # 明度（0.0-1.0）
     
@@ -94,57 +73,50 @@ class AudioMapper:
     
     def __init__(
         self,
-        scale: ScaleType = ScaleType.PENTATONIC,
-        base_octave: int = 4,                    # 基準オクターブ（C4 = 60）
-        pitch_range: Tuple[int, int] = (48, 84), # 音域（C3～C6）
-        volume_curve: str = "logarithmic",       # 音量カーブ（linear/logarithmic/exponential）
-        spatial_range: float = 2.0,             # 空間範囲（メートル）
-        default_instrument: InstrumentType = InstrumentType.MARIMBA,
-        enable_adaptive_mapping: bool = True     # 適応的マッピング
+        base_octave: int = 4,
+        pitch_range: Tuple[int, int] = (48, 84),
+        volume_curve: str = "logarithmic",
+        spatial_range: float = 2.0,
+        enable_adaptive_mapping: bool = True
     ):
         """
         初期化
-        
-        Args:
-            scale: 使用する音階
-            base_octave: 基準オクターブ
-            pitch_range: 音域範囲 (min_note, max_note)
-            volume_curve: 音量カーブタイプ
-            spatial_range: 空間マッピング範囲
-            default_instrument: デフォルト楽器
-            enable_adaptive_mapping: 適応的マッピングを有効にするか
         """
-        self.scale = scale
+        self.audio_config = settings.get('audio', {})
+        
+        # configから直接読み込む
+        self.scale_patterns = self._load_scales_from_config()
+        self.instrument_envelopes = self._load_instrument_envelopes_from_config()
+        
+        self.scale = self.audio_config.get('default_scale', 'PENTATONIC').upper()
+        if self.scale not in self.scale_patterns:
+            self.scale = next(iter(self.scale_patterns)) # フォールバック
+
+        self.default_instrument = self.audio_config.get('default_instrument', 'MARIMBA').upper()
+        if self.default_instrument not in self.instrument_envelopes:
+            self.default_instrument = next(iter(self.instrument_envelopes)) # フォールバック
+
         self.base_octave = base_octave
         self.pitch_range = pitch_range
         self.volume_curve = volume_curve
         self.spatial_range = spatial_range
-        self.default_instrument = default_instrument
         self.enable_adaptive_mapping = enable_adaptive_mapping
         
-        # 音階パターンを初期化
-        self.scale_patterns = self._initialize_scale_patterns()
-        
-        # 楽器マッピングテーブル
-        self.instrument_mappings = self._initialize_instrument_mappings()
-        
-        # 適応的パラメータ
         self.adaptive_params = {
-            'y_range': [0.0, 1.0],           # Y座標の実測範囲
-            'velocity_range': [0.0, 1.0],    # 速度の実測範囲
-            'x_range': [-1.0, 1.0],          # X座標の実測範囲
+            'y_range': [0.0, 1.0],
+            'velocity_range': [0.0, 1.0],
+            'x_range': [-1.0, 1.0],
             'samples_count': 0,
-            'update_interval': 100           # 適応更新間隔
+            'update_interval': 100
         }
         
-        # パフォーマンス統計
         self.stats = {
             'total_mappings': 0,
             'total_time_ms': 0.0,
             'average_time_ms': 0.0,
             'last_mapping_time_ms': 0.0,
-            'instrument_usage': {inst: 0 for inst in InstrumentType},
-            'note_distribution': np.zeros(128)  # MIDI note distribution
+            'instrument_usage': {inst: 0 for inst in self.instrument_envelopes.keys()},
+            'note_distribution': np.zeros(128)
         }
     
     def map_collision_event(self, event: CollisionEvent) -> AudioParameters:
@@ -222,7 +194,8 @@ class AudioMapper:
         normalized_y = max(0.0, min(1.0, normalized_y))
         
         # 音階に応じて量子化
-        scale_notes = self.scale_patterns[self.scale]
+        scale_key = self.scale
+        scale_notes = self.scale_patterns.get(scale_key, [0, 2, 4, 7, 9])
         min_note, max_note = self.pitch_range
         
         # スケール内の音程を計算
@@ -240,85 +213,54 @@ class AudioMapper:
         return max(min_note, min(max_note, final_note))
     
     def _map_velocity(self, event: CollisionEvent) -> float:
-        """衝突速度・強度を音量にマッピング"""
-        # 速度成分（適応的範囲使用）
-        vel_min, vel_max = self.adaptive_params['velocity_range']
-        if vel_max > vel_min:
-            velocity_component = (event.velocity - vel_min) / (vel_max - vel_min)
-        else:
-            velocity_component = 0.5
+        """衝突イベントの速度と強度を音量にマッピング"""
+        # 基本速度
+        base_velocity = np.clip(event.velocity * 2.0, 0.1, 1.0) # 0.5m/sで最大に
         
-        velocity_component = max(0.0, min(1.0, velocity_component))
+        # 侵入深度による加算
+        depth_factor = np.clip(event.penetration_depth * 10.0, 0.0, 0.2)
         
-        # 強度成分（8段階）
-        intensity_component = event.intensity.value / CollisionIntensity.MAXIMUM.value
+        # 強度による乗算
+        intensity_factor = (event.intensity.value / CollisionIntensity.MAXIMUM.value)
         
-        # 侵入深度成分
-        depth_component = min(event.penetration_depth * 100, 1.0)
-        
-        # 重み付き結合
-        combined_velocity = (
-            velocity_component * 0.4 + 
-            intensity_component * 0.4 + 
-            depth_component * 0.2
-        )
-        
-        # 音量カーブ適用
+        final_velocity = base_velocity * (1.0 + depth_factor) * (0.5 + intensity_factor * 0.5)
+
+        # 対数カーブ
         if self.volume_curve == "logarithmic":
-            # 対数カーブ（より自然な音量変化）
-            mapped_velocity = np.power(combined_velocity, 0.5)
-        elif self.volume_curve == "exponential":
-            # 指数カーブ（急激な変化）
-            mapped_velocity = np.power(combined_velocity, 2.0)
-        else:  # linear
-            mapped_velocity = combined_velocity
-        
-        return max(0.01, min(1.0, mapped_velocity))  # 完全無音は避ける
+            # ゼロや負の値を回避
+            safe_velocity = max(1e-4, final_velocity)
+            # 1.0以上にならないようにクリップし、floatに変換
+            return float(np.clip(np.log1p(safe_velocity * 9) / np.log1p(9), 0.0, 1.0))
+
+        return float(np.clip(final_velocity, 0.0, 1.0))
     
     def _map_duration(self, event: CollisionEvent) -> float:
         """持続時間をマッピング"""
-        # 基本持続時間（楽器タイプに依存）
-        base_duration = 1.0
+        # 継続時間があればそれを優先
+        if event.event_type == EventType.COLLISION_CONTINUE and event.duration_ms > 0:
+            return event.duration_ms / 1000.0
         
-        # 接触面積による調整
-        area_factor = min(event.contact_area * 1000, 2.0)  # 0-2倍
+        # 強度と速度に基づいて基本時間を設定
+        base_duration = 0.1 + (event.intensity.value / CollisionIntensity.MAXIMUM.value) * 1.0
+        velocity_factor = 1.0 + np.clip(event.velocity, 0, 1.0)
         
-        # 強度による調整
-        intensity_factor = 0.5 + (event.intensity.value / CollisionIntensity.MAXIMUM.value) * 1.5
-        
-        duration = base_duration * area_factor * intensity_factor
+        duration = base_duration * velocity_factor
         return max(0.1, min(5.0, duration))
     
-    def _select_instrument(self, event: CollisionEvent) -> InstrumentType:
-        """楽器を選択"""
-        # デフォルト楽器から開始
-        instrument = self.default_instrument
-        
-        # 衝突タイプによる楽器選択
-        if hasattr(event, 'collision_type'):
-            collision_type_str = str(event.collision_type)
-            if "FACE_COLLISION" in collision_type_str:
-                instrument = InstrumentType.MARIMBA
-            elif "EDGE_COLLISION" in collision_type_str:
-                instrument = InstrumentType.BELL
-            elif "VERTEX_COLLISION" in collision_type_str:
-                instrument = InstrumentType.CRYSTAL
-        
-        # 高度（Y座標）による楽器選択
+    def _select_instrument(self, event: CollisionEvent) -> str:
+        """衝突イベントに基づいて楽器を選択"""
+        # Y座標（高さ）に基づいて楽器を切り替える
         y_pos = event.contact_position[1]
-        if y_pos > 0.7:
-            instrument = InstrumentType.BELL
-        elif y_pos < 0.3:
-            instrument = InstrumentType.DRUM
         
-        # 音色ヒントによる調整
-        if hasattr(event, 'timbre_hint'):
-            if event.timbre_hint > 0.8:
-                instrument = InstrumentType.CRYSTAL
-            elif event.timbre_hint < 0.2:
-                instrument = InstrumentType.WATER_DROP
-        
-        return instrument
+        if y_pos > 0.8:
+            return "CRYSTAL"
+        elif y_pos > 0.5:
+            return "BELL"
+        elif y_pos > 0.2:
+            return "MARIMBA"
+        else:
+            # 低い位置はパーカッシブな音
+            return self.audio_config.get('percussion_instrument', 'DRUM').upper()
     
     def _map_timbre(self, event: CollisionEvent) -> float:
         """音色をマッピング"""
@@ -378,141 +320,58 @@ class AudioMapper:
         reverb = distance_factor * 0.6 + area_factor * 0.4
         return max(0.0, min(0.8, reverb))  # 最大80%
     
-    def _map_envelope(self, event: CollisionEvent, instrument: InstrumentType) -> Tuple[float, float, float, float]:
-        """楽器タイプに応じたエンベロープをマッピング"""
-        
-        # 楽器ごとのデフォルトエンベロープ
-        envelopes = {
-            InstrumentType.MARIMBA: (0.01, 0.1, 0.8, 0.5),
-            InstrumentType.SYNTH_PAD: (0.2, 0.3, 0.9, 1.0),
-            InstrumentType.BELL: (0.02, 0.2, 0.7, 1.2),
-            InstrumentType.CRYSTAL: (0.01, 0.05, 0.6, 0.8),
-            InstrumentType.DRUM: (0.001, 0.05, 0.5, 0.2),
-            InstrumentType.WATER_DROP: (0.05, 0.1, 0.8, 0.3),
-            InstrumentType.WIND: (0.5, 0.5, 0.9, 1.5),
-            InstrumentType.STRING: (0.1, 0.2, 0.8, 0.6)
-        }
-        
-        attack, decay, sustain, release = envelopes.get(
-            instrument, (0.05, 0.2, 0.8, 0.5)
-        )
-        
-        # 強度による調整
-        intensity_factor = event.intensity.value / CollisionIntensity.MAXIMUM.value
-        
-        # アタックは強度が高いほど短く
-        attack *= (1.0 - intensity_factor * 0.5)
-        
-        # リリースは接触面積が大きいほど長く
-        area_factor = min(event.contact_area * 1000, 2.0)
-        release *= area_factor
-        
-        return (
-            max(0.001, attack),
-            max(0.01, decay), 
-            max(0.1, min(1.0, sustain)),
-            max(0.1, release)
-        )
+    def _map_envelope(self, event: CollisionEvent, instrument: str) -> Tuple[float, float, float, float]:
+        """イベントと楽器に基づいてエンベロープをマッピング"""
+        envelope = self.instrument_envelopes.get(instrument.upper())
+        if envelope:
+            # 衝突速度に応じてアタックを少し変える
+            attack_mod = 1.0 - np.clip(event.velocity * 0.5, 0, 0.5)
+            return (
+                envelope['attack'] * attack_mod,
+                envelope['decay'],
+                envelope['sustain'],
+                envelope['release']
+            )
+        # デフォルトエンベロープ
+        return (0.01, 0.3, 0.5, 0.5)
 
-    def _initialize_scale_patterns(self) -> Dict[ScaleType, List[int]]:
-        """音階パターンを初期化"""
-        return {
-            ScaleType.CHROMATIC: list(range(12)),
-            ScaleType.MAJOR: [0, 2, 4, 5, 7, 9, 11],
-            ScaleType.MINOR: [0, 2, 3, 5, 7, 8, 10],
-            ScaleType.PENTATONIC: [0, 2, 4, 7, 9],
-            ScaleType.BLUES: [0, 3, 5, 6, 7, 10],
-            ScaleType.WHOLE_TONE: [0, 2, 4, 6, 8, 10],
-            ScaleType.JAPANESE: [0, 1, 5, 7, 8]  # 雅楽音階
-        }
-    
-    def _initialize_instrument_mappings(self) -> Dict[InstrumentType, Dict[str, float]]:
-        """楽器特性マッピングを初期化"""
-        return {
-            InstrumentType.MARIMBA: {
-                'brightness_base': 0.6,
-                'decay_multiplier': 1.0,
-                'reverb_affinity': 0.3
-            },
-            InstrumentType.SYNTH_PAD: {
-                'brightness_base': 0.4,
-                'decay_multiplier': 3.0,
-                'reverb_affinity': 0.8
-            },
-            InstrumentType.BELL: {
-                'brightness_base': 0.8,
-                'decay_multiplier': 2.0,
-                'reverb_affinity': 0.6
-            },
-            InstrumentType.CRYSTAL: {
-                'brightness_base': 0.9,
-                'decay_multiplier': 1.5,
-                'reverb_affinity': 0.4
-            },
-            InstrumentType.DRUM: {
-                'brightness_base': 0.5,
-                'decay_multiplier': 0.3,
-                'reverb_affinity': 0.2
-            },
-            InstrumentType.WATER_DROP: {
-                'brightness_base': 0.7,
-                'decay_multiplier': 0.5,
-                'reverb_affinity': 0.5
-            },
-            InstrumentType.WIND: {
-                'brightness_base': 0.3,
-                'decay_multiplier': 4.0,
-                'reverb_affinity': 0.9
-            },
-            InstrumentType.STRING: {
-                'brightness_base': 0.6,
-                'decay_multiplier': 2.0,
-                'reverb_affinity': 0.5
-            }
-        }
-    
+    def _load_scales_from_config(self) -> Dict[str, List[int]]:
+        """config.yamlから音階定義を読み込む"""
+        scales_config = self.audio_config.get('scales', {})
+        return {name.upper(): pattern for name, pattern in scales_config.items()}
+
+    def _load_instrument_envelopes_from_config(self) -> Dict[str, Dict[str, float]]:
+        """config.yamlから楽器のエンベロープ定義を読み込む"""
+        instruments_config = self.audio_config.get('instruments', {})
+        envelopes = {}
+        for name, details in instruments_config.items():
+            if 'envelope' in details:
+                envelopes[name.upper()] = details['envelope']
+        return envelopes
+
     def _update_adaptive_params(self, event: CollisionEvent):
-        """適応的パラメータを更新"""
+        """適応的パラメータ（Y座標、速度、X座標の範囲）を更新"""
         self.adaptive_params['samples_count'] += 1
         
         if self.adaptive_params['samples_count'] % self.adaptive_params['update_interval'] == 0:
-            # Y座標範囲の適応更新
-            y_pos = event.contact_position[1]
-            y_min, y_max = self.adaptive_params['y_range']
-            self.adaptive_params['y_range'] = [
-                min(y_min, y_pos),
-                max(y_max, y_pos)
-            ]
-            
-            # 速度範囲の適応更新
-            vel_min, vel_max = self.adaptive_params['velocity_range']
-            self.adaptive_params['velocity_range'] = [
-                min(vel_min, event.velocity),
-                max(vel_max, event.velocity)
-            ]
-            
-            # X座標範囲の適応更新
-            x_pos = event.contact_position[0]
-            x_min, x_max = self.adaptive_params['x_range']
-            self.adaptive_params['x_range'] = [
-                min(x_min, x_pos),
-                max(x_max, x_pos)
-            ]
-    
+            # 範囲をわずかにリセットして外れ値の影響を徐々に減らす
+            self.adaptive_params['y_range'][0] *= 1.05
+            self.adaptive_params['y_range'][1] *= 0.95
+            self.adaptive_params['velocity_range'][1] *= 0.95
+
     def _update_stats(self, elapsed_ms: float, audio_params: AudioParameters):
-        """パフォーマンス統計更新"""
+        """パフォーマンス統計を更新"""
         self.stats['total_mappings'] += 1
         self.stats['total_time_ms'] += elapsed_ms
         self.stats['average_time_ms'] = self.stats['total_time_ms'] / self.stats['total_mappings']
         self.stats['last_mapping_time_ms'] = elapsed_ms
         
-        # 楽器使用統計
-        self.stats['instrument_usage'][audio_params.instrument] += 1
+        # 楽器使用状況
+        inst_key = audio_params.instrument.upper()
+        self.stats['instrument_usage'][inst_key] += 1
         
-        # 音高分布統計
-        midi_note = audio_params.midi_note
-        if 0 <= midi_note < 128:
-            self.stats['note_distribution'][midi_note] += 1
+        # 音高分布
+        self.stats['note_distribution'][audio_params.midi_note] += 1
     
     def get_performance_stats(self) -> dict:
         """パフォーマンス統計取得"""
@@ -528,15 +387,19 @@ class AudioMapper:
             'total_time_ms': 0.0,
             'average_time_ms': 0.0,
             'last_mapping_time_ms': 0.0,
-            'instrument_usage': {inst: 0 for inst in InstrumentType},
+            'instrument_usage': {inst: 0 for inst in self.instrument_envelopes.keys()},
             'note_distribution': np.zeros(128)
         }
         
         self.adaptive_params['samples_count'] = 0
     
-    def set_scale(self, scale: ScaleType):
-        """音階を変更"""
-        self.scale = scale
+    def set_scale(self, scale_name: str):
+        """使用する音階を設定"""
+        scale_name_upper = scale_name.upper()
+        if scale_name_upper in self.scale_patterns:
+            self.scale = scale_name_upper
+        else:
+            raise ValueError(f"Scale '{scale_name}' not found in config.")
     
     def set_pitch_range(self, min_note: int, max_note: int):
         """音域を変更"""
@@ -551,21 +414,26 @@ class AudioMapper:
 
 def map_collision_to_audio(
     event: CollisionEvent,
-    scale: ScaleType = ScaleType.PENTATONIC,
-    instrument: InstrumentType = InstrumentType.MARIMBA
+    scale: Optional[str] = None,
+    instrument: Optional[str] = None
 ) -> AudioParameters:
     """
-    衝突イベントを音響パラメータにマッピング（簡単なインターフェース）
+    衝突イベントを音響パラメータにマッピングする簡易関数
     
     Args:
         event: 衝突イベント
-        scale: 使用する音階
-        instrument: デフォルト楽器
+        scale: 音階（指定されない場合はコンフィグのデフォルト値を使用）
+        instrument: 楽器（指定されない場合はコンフィグのデフォルト値を使用）
         
     Returns:
         音響パラメータ
     """
-    mapper = AudioMapper(scale=scale, default_instrument=instrument)
+    mapper = AudioMapper()
+    if scale:
+        mapper.set_scale(scale)
+    if instrument:
+        mapper.default_instrument = instrument
+    
     return mapper.map_collision_event(event)
 
 
@@ -574,11 +442,11 @@ def batch_map_collisions(
     mapper: Optional[AudioMapper] = None
 ) -> List[AudioParameters]:
     """
-    複数の衝突イベントを一括マッピング
+    複数の衝突イベントを一括でマッピング
     
     Args:
         events: 衝突イベントのリスト
-        mapper: 使用するマッパー（Noneの場合はデフォルト作成）
+        mapper: 使用するAudioMapperインスタンス（指定されない場合は新規作成）
         
     Returns:
         音響パラメータのリスト
@@ -590,24 +458,11 @@ def batch_map_collisions(
 
 
 def create_scale_mapper(
-    scale: ScaleType,
+    scale_name: str,
     root_note: int = 60  # C4
 ) -> AudioMapper:
-    """
-    指定音階のマッパーを作成
-    
-    Args:
-        scale: 音階タイプ
-        root_note: ルート音のMIDIノート番号
-        
-    Returns:
-        設定されたマッパー
-    """
-    base_octave = root_note // 12
-    pitch_range = (root_note - 12, root_note + 24)  # ±1オクターブ + 1オクターブ
-    
-    return AudioMapper(
-        scale=scale,
-        base_octave=base_octave,
-        pitch_range=pitch_range
-    )
+    """特定の音階に設定されたマッパーを生成"""
+    mapper = AudioMapper()
+    mapper.set_scale(scale_name)
+    # 必要に応じて他のパラメータも設定
+    return mapper

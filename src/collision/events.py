@@ -98,53 +98,107 @@ class CollisionEventQueue:
             'queue_overflows': 0
         }
     
-    def create_event(
+    def update_state(
         self,
         collision_info: CollisionInfo,
         hand_id: str,
         hand_position: np.ndarray,
         hand_velocity: Optional[np.ndarray] = None
     ) -> Optional[CollisionEvent]:
-        """衝突イベントを作成"""
-        if not collision_info.has_collision:
-            return self._end_active_event(hand_id)
-        
+        """
+        特定のハンドIDの衝突状態を更新し、適切なイベントを生成する。
+        これはステートマシンのように動作する。
+        """
+        is_colliding = collision_info.has_collision
+        is_active = hand_id in self.active_events
+
+        if is_colliding:
+            if is_active:
+                # 継続 (CONTINUE)
+                return self._continue_active_event(collision_info, hand_id, hand_position, hand_velocity)
+            else:
+                # 開始 (START)
+                return self._start_new_event(collision_info, hand_id, hand_position, hand_velocity)
+        else:
+            if is_active:
+                # 終了 (END)
+                return self._end_active_event(hand_id)
+            else:
+                # 何もなし
+                return None
+
+    def _start_new_event(
+        self,
+        collision_info: CollisionInfo,
+        hand_id: str,
+        hand_position: np.ndarray,
+        hand_velocity: Optional[np.ndarray]
+    ) -> Optional[CollisionEvent]:
+        """新しい衝突イベントを開始"""
         primary_contact = collision_info.closest_point
-        if primary_contact is None:
+        if not primary_contact:
             return None
-        
+
+        self.event_counter += 1
+        event_id = f"collision_{self.event_counter:06d}"
         velocity = np.linalg.norm(hand_velocity) if hand_velocity is not None else 0.0
-        intensity = self._calculate_intensity(collision_info, velocity)
-        
+
         event = CollisionEvent(
-            event_id=f"collision_{self.event_counter:06d}",
+            event_id=event_id,
             event_type=EventType.COLLISION_START,
             timestamp=time.perf_counter(),
             duration_ms=0.0,
-            
             contact_position=primary_contact.position.copy(),
             hand_position=hand_position.copy(),
             surface_normal=primary_contact.normal.copy(),
-            
-            intensity=intensity,
+            intensity=self._calculate_intensity(collision_info, velocity),
             velocity=velocity,
             penetration_depth=primary_contact.depth,
             contact_area=self._estimate_contact_area(collision_info),
-            
             pitch_hint=max(0.0, min(1.0, primary_contact.position[1])),
             timbre_hint=0.5,
             spatial_position=np.array([primary_contact.position[0], 0.0, primary_contact.position[2]]),
-            
             triangle_index=primary_contact.triangle_index,
             hand_id=hand_id,
             collision_type=primary_contact.collision_type
         )
-        
-        self.event_counter += 1
         self.active_events[hand_id] = event
         self._add_to_queue(event)
-        
         return event
+
+    def _continue_active_event(
+        self,
+        collision_info: CollisionInfo,
+        hand_id: str,
+        hand_position: np.ndarray,
+        hand_velocity: Optional[np.ndarray]
+    ) -> Optional[CollisionEvent]:
+        """アクティブな衝突イベントを継続"""
+        active_event = self.active_events.get(hand_id)
+        if not active_event:
+            # 予期せぬケース: STARTイベントとして扱う
+            return self._start_new_event(collision_info, hand_id, hand_position, hand_velocity)
+
+        primary_contact = collision_info.closest_point
+        if not primary_contact:
+            return None
+            
+        velocity = np.linalg.norm(hand_velocity) if hand_velocity is not None else 0.0
+        
+        # 既存イベントを更新
+        active_event.event_type = EventType.COLLISION_CONTINUE
+        active_event.duration_ms = (time.perf_counter() - active_event.timestamp) * 1000
+        active_event.contact_position = primary_contact.position.copy()
+        active_event.hand_position = hand_position.copy()
+        active_event.surface_normal = primary_contact.normal.copy()
+        active_event.intensity = self._calculate_intensity(collision_info, velocity)
+        active_event.velocity = velocity
+        active_event.penetration_depth = primary_contact.depth
+        active_event.contact_area = self._estimate_contact_area(collision_info)
+        active_event.pitch_hint = max(0.0, min(1.0, primary_contact.position[1]))
+        
+        self._add_to_queue(active_event)
+        return active_event
     
     def _calculate_intensity(self, collision_info: CollisionInfo, velocity: float) -> CollisionIntensity:
         """衝突強度を計算"""
@@ -183,7 +237,7 @@ class CollisionEventQueue:
             return None
         
         end_event = CollisionEvent(
-            event_id=f"collision_{self.event_counter:06d}",
+            event_id=active_event.event_id, # 同じIDを引き継ぐ
             event_type=EventType.COLLISION_END,
             timestamp=time.perf_counter(),
             duration_ms=(time.perf_counter() - active_event.timestamp) * 1000,
@@ -206,7 +260,7 @@ class CollisionEventQueue:
             collision_type=active_event.collision_type
         )
         
-        self.event_counter += 1
+        self.event_counter += 1 # ENDイベントもカウントはする
         self._add_to_queue(end_event)
         return end_event
     
@@ -243,7 +297,7 @@ def create_collision_event(
 ) -> Optional[CollisionEvent]:
     """衝突イベントを作成（簡単なインターフェース）"""
     queue = CollisionEventQueue()
-    return queue.create_event(collision_info, hand_id, hand_position, hand_velocity)
+    return queue.update_state(collision_info, hand_id, hand_position, hand_velocity)
 
 
 def process_collision_events(
@@ -258,7 +312,7 @@ def process_collision_events(
     
     for i, (collision_info, hand_id, hand_pos) in enumerate(zip(collision_infos, hand_ids, hand_positions)):
         velocity = hand_velocities[i] if hand_velocities else None
-        event = queue.create_event(collision_info, hand_id, hand_pos, velocity)
+        event = queue.update_state(collision_info, hand_id, hand_pos, velocity)
         if event:
             events.append(event)
     

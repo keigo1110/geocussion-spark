@@ -1,0 +1,161 @@
+# Geocussion-Spark 改善プロジェクト 要件定義書
+# 本ドキュメントは、`inst/develop.md`の分析に基づき、具体的な実装タスクを定義します。
+
+meta:
+  version: 1.0
+  author: "AI Assistant"
+  last_updated: "2023-10-27"
+
+# ==============================================================================
+# フェーズ1: プロジェクト基盤の整備
+# 概要: 開発効率、安定性、再現性を確保するための基本的な環境を整備する。
+# ==============================================================================
+phase_1_foundation:
+  title: "プロジェクト基盤の整備"
+  tasks:
+    - id: F1-T1
+      title: "依存関係の管理"
+      description: "pipを利用して依存ライブラリのバージョンを固定し、開発環境の再現性を保証する。"
+      target_modules:
+        - "requirements.txt"
+      acceptance_criteria:
+        - "プロジェクトルートに`requirements.txt`が作成されている。"
+        - "`pip install -r requirements.txt`で環境構築が正常に完了する。"
+
+    - id: F1-T2
+      title: "テストフレームワークの導入"
+      description: "`pytest`を導入し、自動テストを実行するための基本的な設定とディレクトリ構造を整備する。"
+      target_modules:
+        - "tests/"
+        - "pytest.ini"
+      acceptance_criteria:
+        - "`tests/`ディレクトリに空のテストファイルを追加し、`pytest`コマンドでテストが実行され、正常にパスすること。"
+        - "基本的な`pytest.ini`設定ファイルが作成されている。"
+
+    - id: F1-T3
+      title: "中央集権的なロギング基盤の導入"
+      description: "Python標準の`logging`モジュールをラップした共通ロガーを実装し、構造化されたログをコンソールとファイルに出力できるようにする。"
+      target_modules:
+        - "src/utils/logger.py"
+      acceptance_criteria:
+        - "ログレベル(INFO, WARNING, ERROR)に応じた出力ができる。"
+        - "全ての`print()`によるデバッグ出力と例外処理を、新しいロガーに置き換える準備が整う。"
+        - "ログフォーマットにタイムスタンプ、ログレベル、モジュール名が含まれる。"
+
+    - id: F1-T4
+      title: "設定管理機能の導入"
+      description: "YAMLファイルを読み込んでアプリケーションの設定を管理する仕組みを導入し、ハードコードされた値を外部化する。"
+      target_modules:
+        - "config.yaml"
+        - "src/utils/config.py"
+      acceptance_criteria:
+        - "プロジェクトルートに`config.yaml`が作成され、いくつかの設定値（例: 閾値、IPアドレス）が定義されている。"
+        - "アプリケーション全体から容易に設定値にアクセスできるシングルトンまたは同様のメカニズムが提供される。"
+
+# ==============================================================================
+# フェーズ2: 致命的なバグの修正
+# 概要: アプリケーションのクラッシュや誤動作に直結する、優先度の高いバグを修正する。
+# ==============================================================================
+phase_2_critical_fixes:
+  title: "致命的なバグの修正"
+  tasks:
+    - id: F2-T1
+      title: "トラッカーの加速度計算バグの修正"
+      description: "`tracker.py`内で、速度ベクトルがディープコピーされておらず、加速度が常にゼロになる問題を修正する。"
+      target_modules:
+        - "src/detection/tracker.py"
+        - "tests/detection/test_tracker.py"
+      acceptance_criteria:
+        - "速度ベクトルを`.copy()`でディープコピーする。"
+        - "加速度が正しく計算されることを検証するユニットテストが追加され、パスすること。"
+
+    - id: F2-T2
+      title: "3D投影時のガウシアンフィルタ実装の誤りを修正"
+      description: "`hands3d.py`内で、深度画像のピクセルの空間的隣接関係を破壊しているフィルタ適用方法を、2D画像全体に適用する正しい方法に修正する。"
+      target_modules:
+        - "src/detection/hands3d.py"
+        - "tests/detection/test_hands3d.py"
+      acceptance_criteria:
+        - "NaNを考慮した2Dガウシアンフィルタ（例: `scipy.ndimage.gaussian_filter`の別実装やOpenCVの機能）に置き換える。"
+        - "フィルタ適用後も画像の構造が破壊されていないことを確認するユニットテストを追加し、パスすること。"
+
+    - id: F2-T3
+      title: "衝突イベントのライフサイクル管理ロジックの修正"
+      description: "`events.py`が`COLLISION_START`しか生成しない問題を解決し、`CONTINUE`, `END`を正しく判定・生成するステートマシンとして再設計する。"
+      target_modules:
+        - "src/collision/events.py"
+        - "tests/collision/test_events.py"
+      acceptance_criteria:
+        - "前フレームと現フレームの衝突状態を比較し、START/CONTINUE/ENDを判定するロジックを実装する。"
+        - "連続した衝突、単発の衝突、衝突の終了といったシナリオを網羅するユニットテストを追加し、パスすること。"
+
+# ==============================================================================
+# フェーズ3: パフォーマンス改善と品質向上
+# 概要: ボトルネックの解消と、コードの堅牢性・保守性を向上させるリファクタリングを行う。
+# ==============================================================================
+phase_3_performance_refactoring:
+  title: "パフォーマンス改善と品質向上"
+  tasks:
+    - id: F3-T1
+      title: "メッシュ属性計算のベクトル化による高速化"
+      description: "`attributes.py`内のPythonループをNumPyのベクトル化された演算に置き換え、法線や曲率の計算を高速化する。"
+      target_modules:
+        - "src/mesh/attributes.py"
+      acceptance_criteria:
+        - "forループが排除され、NumPyの行列演算に置き換えられている。"
+        - "同等の入力に対し、リファクタリング前と同じ結果を返すことを保証するテストが存在する。"
+        - "大規模メッシュでの処理速度が大幅に向上する。"
+
+    - id: F3-T2
+      title: "ハイトマップ生成処理の高速化"
+      description: "`projection.py`内のPythonループを`numpy.histogram2d`等の高効率な関数に置き換え、ハイトマップ生成を高速化する。"
+      target_modules:
+        - "src/mesh/projection.py"
+      acceptance_criteria:
+        - "forループが排除され、NumPyの関数に置き換えられている。"
+        - "大規模点群での処理速度が大幅に向上する。"
+
+    - id: F3-T3
+      title: "スレッドセーフティの確保"
+      description: "複数のモジュールに存在する共有リソース（キャッシュ、統計辞書など）へのアクセスを`threading.Lock`で保護し、データ競合を防止する。"
+      target_modules:
+        - "src/detection/tracker.py"
+        - "src/collision/search.py"
+        - "src/sound/voice_mgr.py"
+      acceptance_criteria:
+        - "共有リソースの読み書きを行う箇所がロックで適切に保護されている。"
+
+# ==============================================================================
+# フェーズ4: 機能拡張と最終調整
+# 概要: 柔軟性の向上、アルゴリズムの改善、残存する問題点の修正を行う。
+# ==============================================================================
+phase_4_enhancements_finalization:
+  title: "機能拡張と最終調整"
+  tasks:
+    - id: F4-T1
+      title: "音響マッピングと楽器定義の外部化"
+      description: "`mapping.py`と`synth.py`にハードコードされている音階や楽器の定義を`config.yaml`に移動させ、柔軟性を高める。"
+      target_modules:
+        - "src/sound/mapping.py"
+        - "src/sound/synth.py"
+        - "config.yaml"
+      acceptance_criteria:
+        - "新しい楽器や音階を、Pythonコードを変更することなく`config.yaml`への追記だけで追加できる。"
+
+    - id: F4-T2
+      title: "ロバストなボイス管理の実装"
+      description: "`voice_mgr.py`のボイス終了判定とスティールロジックを改善し、より自然な発音管理を実現する。"
+      target_modules:
+        - "src/sound/voice_mgr.py"
+      acceptance_criteria:
+        - "音が鳴り終わったことをより正確に判定するロジックを実装する。"
+        - "ボイススティール時に、即時停止ではなく短いフェードアウトを適用する。"
+
+    - id: F4-T3
+      title: "3Dメッシュ面積計算のバグ修正"
+      description: "`delaunay.py`の面積フィルタが2Dで計算されている問題を、3Dベクトルの外積を用いた正しい面積計算に修正する。"
+      target_modules:
+        - "src/mesh/delaunay.py"
+      acceptance_criteria:
+        - "3D空間での真の三角形面積を計算するロジックに修正されている。"
+        - "修正を検証するユニットテストが追加され、パスすること。"

@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional, Callable, Any
 from enum import Enum
 import numpy as np
+import copy
 
 try:
     import pyo
@@ -20,7 +21,9 @@ except ImportError:
     pyo = None
 
 # 他フェーズとの連携
-from .mapping import AudioParameters, InstrumentType
+from .mapping import AudioParameters
+from ..utils import config_manager
+from ..utils.config import settings
 
 
 class EngineState(Enum):
@@ -55,7 +58,6 @@ class AudioSynthesizer:
     
     def __init__(
         self,
-        config: Optional[AudioConfig] = None,
         enable_physical_modeling: bool = True,
         enable_effects: bool = True,
         enable_spatial_audio: bool = True
@@ -64,26 +66,31 @@ class AudioSynthesizer:
         初期化
         
         Args:
-            config: 音響設定
             enable_physical_modeling: 物理モデリングを有効にするか
             enable_effects: エフェクトを有効にするか
             enable_spatial_audio: 空間音響を有効にするか
         """
-        self.config = config or AudioConfig()
+        self.audio_config = settings.get('audio', {})
+        
+        self.internal_config = AudioConfig(
+            master_volume=self.audio_config.get('master_volume', 0.7),
+            max_polyphony=self.audio_config.get('polyphony', 16)
+        )
+        
         self.enable_physical_modeling = enable_physical_modeling
         self.enable_effects = enable_effects
         self.enable_spatial_audio = enable_spatial_audio
         
         # pyo関連
-        self.server: Optional[pyo.Server] = None
+        self.server: Optional['pyo.Server'] = None
         self.state = EngineState.STOPPED
         
         # 楽器インスタンス
-        self.instruments: Dict[InstrumentType, Any] = {}
+        self.instrument_templates: Dict[str, Dict] = {}
         self.active_voices: Dict[str, Dict] = {}  # voice_id -> voice_data
         
         # エフェクト
-        self.reverb: Optional[Callable[[Any], pyo.Freeverb]] = None
+        self.reverb: Optional['pyo.Freeverb'] = None
         
         # パフォーマンス統計
         self.stats = {
@@ -98,7 +105,13 @@ class AudioSynthesizer:
         # スレッド安全性
         self._lock = threading.Lock()
         
-        print(f"AudioSynthesizer initialized with config: {self.config}")
+        if not pyo:
+            self.state = EngineState.ERROR
+            print("AudioSynthesizer disabled because pyo is not available.")
+        else:
+            # Pyoサーバーが起動する前にテンプレートを初期化
+            self._initialize_instrument_templates()
+            print(f"AudioSynthesizer initialized with config: {self.internal_config}")
     
     def start_engine(self) -> bool:
         """
@@ -107,8 +120,7 @@ class AudioSynthesizer:
         Returns:
             成功したかどうか
         """
-        if pyo is None:
-            print("Error: pyo is not available")
+        if not pyo or self.server is not None:
             self.state = EngineState.ERROR
             return False
         
@@ -117,23 +129,24 @@ class AudioSynthesizer:
             
             # pyoサーバー初期化
             self.server = pyo.Server(
-                sr=self.config.sample_rate,
-                nchnls=self.config.channels,
-                buffersize=self.config.buffer_size,
-                duplex=int(self.config.enable_duplex),
-                audio=self.config.audio_driver
+                sr=self.internal_config.sample_rate,
+                nchnls=self.internal_config.channels,
+                buffersize=self.internal_config.buffer_size,
+                duplex=int(self.internal_config.enable_duplex),
+                audio=self.internal_config.audio_driver
             )
             
             # サーバー起動順序修正: boot() -> start()
             self.server.boot()
             self.server.start()
             
-            # 楽器とエフェクトの初期化
-            self._initialize_instruments()
+            # エフェクトの初期化 (サーバー起動後)
             self._initialize_effects()
             
             self.state = EngineState.RUNNING
-            print(f"Audio engine started successfully. Latency: {self.config.latency_ms:.1f}ms")
+            print(f"Audio engine started successfully. Latency: {self.internal_config.latency_ms:.1f}ms")
+            if self.server:
+                self.server.setAmp(self.internal_config.master_volume)
             return True
             
         except Exception as e:
@@ -172,7 +185,7 @@ class AudioSynthesizer:
         Returns:
             ボイスID（再生に成功した場合）
         """
-        if self.state != EngineState.RUNNING:
+        if not pyo or self.state != EngineState.RUNNING:
             return None
         
         with self._lock:
@@ -180,19 +193,21 @@ class AudioSynthesizer:
                 # ボイスID生成
                 voice_id = f"{params.event_id}_{int(time.time() * 1000000)}"
                 
+                # 楽器テンプレートを検索
+                instrument_name = params.instrument.upper()
+                template = self.instrument_templates.get(instrument_name)
+
+                if template is None:
+                    print(f"Warning: Instrument template '{instrument_name}' not found.")
+                    return None
+
                 # 楽器に応じたボイス生成
-                voice = self._create_voice(params)
+                voice = self._create_voice(params, template)
                 if voice is None:
                     return None
                 
                 # ボイス管理に追加
-                self.active_voices[voice_id] = {
-                    'voice': voice,
-                    'params': params,
-                    'start_time': time.perf_counter(),
-                    'duration': params.duration,
-                    'instrument': params.instrument
-                }
+                self.active_voices[voice_id] = voice
                 
                 # 統計更新
                 self.stats['total_notes_played'] += 1
@@ -208,242 +223,197 @@ class AudioSynthesizer:
                 print(f"Error playing audio: {e}")
                 return None
     
-    def stop_voice(self, voice_id: str):
-        """特定のボイスを停止"""
+    def stop_voice(self, voice_id: str, fadeout_sec: float = 0.0):
+        """
+        特定のボイスを停止
+
+        Args:
+            voice_id (str): 停止するボイスのID
+            fadeout_sec (float, optional): フェードアウト時間(秒). Defaults to 0.0.
+        """
         with self._lock:
             if voice_id in self.active_voices:
                 try:
-                    voice_data = self.active_voices[voice_id]
-                    voice = voice_data['voice']
+                    voice_data = self.active_voices.pop(voice_id) # 先に削除
+                    voice = voice_data['source']
                     
-                    # ボイス停止
-                    if hasattr(voice, 'stop'):
-                        voice.stop()
+                    if fadeout_sec > 0:
+                        # PyoObjectのout()メソッドで滑らかに停止
+                        if hasattr(voice, 'out'):
+                            voice.out(dur=fadeout_sec)
+                    else:
+                        if hasattr(voice, 'stop'):
+                            voice.stop()
                     
-                    # 管理から削除
-                    del self.active_voices[voice_id]
                     self.stats['active_voices_count'] = len(self.active_voices)
                     
                 except Exception as e:
                     print(f"Error stopping voice {voice_id}: {e}")
     
-    def stop_all_voices(self):
-        """全ボイスを停止"""
+    def stop_all_voices(self, fadeout_sec: float = 0.05):
+        """
+        全ボイスを停止
+
+        Args:
+            fadeout_sec (float, optional): フェードアウト時間(秒). Defaults to 0.05.
+        """
         with self._lock:
             voice_ids = list(self.active_voices.keys())
             for voice_id in voice_ids:
-                self.stop_voice(voice_id)
+                self.stop_voice(voice_id, fadeout_sec=fadeout_sec)
     
     def update_master_volume(self, volume: float):
         """マスターボリューム更新"""
-        self.config.master_volume = max(0.0, min(1.0, volume))
+        self.internal_config.master_volume = max(0.0, min(1.0, volume))
         if self.server:
-            self.server.setAmp(self.config.master_volume)
+            self.server.setAmp(self.internal_config.master_volume)
     
-    def _initialize_instruments(self):
-        """楽器を初期化"""
-        if not self.server:
-            return
-        
-        # 各楽器タイプのテンプレートを作成
-        for instrument_type in InstrumentType:
-            self.instruments[instrument_type] = self._create_instrument_template(instrument_type)
+    def _initialize_instrument_templates(self):
+        """設定ファイルから楽器テンプレートを初期化"""
+        if 'instruments' in self.audio_config:
+            self.instrument_templates = self.audio_config['instruments']
+            print(f"Loaded {len(self.instrument_templates)} instrument templates from config.")
+        else:
+            print("Warning: No instrument definitions found in config.yaml")
     
     def _initialize_effects(self):
         """エフェクトを初期化"""
-        if not self.server or not self.enable_effects:
+        if not self.server or not pyo:
             return
         
         try:
-            # リバーブエフェクト (後で入力を渡すファクトリとして保持)
-            self.reverb = lambda inp: pyo.Freeverb(
-                inp,
-                size=0.8,
-                damp=0.6,
-                bal=self.config.reverb_level
-            )
+            # マスターリバーブ
+            reverb_level = self.audio_config.get('reverb_level', 0.2)
+            self.reverb = pyo.Freeverb(
+                self.server.getBootedSources(),
+                size=0.8, damp=0.5, bal=reverb_level
+            ).out()
             
             # サーバーのマスターボリュームを設定
-            self.server.setAmp(self.config.master_volume)
+            self.server.setAmp(self.internal_config.master_volume)
             
         except Exception as e:
             print(f"Error initializing effects: {e}")
     
-    def _create_instrument_template(self, instrument_type: InstrumentType) -> Dict:
-        """楽器テンプレートを作成"""
-        
-        templates = {
-            InstrumentType.MARIMBA: {
-                'oscillator_type': 'sine',
-                'harmonics': [1.0, 0.3, 0.1, 0.05],
-                'formant_freq': [440, 880, 1320],
-                'resonance': 0.8,
-                'decay_curve': 'exponential'
-            },
-            
-            InstrumentType.SYNTH_PAD: {
-                'oscillator_type': 'saw',
-                'harmonics': [1.0, 0.5, 0.25, 0.125],
-                'filter_cutoff': 2000,
-                'filter_resonance': 0.3,
-                'decay_curve': 'linear'
-            },
-            
-            InstrumentType.BELL: {
-                'oscillator_type': 'fm',
-                'carrier_ratio': 1.0,
-                'modulator_ratio': 3.14,
-                'modulation_index': 2.0,
-                'decay_curve': 'exponential'
-            },
-            
-            InstrumentType.CRYSTAL: {
-                'oscillator_type': 'sine',
-                'harmonics': [1.0, 0.8, 0.6, 0.4, 0.2],
-                'detune': 0.02,
-                'chorus_depth': 0.3,
-                'decay_curve': 'exponential'
-            },
-            
-            InstrumentType.DRUM: {
-                'oscillator_type': 'noise',
-                'filter_type': 'bandpass',
-                'filter_freq': 200,
-                'filter_q': 2.0,
-                'decay_curve': 'exponential'
-            },
-            
-            InstrumentType.WATER_DROP: {
-                'oscillator_type': 'sine',
-                'frequency_sweep': True,
-                'sweep_range': 0.5,
-                'resonance': 0.9,
-                'decay_curve': 'exponential'
-            },
-            
-            InstrumentType.WIND: {
-                'oscillator_type': 'noise',
-                'filter_type': 'lowpass',
-                'filter_cutoff': 1000,
-                'amplitude_modulation': 0.2,
-                'decay_curve': 'linear'
-            },
-            
-            InstrumentType.STRING: {
-                'oscillator_type': 'karplus_strong',
-                'pluck_position': 0.3,
-                'damping': 0.1,
-                'string_tension': 0.8,
-                'decay_curve': 'exponential'
-            }
-        }
-        
-        return templates.get(instrument_type, templates[InstrumentType.MARIMBA])
-    
-    def _create_voice(self, params: AudioParameters) -> Optional[Any]:
-        """パラメータに基づいてボイスを作成"""
-        if not self.server:
+    def _create_voice(self, params: AudioParameters, template: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """オーディオパラメータに基づいてボイスを生成"""
+        if not pyo:
+            return None
+
+        # pyoオブジェクト名を取得
+        pyo_object_name = template.get("pyo_object")
+        if not pyo_object_name or not hasattr(pyo, pyo_object_name):
+            print(f"Error: pyo object '{pyo_object_name}' not found.")
             return None
         
+        pyo_class = getattr(pyo, pyo_object_name)
+
+        # パラメータを構築
+        voice_params = copy.deepcopy(template.get("default_params", {}))
+        voice_params['freq'] = params.frequency
+        voice_params['mul'] = params.velocity
+
+        # ADSRエンベロープを作成
+        envelope = pyo.Adsr(
+            attack=params.attack,
+            decay=params.decay,
+            sustain=params.sustain,
+            release=params.release,
+            dur=params.duration,
+            mul=voice_params.get('mul', params.velocity)
+        )
+        # 再生終了後に自身をクリーンアップするコールバックを設定
+        envelope.setCallback(lambda: self.cleanup_voice(params.event_id))
+
+        voice_params['mul'] = envelope
+
+        # Pyoオブジェクトをインスタンス化
         try:
-            instrument_template = self.instruments[params.instrument]
-            
-            # 基本周波数
-            freq = params.frequency
-            
-            # エンベロープ
-            envelope = pyo.Adsr(
-                attack=params.attack,
-                decay=params.decay,
-                sustain=params.sustain,
-                release=params.release,
-                dur=params.duration
-            )
-            
-            # 楽器に応じたオシレーター生成
-            oscillator = self._create_oscillator(params, instrument_template, freq)
-            
-            # 音量適用
-            voice = oscillator * envelope * params.velocity
-            
-            # パンニング適用
-            if self.enable_spatial_audio and self.config.channels == 2:
-                voice = pyo.Pan(voice, outs=2, pan=params.pan)
-            
-            # エフェクト適用
-            if self.enable_effects and self.reverb:
-                reverb_send = voice * params.reverb
-                reverb_out = self.reverb(reverb_send)
-                voice = voice + reverb_out
-            
-            # 出力開始
-            voice.out()
-            envelope.play()
-            
-            return voice
-            
+            sound_source = pyo_class(**voice_params)
         except Exception as e:
-            print(f"Error creating voice: {e}")
+            print(f"Error creating pyo object '{pyo_object_name}' with params {voice_params}: {e}")
             return None
-    
-    def _create_oscillator(self, params: AudioParameters, template: Dict, freq: float) -> Any:
-        """楽器テンプレートに基づいてオシレーターを作成"""
-        
-        osc_type = template.get('oscillator_type', 'sine')
-        
-        if osc_type == 'sine':
-            return pyo.Sine(freq=freq)
-            
-        elif osc_type == 'saw':
-            return pyo.Saw(freq=freq)
-            
-        elif osc_type == 'fm':
-            carrier_ratio = template.get('carrier_ratio', 1.0)
-            modulator_ratio = template.get('modulator_ratio', 2.0)
-            mod_index = template.get('modulation_index', 1.0)
-            
-            modulator = pyo.Sine(freq=freq * modulator_ratio)
-            return pyo.Sine(freq=freq * carrier_ratio + modulator * mod_index)
-            
-        elif osc_type == 'noise':
-            return pyo.Noise()
-            
-        elif osc_type == 'karplus_strong':
-            return pyo.Pluck(
-                freq=freq,
-                dur=params.duration,
-                damping=template.get('damping', 0.1)
-            )
-        
+
+        # 空間配置
+        if self.enable_spatial_audio:
+            panner = pyo.Pan(sound_source, outs=2, pan=params.pan, spread=0.5)
         else:
-            # デフォルト
-            return pyo.Sine(freq=freq)
+            panner = sound_source.mix(2)
+
+        # リバーブ処理
+        if self.enable_effects and self.reverb:
+            # Pyoオブジェクトを直接リバーブに渡す
+            final_output = self.reverb(panner).mix(2)
+        else:
+            final_output = panner
+
+        final_output.out()
+
+        return {
+            "source": sound_source,
+            "envelope": envelope,
+            "panner": panner,
+            "output": final_output,
+            "timestamp": time.perf_counter(),
+            "event_id": params.event_id
+        }
     
     def cleanup_finished_voices(self):
-        """終了したボイスをクリーンアップ"""
+        """再生が完了したボイスをクリーンアップ"""
+        if not pyo:
+            return
+        # このメソッドはAdsrのコールバックから直接呼ばれるようになったため、
+        # 定期的な呼び出しは不要になった
+        pass
+
+    def cleanup_voice(self, event_id: str):
+        """特定のイベントIDに紐づくボイスをクリーンアップ"""
         with self._lock:
-            current_time = time.perf_counter()
-            finished_voices = []
+            # event_idに部分一致するボイスを探す
+            voices_to_remove = [
+                vid for vid in self.active_voices 
+                if self.active_voices[vid].get("event_id") == event_id
+            ]
             
-            for voice_id, voice_data in self.active_voices.items():
-                elapsed = current_time - voice_data['start_time']
-                if elapsed >= voice_data['duration']:
-                    finished_voices.append(voice_id)
-            
-            for voice_id in finished_voices:
-                self.stop_voice(voice_id)
+            for voice_id in voices_to_remove:
+                if voice_id in self.active_voices:
+                    # stop()は不要、ADSRが完了しているため
+                    del self.active_voices[voice_id]
+                    self.stats['active_voices_count'] = len(self.active_voices)
     
+    def update_voice_parameters(self, voice_id: str, volume: Optional[float], pan: Optional[float], reverb: Optional[float]):
+        """再生中のボイスのパラメータを更新"""
+        if not pyo:
+            return
+            
+        with self._lock:
+            voice_data = self.active_voices.get(voice_id)
+            if not voice_data:
+                return
+
+            if volume is not None and 'envelope' in voice_data:
+                voice_data['envelope'].mul = volume
+            
+            if pan is not None and 'panner' in voice_data:
+                voice_data['panner'].pan = pan
+            
+            # リバーブの動的変更は複雑なため、ここでは未実装
+            # if reverb is not None and self.reverb:
+            #     pass
+
     def get_performance_stats(self) -> dict:
-        """パフォーマンス統計取得"""
-        stats = self.stats.copy()
-        stats['engine_state'] = self.state.value
-        stats['config'] = {
-            'sample_rate': self.config.sample_rate,
-            'buffer_size': self.config.buffer_size,
-            'latency_ms': self.config.latency_ms,
-            'max_polyphony': self.config.max_polyphony
-        }
-        return stats
+        """パフォーマンス統計を取得"""
+        with self._lock:
+            stats = self.stats.copy()
+            stats['engine_state'] = self.state.value
+            stats['config'] = {
+                'sample_rate': self.internal_config.sample_rate,
+                'buffer_size': self.internal_config.buffer_size,
+                'latency_ms': self.internal_config.latency_ms,
+                'max_polyphony': self.internal_config.max_polyphony
+            }
+            stats['cpu_usage'] = self.server.getCPU() if self.server else 0.0
+            return stats
     
     def reset_stats(self):
         """統計リセット"""
@@ -460,28 +430,18 @@ class AudioSynthesizer:
 # 便利関数
 
 def create_audio_synthesizer(
-    sample_rate: int = 44100,
-    buffer_size: int = 256,
-    max_polyphony: int = 32
+    enable_physical_modeling: bool = True,
+    enable_effects: bool = True,
+    enable_spatial_audio: bool = True,
 ) -> AudioSynthesizer:
     """
-    音響シンセサイザーを作成（簡単なインターフェース）
-    
-    Args:
-        sample_rate: サンプリングレート
-        buffer_size: バッファサイズ
-        max_polyphony: 最大ポリフォニー
-        
-    Returns:
-        設定されたシンセサイザー
+    AudioSynthesizerのファクトリ関数
     """
-    config = AudioConfig(
-        sample_rate=sample_rate,
-        buffer_size=buffer_size,
-        max_polyphony=max_polyphony
+    return AudioSynthesizer(
+        enable_physical_modeling=enable_physical_modeling,
+        enable_effects=enable_effects,
+        enable_spatial_audio=enable_spatial_audio
     )
-    
-    return AudioSynthesizer(config=config)
 
 
 def play_audio_immediately(
@@ -489,14 +449,7 @@ def play_audio_immediately(
     synthesizer: Optional[AudioSynthesizer] = None
 ) -> Optional[str]:
     """
-    音響パラメータを即座に再生
-    
-    Args:
-        params: 音響パラメータ
-        synthesizer: 使用するシンセサイザー（Noneの場合は新規作成）
-        
-    Returns:
-        ボイスID
+    音響パラメータを即時再生するヘルパー関数
     """
     if synthesizer is None:
         synthesizer = create_audio_synthesizer()

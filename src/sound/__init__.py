@@ -15,8 +15,6 @@ Geocussion-SP 音響生成フェーズ
 
 # パラメータマッピング
 from .mapping import (
-    InstrumentType,
-    ScaleType,
     AudioParameters,
     AudioMapper,
     map_collision_to_audio,
@@ -47,8 +45,6 @@ from .voice_mgr import (
 
 __all__ = [
     # パラメータマッピング
-    'InstrumentType',
-    'ScaleType',
     'AudioParameters',
     'AudioMapper',
     'map_collision_to_audio',

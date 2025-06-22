@@ -24,6 +24,7 @@ import time
 import threading
 from typing import Optional, List, Dict
 import numpy as np
+import logging
 
 # プロジェクトルートをパスに追加
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -46,22 +47,17 @@ try:
     from src.collision.events import CollisionEventQueue
     
     # 音響生成
-    from src.sound.mapping import (
-        AudioMapper, AudioParameters, InstrumentType, ScaleType,
-        map_collision_to_audio, batch_map_collisions
-    )
-    from src.sound.synth import (
-        AudioSynthesizer, AudioConfig, EngineState,
-        create_audio_synthesizer
-    )
-    from src.sound.voice_mgr import (
-        VoiceManager, StealStrategy, SpatialMode, SpatialConfig,
-        create_voice_manager, allocate_and_play
-    )
+    from src.sound.mapping import AudioMapper, AudioParameters
+    from src.sound.synth import AudioSynthesizer
+    from src.sound.voice_mgr import VoiceManager, StealStrategy
     
     # デバッグ用
     import open3d as o3d
     import cv2
+    
+    # ユーティリティ
+    from src.utils.config import settings
+    from src.utils.logger import setup_logger, LOGGER_NAME
     
 except ImportError as e:
     print(f"Import error: {e}")
@@ -81,15 +77,19 @@ class FullPipelineViewer(DualViewer):
         self.mesh_update_interval = kwargs.pop('mesh_update_interval', 10)  # フレーム
         self.sphere_radius = kwargs.pop('sphere_radius', 0.05)  # 5cm
         
-        # 音響生成関連の設定を追加
+        # 音響生成関連の設定を追加 (config.yamlから読み込む)
         self.enable_audio_synthesis = kwargs.pop('enable_audio_synthesis', True)
-        self.audio_scale = kwargs.pop('audio_scale', ScaleType.PENTATONIC)
-        self.audio_instrument = kwargs.pop('audio_instrument', InstrumentType.MARIMBA)
-        self.audio_polyphony = kwargs.pop('audio_polyphony', 16)
-        self.audio_master_volume = kwargs.pop('audio_master_volume', 0.7)
+        audio_settings = settings.get('audio', {})
+        self.audio_scale_name = kwargs.pop('audio_scale', audio_settings.get('default_scale', 'PENTATONIC')).upper()
+        self.audio_instrument_name = kwargs.pop('audio_instrument', audio_settings.get('default_instrument', 'MARIMBA')).upper()
+        self.audio_polyphony = kwargs.pop('audio_polyphony', audio_settings.get('polyphony', 16))
+        self.audio_master_volume = kwargs.pop('audio_master_volume', audio_settings.get('master_volume', 0.7))
         
         # 親クラス初期化
         super().__init__(**kwargs)
+        
+        # ロガーを初期化 (音響システム初期化より前に)
+        self.log = logging.getLogger(LOGGER_NAME)
         
         # 地形メッシュ生成コンポーネント
         self.projector = PointCloudProjector(
@@ -147,18 +147,18 @@ class FullPipelineViewer(DualViewer):
         if self.enable_audio_synthesis:
             self._initialize_audio_system()
         
-        print("全フェーズ統合ビューワーが初期化されました")
-        print(f"  - メッシュ生成: {'有効' if self.enable_mesh_generation else '無効'}")
-        print(f"  - 衝突検出: {'有効' if self.enable_collision_detection else '無効'}")
-        print(f"  - 接触点可視化: {'有効' if self.enable_collision_visualization else '無効'}")
-        print(f"  - 球半径: {self.sphere_radius*100:.1f}cm")
-        print(f"  - 音響合成: {'有効' if self.enable_audio_synthesis else '無効'}")
+        self.log.info("全フェーズ統合ビューワーが初期化されました")
+        self.log.info(f"  - メッシュ生成: {'有効' if self.enable_mesh_generation else '無効'}")
+        self.log.info(f"  - 衝突検出: {'有効' if self.enable_collision_detection else '無効'}")
+        self.log.info(f"  - 接触点可視化: {'有効' if self.enable_collision_visualization else '無効'}")
+        self.log.info(f"  - 球半径: {self.sphere_radius*100:.1f}cm")
+        self.log.info(f"  - 音響合成: {'有効' if self.enable_audio_synthesis else '無効'}")
         if self.enable_audio_synthesis:
-            print(f"    - 音階: {self.audio_scale.value}")
-            print(f"    - 楽器: {self.audio_instrument.value}")
-            print(f"    - ポリフォニー: {self.audio_polyphony}")
-            print(f"    - 音量: {self.audio_master_volume:.1f}")
-            print(f"    - エンジン状態: {'動作中' if self.audio_enabled else '停止中'}")
+            self.log.info(f"    - 音階: {self.audio_scale_name}")
+            self.log.info(f"    - 楽器: {self.audio_instrument_name}")
+            self.log.info(f"    - ポリフォニー: {self.audio_polyphony}")
+            self.log.info(f"    - 音量: {self.audio_master_volume:.1f}")
+            self.log.info(f"    - エンジン状態: {'動作中' if self.audio_enabled else '停止中'}")
     
     def update_help_text(self):
         """ヘルプテキストを更新（衝突検出機能を追加）"""
@@ -191,36 +191,33 @@ class FullPipelineViewer(DualViewer):
         # 衝突検出関連のキーイベント
         if key == ord('m') or key == ord('M'):
             self.enable_mesh_generation = not self.enable_mesh_generation
-            status = "有効" if self.enable_mesh_generation else "無効"
-            print(f"メッシュ生成: {status}")
+            self.log.info(f"メッシュ生成: {'有効' if self.enable_mesh_generation else '無効'}")
             return True
             
         elif key == ord('c') or key == ord('C'):
             self.enable_collision_detection = not self.enable_collision_detection
-            status = "有効" if self.enable_collision_detection else "無効"
-            print(f"衝突検出: {status}")
+            self.log.info(f"衝突検出: {'有効' if self.enable_collision_detection else '無効'}")
             return True
             
         elif key == ord('v') or key == ord('V'):
             self.enable_collision_visualization = not self.enable_collision_visualization
-            status = "有効" if self.enable_collision_visualization else "無効"
-            print(f"衝突可視化: {status}")
+            self.log.info(f"衝突可視化: {'有効' if self.enable_collision_visualization else '無効'}")
             self._update_visualization()
             return True
             
         elif key == ord('n') or key == ord('N'):
-            print("メッシュを強制更新中...")
+            self.log.info("メッシュを強制更新中...")
             self._force_mesh_update()
             return True
             
         elif key == ord('+') or key == ord('='):
             self.sphere_radius = min(self.sphere_radius + 0.01, 0.2)
-            print(f"球半径: {self.sphere_radius*100:.1f}cm")
+            self.log.info(f"球半径: {self.sphere_radius*100:.1f}cm")
             return True
             
         elif key == ord('-') or key == ord('_'):
             self.sphere_radius = max(self.sphere_radius - 0.01, 0.01)
-            print(f"球半径: {self.sphere_radius*100:.1f}cm")
+            self.log.info(f"球半径: {self.sphere_radius*100:.1f}cm")
             return True
             
         elif key == ord('p') or key == ord('P'):
@@ -234,8 +231,7 @@ class FullPipelineViewer(DualViewer):
                 self._initialize_audio_system()
             else:
                 self._shutdown_audio_system()
-            status = "有効" if self.enable_audio_synthesis else "無効"
-            print(f"音響合成: {status}")
+            self.log.info(f"音響合成: {'有効' if self.enable_audio_synthesis else '無効'}")
             return True
             
         elif key == ord('s') or key == ord('S'):
@@ -252,26 +248,26 @@ class FullPipelineViewer(DualViewer):
             if self.enable_audio_synthesis and self.audio_synthesizer:
                 self.audio_master_volume = max(0.0, self.audio_master_volume - 0.1)
                 self.audio_synthesizer.update_master_volume(self.audio_master_volume)
-                print(f"音量: {self.audio_master_volume:.1f}")
+                self.log.info(f"音量: {self.audio_master_volume:.1f}")
             return True
             
         elif key == ord('2'):
             if self.enable_audio_synthesis and self.audio_synthesizer:
                 self.audio_master_volume = min(1.0, self.audio_master_volume + 0.1)
                 self.audio_synthesizer.update_master_volume(self.audio_master_volume)
-                print(f"音量: {self.audio_master_volume:.1f}")
+                self.log.info(f"音量: {self.audio_master_volume:.1f}")
             return True
             
         elif key == ord('r') or key == ord('R'):
             if self.enable_audio_synthesis:
-                print("音響エンジンを再起動中...")
+                self.log.info("音響エンジンを再起動中...")
                 self._restart_audio_system()
             return True
             
         elif key == ord('q') or key == ord('Q'):
             if self.enable_audio_synthesis and self.voice_manager:
-                self.voice_manager.stop_all_voices()
-                print("全音声を停止しました")
+                self.voice_manager.shutdown()
+                self.log.info("全音声を停止しました")
             return True
         
         return False
@@ -297,7 +293,7 @@ class FullPipelineViewer(DualViewer):
                 self._update_terrain_mesh(points_3d)
                 self.last_mesh_update = self.frame_counter
             except Exception as e:
-                print(f"メッシュ生成エラー: {e}")
+                self.log.error(f"メッシュ生成エラー: {e}", exc_info=True)
             
             mesh_time = (time.perf_counter() - mesh_start) * 1000
             self.perf_stats['mesh_generation_time'] = mesh_time
@@ -312,7 +308,7 @@ class FullPipelineViewer(DualViewer):
             try:
                 collision_events = self._detect_collisions(tracked_hands)
             except Exception as e:
-                print(f"衝突検出エラー: {e}")
+                self.log.error(f"衝突検出エラー: {e}", exc_info=True)
             
             collision_time = (time.perf_counter() - collision_start) * 1000
             self.perf_stats['collision_detection_time'] = collision_time
@@ -327,7 +323,7 @@ class FullPipelineViewer(DualViewer):
                 audio_notes = self._generate_audio(collision_events)
                 self.perf_stats['audio_notes_played'] += audio_notes
             except Exception as e:
-                print(f"音響生成エラー: {e}")
+                self.log.error(f"音響生成エラー: {e}", exc_info=True)
             
             audio_time = (time.perf_counter() - audio_start) * 1000
             self.perf_stats['audio_synthesis_time'] = audio_time
@@ -380,7 +376,7 @@ class FullPipelineViewer(DualViewer):
                 tracked_hands = filter_stable_hands(tracked_hands, min_confidence=0.7)
 
         except Exception as e:
-            print(f"_process_hands_internal error: {e}")
+            self.log.error(f"_process_hands_internal error: {e}", exc_info=True)
 
         # 可視化用に保持
         self.current_tracked_hands = tracked_hands
@@ -399,7 +395,7 @@ class FullPipelineViewer(DualViewer):
             triangle_mesh = self.triangulator.triangulate_heightmap(height_map)
             
             if triangle_mesh is None or triangle_mesh.num_triangles == 0:
-                print("三角分割に失敗しました")
+                self.log.warning("三角分割に失敗しました")
                 return
             
             # 3. メッシュ簡略化
@@ -421,12 +417,10 @@ class FullPipelineViewer(DualViewer):
             # 可視化更新
             self._update_mesh_visualization(simplified_mesh)
             
-            print(f"メッシュ更新完了: {simplified_mesh.num_triangles}三角形")
+            self.log.info(f"メッシュ更新完了: {simplified_mesh.num_triangles}三角形")
             
         except Exception as e:
-            print(f"メッシュ生成中にエラー: {e}")
-            import traceback
-            traceback.print_exc()
+            self.log.error(f"メッシュ生成中にエラー: {e}", exc_info=True)
     
     def _detect_collisions(self, tracked_hands):
         """衝突検出を実行"""
@@ -435,51 +429,46 @@ class FullPipelineViewer(DualViewer):
             not tracked_hands):
             return []
         
-        collision_events = []
+        all_events = []
         self.current_collision_points = []
-        
-        for i, tracked in enumerate(tracked_hands):
+        active_collisions = {}
+
+        for tracked in tracked_hands:
             hand_pos = tracked.position
             if hand_pos is None or len(hand_pos) != 3:
                 continue
             
             try:
-                # 1. 空間検索 (公開API使用)
+                # 1. 空間検索
                 search_result = self.collision_searcher.search_near_hand(tracked, override_radius=self.sphere_radius)
-                
-                if len(search_result.triangle_indices) == 0:
-                    continue
                 
                 # 2. 衝突判定
                 collision_info = self.collision_tester.test_sphere_collision(
                     hand_pos, self.sphere_radius, search_result
                 )
                 
+                # 衝突情報をキューに追加
+                self.event_queue.add_collision_info(tracked.id, collision_info, tracked.velocity)
+                
+                # 接触点を可視化用に記録
                 if collision_info.has_collision:
-                    # 3. イベント生成
-                    event = self.event_queue.create_event(
-                        collision_info,
-                        tracked.id,
-                        hand_pos,
-                        tracked.velocity.copy() if hasattr(tracked, 'velocity') else None
-                    )
-                    
-                    if event:
-                        collision_events.append(event)
-                        
-                        # 接触点を記録
-                        for contact in collision_info.contact_points:
-                            self.current_collision_points.append({
-                                'position': contact.position,
-                                'normal': contact.normal,
-                                'depth': contact.depth,
-                                'hand_id': tracked.id
-                            })
+                    for contact in collision_info.contact_points:
+                        self.current_collision_points.append({
+                            'position': contact.position,
+                            'normal': contact.normal,
+                            'depth': contact.depth,
+                            'hand_id': tracked.id
+                        })
             
             except Exception as e:
-                print(f"Hand {tracked.id[:8]} collision error: {e}")
+                self.log.error(f"Hand {tracked.id[:8]} collision error: {e}", exc_info=True)
         
-        return collision_events
+        # イベントを更新・生成
+        active_hand_ids = {h.id for h in tracked_hands}
+        events = self.event_queue.update_and_get_events(active_hand_ids)
+        all_events.extend(events)
+
+        return all_events
     
     def _update_mesh_visualization(self, mesh):
         """メッシュ可視化を更新"""
@@ -514,7 +503,7 @@ class FullPipelineViewer(DualViewer):
             self.mesh_geometries.extend([o3d_mesh, wireframe])
             
         except Exception as e:
-            print(f"メッシュ可視化エラー: {e}")
+            self.log.error(f"メッシュ可視化エラー: {e}", exc_info=True)
     
     def _update_collision_visualization(self, collision_events):
         """衝突可視化を更新"""
@@ -569,7 +558,7 @@ class FullPipelineViewer(DualViewer):
                         self.collision_geometries.append(wireframe)
         
         except Exception as e:
-            print(f"衝突可視化エラー: {e}")
+            self.log.error(f"衝突可視化エラー: {e}", exc_info=True)
     
     def _update_visualization(self):
         """可視化全体を更新"""
@@ -610,7 +599,7 @@ class FullPipelineViewer(DualViewer):
             audio_status = "ON" if self.audio_enabled else "OFF"
             info_lines.append(f"Audio: {audio_status}")
             if self.audio_enabled and self.voice_manager:
-                active_voices = len(self.voice_manager.active_voices)
+                active_voices = self.voice_manager.get_active_voice_count()
                 info_lines.append(f"Voices: {active_voices}/{self.audio_polyphony}")
         
         # 描画
@@ -627,43 +616,42 @@ class FullPipelineViewer(DualViewer):
         
         # 音響再生情報
         if self.enable_audio_synthesis and self.audio_enabled and collision_events:
-            cv2.putText(color_image, f"PLAYING AUDIO ({self.audio_instrument.value})", 
+            cv2.putText(color_image, f"PLAYING AUDIO ({self.audio_instrument_name})", 
                        (10, color_image.shape[0] - 30),
                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
     
     def _print_performance_stats(self):
         """パフォーマンス統計を印刷"""
-        print("\n" + "="*50)
-        print("パフォーマンス統計")
-        print("="*50)
-        print(f"総フレーム数: {self.perf_stats['frame_count']}")
-        print(f"現在のフレーム: {self.frame_counter}")
-        print(f"パイプライン時間: {self.perf_stats['total_pipeline_time']:.2f}ms")
-        print(f"メッシュ生成時間: {self.perf_stats['mesh_generation_time']:.2f}ms")
-        print(f"衝突検出時間: {self.perf_stats['collision_detection_time']:.2f}ms")
-        print(f"音響生成時間: {self.perf_stats['audio_synthesis_time']:.2f}ms")
-        print(f"総衝突イベント数: {self.perf_stats['collision_events_count']}")
-        print(f"総音響ノート数: {self.perf_stats['audio_notes_played']}")
+        self.log.info("\n" + "="*50)
+        self.log.info("パフォーマンス統計")
+        self.log.info("="*50)
+        self.log.info(f"総フレーム数: {self.perf_stats['frame_count']}")
+        self.log.info(f"現在のフレーム: {self.frame_counter}")
+        self.log.info(f"パイプライン時間: {self.perf_stats['total_pipeline_time']:.2f}ms")
+        self.log.info(f"メッシュ生成時間: {self.perf_stats['mesh_generation_time']:.2f}ms")
+        self.log.info(f"衝突検出時間: {self.perf_stats['collision_detection_time']:.2f}ms")
+        self.log.info(f"音響生成時間: {self.perf_stats['audio_synthesis_time']:.2f}ms")
+        self.log.info(f"総衝突イベント数: {self.perf_stats['collision_events_count']}")
+        self.log.info(f"総音響ノート数: {self.perf_stats['audio_notes_played']}")
         
         if self.current_mesh:
-            print(f"現在のメッシュ: {self.current_mesh.num_triangles}三角形")
+            self.log.info(f"現在のメッシュ: {self.current_mesh.num_triangles}三角形")
         
-        print(f"球半径: {self.sphere_radius*100:.1f}cm")
+        self.log.info(f"球半径: {self.sphere_radius*100:.1f}cm")
         
         # 音響統計
         if self.enable_audio_synthesis:
-            print(f"音響合成: {'有効' if self.audio_enabled else '無効'}")
-            if self.audio_enabled:
-                print(f"  - 音階: {self.audio_scale.value}")
-                print(f"  - 楽器: {self.audio_instrument.value}")
-                print(f"  - 音量: {self.audio_master_volume:.1f}")
-                if self.voice_manager:
-                    voice_stats = self.voice_manager.get_performance_stats()
-                    print(f"  - アクティブボイス: {voice_stats['current_active_voices']}/{self.audio_polyphony}")
-                    print(f"  - 総作成ボイス: {voice_stats['total_voices_created']}")
-                    print(f"  - ボイススティール: {voice_stats['total_voices_stolen']}")
+            self.log.info(f"音響合成: {'有効' if self.audio_enabled else '無効'}")
+            if self.audio_enabled and self.voice_manager:
+                self.log.info(f"  - 音階: {self.audio_scale_name}")
+                self.log.info(f"  - 楽器: {self.audio_instrument_name}")
+                self.log.info(f"  - 音量: {self.audio_master_volume:.1f}")
+                voice_stats = self.voice_manager.get_performance_stats()
+                self.log.info(f"  - アクティブボイス: {voice_stats['current_active_voices']}/{self.audio_polyphony}")
+                self.log.info(f"  - 総作成ボイス: {voice_stats['total_voices_created']}")
+                self.log.info(f"  - ボイススティール: {voice_stats['total_voices_stolen']}")
         
-        print("="*50)
+        self.log.info("="*50)
     
     def update_frame(self, color_image, depth_image, points_3d):
         """フレーム更新（衝突検出版）"""
@@ -686,64 +674,56 @@ class FullPipelineViewer(DualViewer):
                 self.update_hand_3d_visualization()
         
         except Exception as e:
-            print(f"フレーム更新エラー: {e}")
+            self.log.error(f"フレーム更新エラー: {e}", exc_info=True)
     
     def _initialize_audio_system(self):
         """音響システムを初期化"""
         try:
-            print("音響システムを初期化中...")
+            self.log.info("音響システムを初期化中...")
             
-            # 音響マッパー初期化
-            self.audio_mapper = AudioMapper(
-                scale=self.audio_scale,
-                default_instrument=self.audio_instrument,
-                pitch_range=(48, 84),  # C3-C6
-                enable_adaptive_mapping=True
-            )
+            # 音響マッパー初期化 (configベース)
+            self.audio_mapper = AudioMapper()
+            self.audio_mapper.set_scale(self.audio_scale_name)
+            self.audio_mapper.default_instrument = self.audio_instrument_name
             
-            # 音響シンセサイザー初期化
-            self.audio_synthesizer = create_audio_synthesizer(
-                sample_rate=44100,
-                buffer_size=256,
-                max_polyphony=self.audio_polyphony
-            )
+            # 音響シンセサイザー初期化 (configベース)
+            self.audio_synthesizer = AudioSynthesizer()
             
             # 音響エンジン開始
             if self.audio_synthesizer.start_engine():
-                # ボイス管理システム初期化
-                self.voice_manager = create_voice_manager(
+                # ボイス管理システム初期化 (configベース)
+                audio_settings = settings.get('audio', {})
+                steal_strategy_str = audio_settings.get('steal_strategy', 'OLDEST').upper()
+                self.voice_manager = VoiceManager(
                     self.audio_synthesizer,
                     max_polyphony=self.audio_polyphony,
-                    steal_strategy=StealStrategy.OLDEST
+                    steal_strategy=StealStrategy[steal_strategy_str]
                 )
                 
                 # マスターボリューム設定
                 self.audio_synthesizer.update_master_volume(self.audio_master_volume)
                 
                 self.audio_enabled = True
-                print("音響システム初期化完了")
+                self.log.info("音響システム初期化完了")
             else:
-                print("音響エンジンの開始に失敗しました")
+                self.log.warning("音響エンジンの開始に失敗しました")
                 self.audio_enabled = False
         
         except Exception as e:
-            print(f"音響システム初期化エラー: {e}")
+            self.log.error(f"音響システム初期化エラー: {e}", exc_info=True)
             self.audio_enabled = False
     
     def _shutdown_audio_system(self):
         """音響システムを停止"""
         try:
             if self.voice_manager:
-                self.voice_manager.stop_all_voices()
-            
+                self.voice_manager.shutdown()
             if self.audio_synthesizer:
                 self.audio_synthesizer.stop_engine()
-            
             self.audio_enabled = False
-            print("音響システムを停止しました")
-        
+            self.log.info("音響システムが正常に停止しました")
         except Exception as e:
-            print(f"音響システム停止エラー: {e}")
+            self.log.error(f"音響システム停止エラー: {e}")
     
     def _restart_audio_system(self):
         """音響システムを再起動"""
@@ -772,10 +752,9 @@ class FullPipelineViewer(DualViewer):
                 ])
                 
                 # 音響再生
-                voice_id = allocate_and_play(
-                    self.voice_manager,
+                voice_id = self.voice_manager.allocate_and_play(
                     audio_params,
-                    priority=7,
+                    priority=7, # 必要に応じて変更
                     spatial_position=spatial_position
                 )
                 
@@ -783,7 +762,7 @@ class FullPipelineViewer(DualViewer):
                     notes_played += 1
             
             except Exception as e:
-                print(f"音響生成エラー（イベント: {event.event_id}）: {e}")
+                self.log.error(f"音響生成エラー（イベント: {event.event_id}）: {e}", exc_info=True)
         
         # 終了したボイスのクリーンアップ
         if self.voice_manager:
@@ -793,27 +772,36 @@ class FullPipelineViewer(DualViewer):
     
     def _cycle_audio_scale(self):
         """音階を循環切り替え"""
-        scales = list(ScaleType)
-        current_index = scales.index(self.audio_scale)
-        next_index = (current_index + 1) % len(scales)
-        self.audio_scale = scales[next_index]
-        
-        if self.audio_mapper:
-            self.audio_mapper.set_scale(self.audio_scale)
-        
-        print(f"音階を切り替え: {self.audio_scale.value}")
+        if not self.audio_mapper: return
+        scales = list(self.audio_mapper.scale_patterns.keys())
+        try:
+            current_index = scales.index(self.audio_scale_name)
+            next_index = (current_index + 1) % len(scales)
+            self.audio_scale_name = scales[next_index]
+            self.audio_mapper.set_scale(self.audio_scale_name)
+            self.log.info(f"音階を切り替え: {self.audio_scale_name}")
+        except (ValueError, IndexError):
+            # 存在しない場合やリストが空の場合、最初のスケールにフォールバック
+            if scales:
+                self.audio_scale_name = scales[0]
+                self.audio_mapper.set_scale(self.audio_scale_name)
+                self.log.warning(f"現在の音階が見つかりません。'{self.audio_scale_name}'にフォールバックします。")
     
     def _cycle_audio_instrument(self):
         """楽器を循環切り替え"""
-        instruments = list(InstrumentType)
-        current_index = instruments.index(self.audio_instrument)
-        next_index = (current_index + 1) % len(instruments)
-        self.audio_instrument = instruments[next_index]
-        
-        if self.audio_mapper:
-            self.audio_mapper.default_instrument = self.audio_instrument
-        
-        print(f"楽器を切り替え: {self.audio_instrument.value}")
+        if not self.audio_mapper: return
+        instruments = list(self.audio_mapper.instrument_envelopes.keys())
+        try:
+            current_index = instruments.index(self.audio_instrument_name)
+            next_index = (current_index + 1) % len(instruments)
+            self.audio_instrument_name = instruments[next_index]
+            self.audio_mapper.default_instrument = self.audio_instrument_name
+            self.log.info(f"楽器を切り替え: {self.audio_instrument_name}")
+        except (ValueError, IndexError):
+            if instruments:
+                self.audio_instrument_name = instruments[0]
+                self.audio_mapper.default_instrument = self.audio_instrument_name
+                self.log.warning(f"現在の楽器が見つかりません。'{self.audio_instrument_name}'にフォールバックします。")
     
     def __del__(self):
         """デストラクタ - 音響システムを適切に停止"""
@@ -821,11 +809,26 @@ class FullPipelineViewer(DualViewer):
             if hasattr(self, 'audio_enabled') and self.audio_enabled:
                 self._shutdown_audio_system()
         except Exception as e:
-            print(f"デストラクタでエラー: {e}")
+            # __del__内でのエラーはキャッチするだけ
+            pass
 
 
 def main():
     """メイン関数"""
+    # ロガー設定
+    setup_logger()
+    log = logging.getLogger(LOGGER_NAME)
+
+    # configから利用可能な音響設定を取得
+    audio_settings = settings.get('audio', {})
+    available_scales = list(audio_settings.get('scales', {}).keys())
+    available_instruments = list(audio_settings.get('instruments', {}).keys())
+    
+    default_scale = audio_settings.get('default_scale', 'PENTATONIC')
+    default_instrument = audio_settings.get('default_instrument', 'MARIMBA')
+    default_polyphony = audio_settings.get('polyphony', 16)
+    default_volume = audio_settings.get('master_volume', 0.7)
+
     parser = argparse.ArgumentParser(
         description="Geocussion-SP 全フェーズ統合デモ（Complete Pipeline）",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -880,14 +883,12 @@ def main():
     
     # 音響生成設定
     parser.add_argument('--no-audio', action='store_true', help='音響合成を無効にする')
-    parser.add_argument('--audio-scale', type=str, default='PENTATONIC', 
-                       choices=['PENTATONIC', 'MAJOR', 'MINOR', 'DORIAN', 'MIXOLYDIAN', 'CHROMATIC', 'BLUES'],
-                       help='音階の種類')
-    parser.add_argument('--audio-instrument', type=str, default='MARIMBA',
-                       choices=['MARIMBA', 'SYNTH_PAD', 'BELL', 'PLUCK', 'BASS', 'LEAD', 'PERCUSSION', 'AMBIENT'],
-                       help='楽器の種類')
-    parser.add_argument('--audio-polyphony', type=int, default=16, help='最大同時発音数')
-    parser.add_argument('--audio-volume', type=float, default=0.7, help='マスター音量 (0.0-1.0)')
+    parser.add_argument('--audio-scale', type=str.upper, default=default_scale, 
+                       choices=available_scales, help='音階の種類')
+    parser.add_argument('--audio-instrument', type=str.upper, default=default_instrument,
+                       choices=available_instruments, help='楽器の種類')
+    parser.add_argument('--audio-polyphony', type=int, default=default_polyphony, help='最大同時発音数')
+    parser.add_argument('--audio-volume', type=float, default=default_volume, help='マスター音量 (0.0-1.0)')
     
     # 手検出設定
     parser.add_argument('--min-confidence', type=float, default=0.7, help='最小検出信頼度 (0.0-1.0)')
@@ -908,51 +909,31 @@ def main():
     
     # 設定値検証
     if args.min_confidence < 0.0 or args.min_confidence > 1.0:
-        print("Error: --min-confidence must be between 0.0 and 1.0")
-        return 1
-    
-    if args.sphere_radius <= 0.0 or args.sphere_radius > 0.5:
-        print("Error: --sphere-radius must be between 0.0 and 0.5")
-        return 1
-    
-    if args.audio_polyphony < 1 or args.audio_polyphony > 64:
-        print("Error: --audio-polyphony must be between 1 and 64")
-        return 1
-    
-    if args.audio_volume < 0.0 or args.audio_volume > 1.0:
-        print("Error: --audio-volume must be between 0.0 and 1.0")
-        return 1
-    
-    # 音階と楽器の列挙値変換
-    try:
-        audio_scale = ScaleType[args.audio_scale]
-        audio_instrument = InstrumentType[args.audio_instrument]
-    except KeyError as e:
-        print(f"Error: Invalid audio parameter: {e}")
+        log.error("Error: --min-confidence must be between 0.0 and 1.0")
         return 1
     
     # 情報表示
-    print("=" * 70)
-    print("Geocussion-SP 全フェーズ統合デモ（Complete Pipeline）")
-    print("=" * 70)
-    print(f"深度フィルタ: {'無効' if args.no_filter else '有効'}")
-    print(f"手検出: {'無効' if args.no_hand_detection else '有効'}")
-    print(f"メッシュ生成: {'無効' if args.no_mesh else '有効'}")
-    print(f"衝突検出: {'無効' if args.no_collision else '有効'}")
+    log.info("=" * 70)
+    log.info("Geocussion-SP 全フェーズ統合デモ（Complete Pipeline）")
+    log.info("=" * 70)
+    log.info(f"深度フィルタ: {'無効' if args.no_filter else '有効'}")
+    log.info(f"手検出: {'無効' if args.no_hand_detection else '有効'}")
+    log.info(f"メッシュ生成: {'無効' if args.no_mesh else '有効'}")
+    log.info(f"衝突検出: {'無効' if args.no_collision else '有効'}")
     if not args.no_collision:
-        print(f"  - 球半径: {args.sphere_radius*100:.1f}cm")
-        print(f"  - 可視化: {'無効' if args.no_collision_viz else '有効'}")
-    print(f"音響合成: {'無効' if args.no_audio else '有効'}")
+        log.info(f"  - 球半径: {args.sphere_radius*100:.1f}cm")
+        log.info(f"  - 可視化: {'無効' if args.no_collision_viz else '有効'}")
+    log.info(f"音響合成: {'無効' if args.no_audio else '有効'}")
     if not args.no_audio:
-        print(f"  - 音階: {audio_scale.value}")
-        print(f"  - 楽器: {audio_instrument.value}")
-        print(f"  - ポリフォニー: {args.audio_polyphony}")
-        print(f"  - 音量: {args.audio_volume:.1f}")
-    print("=" * 70)
+        log.info(f"  - 音階: {args.audio_scale}")
+        log.info(f"  - 楽器: {args.audio_instrument}")
+        log.info(f"  - ポリフォニー: {args.audio_polyphony}")
+        log.info(f"  - 音量: {args.audio_volume:.1f}")
+    log.info("=" * 70)
     
     # テストモード
     if args.test:
-        print("テストモードで実行中...")
+        log.info("テストモードで実行中...")
         try:
             import unittest
             test_dir = os.path.join(PROJECT_ROOT, 'tests')
@@ -965,13 +946,13 @@ def main():
             result = runner.run(suite)
             
             if result.wasSuccessful():
-                print("衝突検出フェーズのテストが正常に完了しました！")
+                log.info("衝突検出フェーズのテストが正常に完了しました！")
                 return 0
             else:
-                print(f"テスト失敗: {len(result.failures)} failures, {len(result.errors)} errors")
+                log.error(f"テスト失敗: {len(result.failures)} failures, {len(result.errors)} errors")
                 return 1
         except Exception as e:
-            print(f"テスト実行エラー: {e}")
+            log.error(f"テスト実行エラー: {e}", exc_info=True)
             return 1
     
     # CollisionDetectionViewer実行
@@ -991,27 +972,25 @@ def main():
             use_gpu_mediapipe=args.gpu_mediapipe,
             mesh_update_interval=args.mesh_interval,
             sphere_radius=args.sphere_radius,
-            audio_scale=audio_scale,
-            audio_instrument=audio_instrument,
+            audio_scale=args.audio_scale,
+            audio_instrument=args.audio_instrument,
             audio_polyphony=args.audio_polyphony,
             audio_master_volume=args.audio_volume
         )
         
-        print("\n全フェーズ統合ビューワーを開始します...")
-        print("=" * 70)
+        log.info("\n全フェーズ統合ビューワーを開始します...")
+        log.info("=" * 70)
         
         viewer.run()
         
-        print("\nビューワーが正常に終了しました")
+        log.info("\nビューワーが正常に終了しました")
         return 0
         
     except KeyboardInterrupt:
-        print("\nユーザーによって中断されました")
+        log.info("\nユーザーによって中断されました")
         return 0
     except Exception as e:
-        print(f"\nエラーが発生しました: {e}")
-        import traceback
-        traceback.print_exc()
+        log.critical(f"\nエラーが発生しました: {e}", exc_info=True)
         return 1
 
 

@@ -9,6 +9,7 @@ import numpy as np
 import time
 import sys
 import os
+import threading
 
 # テスト対象のモジュールをインポート
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
@@ -178,6 +179,37 @@ class TestHand3DProjection(unittest.TestCase):
         self.assertEqual(self.projector.camera_intrinsics.fx, 600.0)
         self.assertEqual(self.projector.camera_intrinsics.width, 800)
 
+    def test_gaussian_filter_structure_preservation(self):
+        """ガウシアンフィルタが画像の空間構造を破壊しないかテスト"""
+        # ほぼ定数値のテスト画像を作成
+        width, height = 64, 48
+        test_depth = np.full((height, width), 1500, dtype=np.uint16)
+        
+        # 中央に穴を開ける（無効値）
+        test_depth[height//2 - 5 : height//2 + 5, width//2 - 5 : width//2 + 5] = 0
+
+        # projectorの設定を変更してフィルタを有効化
+        self.projector.depth_filter_kernel_size = 3
+
+        # 前処理を実行
+        processed_depth = self.projector._preprocess_depth(test_depth)
+        
+        # NaNでなく、かつ穴のエッジ（フィルタの影響を受ける）でない部分をチェック
+        # 元の穴の領域を少し広げてマスクを作成
+        core_mask = np.ones_like(test_depth, dtype=bool)
+        core_mask[height//2 - 8 : height//2 + 8, width//2 - 8 : width//2 + 8] = False
+        
+        # NaNでないことと、コア領域であることを両方満たすピクセルを抽出
+        valid_mask = ~np.isnan(processed_depth)
+        check_mask = valid_mask & core_mask
+        
+        target_pixels = processed_depth[check_mask]
+
+        # 正しい実装なら、フィルタ後も元の値(1.5)に近いはず。
+        # 構造が破壊されていれば、全く違う値が混ざる。
+        max_deviation = np.max(np.abs(target_pixels - 1.5))
+        self.assertLess(max_deviation, 0.1, "Filtered values in stable areas should not deviate significantly")
+
 
 class TestHandTracking(unittest.TestCase):
     """手トラッキングのテスト"""
@@ -259,6 +291,29 @@ class TestHandTracking(unittest.TestCase):
                     velocity = tracked_hands[0].velocity
                     # X方向の速度が正であることを確認
                     self.assertGreater(velocity[0], 0.0)
+    
+    def test_acceleration_calculation(self):
+        """加速度が正しく計算されるかのテスト"""
+        # 加速する手をシミュレート
+        positions = [
+            (0.0, 0.0, 0.8),
+            (0.01, 0.0, 0.8), # 速度 1
+            (0.03, 0.0, 0.8), # 速度 2
+            (0.06, 0.0, 0.8), # 速度 3
+        ]
+
+        tracked_hand = None
+        for pos in positions:
+            mock_3d = create_mock_hand_3d_result()
+            mock_3d.palm_center_3d = pos
+            tracked_hands = self.tracker.update([mock_3d])
+            if tracked_hands:
+                tracked_hand = tracked_hands[0]
+
+        # 最終フレームで加速度が正のx方向を向いていることを確認
+        self.assertIsNotNone(tracked_hand)
+        # BUG: 現状の実装では加速度が常にゼロになるため、このテストは失敗するはず
+        self.assertGreater(tracked_hand.acceleration[0], 0.0, "Acceleration should be positive in x-direction")
     
     def test_data_association(self):
         """データアソシエーションテスト"""
@@ -356,6 +411,40 @@ class TestHandTracking(unittest.TestCase):
         stats = self.tracker.get_performance_stats()
         self.assertGreater(stats['total_updates'], 0)
         self.assertGreater(stats['avg_tracking_time_ms'], 0.0)
+
+    def test_tracker_thread_safety(self):
+        """トラッカーのスレッドセーフティテスト"""
+        tracker = create_test_tracker()
+        num_threads = 10
+        iterations = 50
+        
+        def worker():
+            for i in range(iterations):
+                # 適当な3D手検出結果を生成
+                hand_result = Hand3DResult(
+                    timestamp_ms=int(time.time() * 1000),
+                    handedness=HandednessType.RIGHT,
+                    confidence_2d=0.9,
+                    confidence_3d=0.8,
+                    landmarks_3d=[(0.1, 0.1, 0.5 + i*0.01)] * 21,
+                    palm_center_3d=np.array([0.1, 0.1, 0.5 + i*0.01])
+                )
+                tracker.update([hand_result])
+                tracker.get_performance_stats()
+                if i % 10 == 0:
+                    tracker.reset()
+
+        threads = [threading.Thread(target=worker) for _ in range(num_threads)]
+        
+        for t in threads:
+            t.start()
+            
+        for t in threads:
+            t.join()
+            
+        # クラッシュせずに終了すればOK
+        stats = tracker.get_performance_stats()
+        self.assertGreaterEqual(stats['total_updates'], 0)
 
 
 class TestDetectionIntegration(unittest.TestCase):

@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from typing import List, Tuple, Optional, Set
 from enum import Enum
 import numpy as np
+import threading
 
 # 他フェーズとの連携
 from ..mesh.index import SpatialIndex, BVHNode
@@ -86,6 +87,9 @@ class CollisionSearcher:
         self.strategy = strategy
         self.enable_caching = enable_caching
         self.max_cache_size = max_cache_size
+        
+        # 排他制御ロック
+        self.lock = threading.Lock()
         
         # キャッシュ
         self.search_cache = {}  # {(x, y, z, radius): SearchResult}
@@ -189,31 +193,33 @@ class CollisionSearcher:
         
         # パフォーマンス統計更新
         batch_time = (time.perf_counter() - start_time) * 1000
-        self._update_batch_stats(batch_time, results)
+        
+        with self.lock:
+            self._update_batch_stats(batch_time, results)
         
         return results
     
     def _search_point(self, point: np.ndarray, radius: float) -> SearchResult:
         """単一点の検索"""
-        start_time = time.perf_counter()
+        # キャッシュキーはロックの外で生成
+        cache_key = self._make_cache_key(point, radius)
         
         # キャッシュチェック
         if self.enable_caching:
-            cache_key = self._make_cache_key(point, radius)
-            cached_result = self.search_cache.get(cache_key)
-            if cached_result is not None:
-                self.cache_hits += 1
-                return cached_result
-            self.cache_misses += 1
+            with self.lock:
+                cached_result = self.search_cache.get(cache_key)
+                if cached_result is not None:
+                    self.cache_hits += 1
+                    return cached_result
+                self.cache_misses += 1
+        
+        start_time = time.perf_counter()
         
         # BVHを使って検索
-        triangle_indices = self.spatial_index.query_sphere(point, radius)
+        triangle_indices, nodes_visited = self.spatial_index.query_sphere(point, radius, report_nodes_visited=True)
         
         # 距離計算
         distances = self._calculate_distances(point, triangle_indices)
-        
-        # ノード訪問数を推定（実際の実装では正確に追跡）
-        nodes_visited = min(len(triangle_indices) * 2, 50)  # 推定値
         
         search_time = (time.perf_counter() - start_time) * 1000
         
@@ -226,12 +232,13 @@ class CollisionSearcher:
             num_nodes_visited=nodes_visited
         )
         
-        # キャッシュに保存
-        if self.enable_caching:
-            self._cache_result(cache_key, result)
-        
-        # 統計更新
-        self._update_search_stats(result)
+        with self.lock:
+            # キャッシュに保存
+            if self.enable_caching:
+                self._cache_result(cache_key, result)
+            
+            # 統計更新
+            self._update_search_stats(result)
         
         return result
     
@@ -240,23 +247,25 @@ class CollisionSearcher:
         if override_radius is not None:
             return min(override_radius, self.max_radius)
         
-        if self.strategy == SearchStrategy.ADAPTIVE_RADIUS:
-            # 過去の成功率に基づいて調整
-            if self.successful_radii:
-                avg_successful_radius = np.mean(self.successful_radii[-10:])  # 直近10回の平均
-                adaptive_radius = min(avg_successful_radius * 1.1, self.max_radius)
-                return max(adaptive_radius, self.default_radius * 0.5)
-        
-        elif self.strategy == SearchStrategy.FRUSTUM_QUERY and hand.velocity is not None:
-            # 移動速度に基づいて調整
-            speed = np.linalg.norm(hand.velocity)
-            speed_factor = min(speed * 10.0 + 1.0, 3.0)  # 最大3倍まで拡大
-            return min(self.default_radius * speed_factor, self.max_radius)
-        
+        with self.lock:
+            if self.strategy == SearchStrategy.ADAPTIVE_RADIUS:
+                # 過去の成功率に基づいて調整
+                if self.successful_radii:
+                    avg_successful_radius = np.mean(self.successful_radii[-10:])  # 直近10回の平均
+                    adaptive_radius = min(avg_successful_radius * 1.1, self.max_radius)
+                    return max(adaptive_radius, self.default_radius * 0.5)
+            
+            elif self.strategy == SearchStrategy.FRUSTUM_QUERY and hand.velocity is not None:
+                # 速度に基づいて半径を調整
+                speed = np.linalg.norm(hand.velocity)
+                # 速度が速いほど半径を大きくする（最大値まで）
+                radius = self.default_radius + speed * 0.1 # 係数は要調整
+                return min(radius, self.max_radius)
+
         return self.default_radius
     
     def _calculate_distances(self, point: np.ndarray, triangle_indices: List[int]) -> List[float]:
-        """三角形への距離を計算"""
+        """三角形重心への距離を計算"""
         if not triangle_indices:
             return []
         
@@ -275,55 +284,60 @@ class CollisionSearcher:
         return distances
     
     def _update_radius_feedback(self, radius: float, triangles_found: int):
-        """適応的半径調整のフィードバック更新"""
-        self.radius_history.append((radius, triangles_found))
-        
-        # 成功した半径を記録（三角形が1個以上見つかった場合）
-        if triangles_found > 0:
-            self.successful_radii.append(radius)
-            # 履歴サイズ制限
-            if len(self.successful_radii) > 50:
-                self.successful_radii = self.successful_radii[-30:]
+        """適応的半径調整のためのフィードバック更新"""
+        with self.lock:
+            self.radius_history.append(radius)
+            if len(self.radius_history) > 50:
+                self.radius_history.pop(0)
+
+            if triangles_found > 2: # 2個以上見つかれば成功とみなす
+                self.successful_radii.append(radius)
+                if len(self.successful_radii) > 20:
+                    self.successful_radii.pop(0)
     
     def _make_cache_key(self, point: np.ndarray, radius: float) -> Tuple[int, int, int, int]:
-        """キャッシュキーを生成（量子化で近似）"""
+        """キャッシュキー生成"""
         # 1mm精度で量子化
         quantized_point = (point * 1000).astype(int)
         quantized_radius = int(radius * 1000)
         return (quantized_point[0], quantized_point[1], quantized_point[2], quantized_radius)
     
     def _cache_result(self, cache_key: Tuple, result: SearchResult):
-        """結果をキャッシュに保存"""
+        """検索結果をキャッシュ"""
+        # Note: This method is called within a lock
         if len(self.search_cache) >= self.max_cache_size:
-            # LRU削除（簡易版）
-            oldest_key = next(iter(self.search_cache))
-            del self.search_cache[oldest_key]
-        
+            # oldest_key = next(iter(self.search_cache))
+            # del self.search_cache[oldest_key]
+            # ToDo: Implement LRU cache
+            self.search_cache.pop(next(iter(self.search_cache)))
+
         self.search_cache[cache_key] = result
     
     def _update_search_stats(self, result: SearchResult):
         """検索統計を更新"""
+        # Note: This method is called within a lock
         self.stats['total_searches'] += 1
         self.stats['total_search_time_ms'] += result.search_time_ms
-        self.stats['average_search_time_ms'] = (
-            self.stats['total_search_time_ms'] / self.stats['total_searches']
-        )
         self.stats['last_search_time_ms'] = result.search_time_ms
         self.stats['last_triangles_found'] = result.num_triangles
         self.stats['nodes_visited_total'] += result.num_nodes_visited
         
-        # 平均三角形数更新
-        total_triangles = self.stats.get('total_triangles_found', 0) + result.num_triangles
-        self.stats['total_triangles_found'] = total_triangles
-        self.stats['average_triangles_found'] = total_triangles / self.stats['total_searches']
-        
-        # キャッシュヒット率更新
-        total_queries = self.cache_hits + self.cache_misses
-        if total_queries > 0:
-            self.stats['cache_hit_rate'] = self.cache_hits / total_queries
+        total = self.stats['total_searches']
+        if total > 0:
+            self.stats['average_search_time_ms'] = self.stats['total_search_time_ms'] / total
+            # 移動平均を計算
+            prev_avg_tris = self.stats['average_triangles_found']
+            self.stats['average_triangles_found'] = (
+                (prev_avg_tris * (total - 1)) + result.num_triangles
+            ) / total
+            
+        total_cache_lookups = self.cache_hits + self.cache_misses
+        if total_cache_lookups > 0:
+            self.stats['cache_hit_rate'] = self.cache_hits / total_cache_lookups
     
     def _update_batch_stats(self, batch_time_ms: float, results: List[SearchResult]):
-        """バッチ検索統計を更新"""
+        """バッチ検索の統計を更新"""
+        # Note: This method is called within a lock
         if results:
             avg_search_time = np.mean([r.search_time_ms for r in results])
             total_triangles = sum(r.num_triangles for r in results)
@@ -333,28 +347,33 @@ class CollisionSearcher:
             self.stats['last_batch_total_triangles'] = total_triangles
     
     def clear_cache(self):
-        """キャッシュをクリア"""
-        self.search_cache.clear()
-        self.cache_hits = 0
-        self.cache_misses = 0
+        """検索キャッシュをクリア"""
+        with self.lock:
+            self.search_cache.clear()
+            self.cache_hits = 0
+            self.cache_misses = 0
+            self.stats['cache_hit_rate'] = 0.0
     
     def get_performance_stats(self) -> dict:
-        """パフォーマンス統計取得"""
-        return self.stats.copy()
+        """パフォーマンス統計を取得"""
+        with self.lock:
+            return self.stats.copy()
     
     def reset_stats(self):
-        """統計リセット"""
-        self.stats = {
-            'total_searches': 0,
-            'total_search_time_ms': 0.0,
-            'average_search_time_ms': 0.0,
-            'cache_hit_rate': 0.0,
-            'average_triangles_found': 0.0,
-            'last_search_time_ms': 0.0,
-            'last_triangles_found': 0,
-            'nodes_visited_total': 0
-        }
-        self.clear_cache()
+        """統計情報をリセット"""
+        with self.lock:
+            self.stats = {
+                'total_searches': 0,
+                'total_search_time_ms': 0.0,
+                'average_search_time_ms': 0.0,
+                'cache_hit_rate': 0.0,
+                'average_triangles_found': 0.0,
+                'last_search_time_ms': 0.0,
+                'last_triangles_found': 0,
+                'nodes_visited_total': 0
+            }
+            self.cache_hits = 0
+            self.cache_misses = 0
 
 
 # 便利関数

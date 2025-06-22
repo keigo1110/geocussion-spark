@@ -15,7 +15,7 @@ from queue import PriorityQueue
 import numpy as np
 
 # 他フェーズとの連携
-from .mapping import AudioParameters, InstrumentType
+from .mapping import AudioParameters
 from .synth import AudioSynthesizer
 
 
@@ -133,9 +133,7 @@ class VoiceManager:
         self.voice_counter = 0
         
         # 楽器ごとのボイス管理
-        self.instrument_voices: Dict[InstrumentType, List[str]] = {
-            instrument: [] for instrument in InstrumentType
-        }
+        self.instrument_voices: Dict[str, List[str]] = {}
         
         # パフォーマンス統計
         self.stats = {
@@ -144,7 +142,7 @@ class VoiceManager:
             'max_simultaneous_voices': 0,
             'average_polyphony': 0.0,
             'steal_strategy_usage': {strategy: 0 for strategy in StealStrategy},
-            'instrument_usage': {instrument: 0 for instrument in InstrumentType},
+            'instrument_usage': {},
             'spatial_processing_time_ms': 0.0
         }
         
@@ -209,11 +207,11 @@ class VoiceManager:
                 
                 # ボイス管理に追加
                 self.active_voices[voice_id] = voice_info
-                self.instrument_voices[audio_params.instrument].append(voice_id)
+                self.instrument_voices[audio_params.instrument] = self.instrument_voices.get(audio_params.instrument, []) + [voice_id]
                 
                 # 統計更新
                 self.stats['total_voices_created'] += 1
-                self.stats['instrument_usage'][audio_params.instrument] += 1
+                self.stats['instrument_usage'][audio_params.instrument] = self.stats['instrument_usage'].get(audio_params.instrument, 0) + 1
                 self.stats['max_simultaneous_voices'] = max(
                     self.stats['max_simultaneous_voices'],
                     len(self.active_voices)
@@ -242,25 +240,21 @@ class VoiceManager:
                 return
             
             try:
-                voice_info = self.active_voices[voice_id]
+                voice_info = self.active_voices.pop(voice_id)
                 
                 # シンセサイザーからボイス停止
                 if voice_info.synthesizer_voice_id:
-                    if fade_out:
-                        # フェードアウト処理（TODO: 実装）
-                        pass
-                    self.synthesizer.stop_voice(voice_info.synthesizer_voice_id)
-                
-                # 楽器別管理から削除
+                    fade_duration = 0.05 if fade_out else 0.0
+                    self.synthesizer.stop_voice(
+                        voice_info.synthesizer_voice_id,
+                        fadeout_sec=fade_duration
+                    )
+
+                # 楽器別リストからも削除
                 instrument = voice_info.audio_params.instrument
-                if voice_id in self.instrument_voices[instrument]:
-                    self.instrument_voices[instrument].remove(voice_id)
-                
-                # ボイス状態更新
-                voice_info.state = VoiceState.FINISHED
-                
-                # アクティブボイスから削除
-                del self.active_voices[voice_id]
+                if instrument in self.instrument_voices:
+                    if voice_id in self.instrument_voices[instrument]:
+                        self.instrument_voices[instrument].remove(voice_id)
                 
             except Exception as e:
                 print(f"Error deallocating voice {voice_id}: {e}")
@@ -273,117 +267,74 @@ class VoiceManager:
         reverb: Optional[float] = None,
         spatial_position: Optional[np.ndarray] = None
     ):
-        """
-        ボイスパラメータをリアルタイム更新
-        
-        Args:
-            voice_id: ボイスID
-            volume: 音量
-            pan: パンニング
-            reverb: リバーブ量
-            spatial_position: 空間位置
-        """
+        """ボイスパラメータを動的に更新"""
         with self._lock:
             if voice_id not in self.active_voices:
                 return
             
             voice_info = self.active_voices[voice_id]
             
-            # パラメータ更新
-            if volume is not None:
-                voice_info.current_volume = max(0.0, min(1.0, volume))
-            
-            if pan is not None:
-                voice_info.current_pan = max(-1.0, min(1.0, pan))
-            
-            if reverb is not None:
-                voice_info.current_reverb = max(0.0, min(1.0, reverb))
-            
+            # 空間位置の更新
             if spatial_position is not None:
-                voice_info.spatial_position = spatial_position.copy()
-                # 空間処理を再適用
-                updated_params = self._apply_spatial_processing(
-                    voice_info.audio_params, spatial_position
-                )
-                voice_info.current_pan = updated_params.pan
-                voice_info.current_reverb = updated_params.reverb
+                # 再計算
+                updated_params = self._apply_spatial_processing(voice_info.audio_params, spatial_position)
+                volume = updated_params.velocity
+                pan = updated_params.pan
+                reverb = updated_params.reverb
+                voice_info.spatial_position = spatial_position
             
-            # TODO: シンセサイザーへのリアルタイム更新
+            # シンセサイザーにパラメータ変更を通知
+            self.synthesizer.update_voice_parameters(
+                voice_id=voice_info.synthesizer_voice_id,
+                volume=volume,
+                pan=pan,
+                reverb=reverb
+            )
+            
+            # ローカル情報も更新
+            if volume is not None: voice_info.current_volume = volume
+            if pan is not None: voice_info.current_pan = pan
+            if reverb is not None: voice_info.current_reverb = reverb
     
     def cleanup_finished_voices(self):
-        """終了したボイスをクリーンアップ"""
-        with self._lock:
-            finished_voices = []
-            
-            for voice_id, voice_info in self.active_voices.items():
-                if voice_info.estimated_remaining_time <= 0:
-                    finished_voices.append(voice_id)
-            
-            for voice_id in finished_voices:
-                self.deallocate_voice(voice_id, fade_out=False)
+        """
+        再生が完了したボイスをクリーンアップする。
+        実際の処理はAudioSynthesizer側に移譲する。
+        """
+        self.synthesizer.cleanup_finished_voices()
     
     def _steal_voice(self, new_audio_params: AudioParameters, new_priority: int) -> Optional[str]:
         """
-        ボイススティール戦略に基づいてボイスを停止
-        
-        Args:
-            new_audio_params: 新しい音響パラメータ
-            new_priority: 新しいボイスの優先度
-            
-        Returns:
-            停止したボイスのID
+        ボイススティール戦略に基づいて、停止するボイスを選択して停止する
         """
-        if not self.active_voices:
-            return None
+        victim_id: Optional[str] = None
         
-        candidates = list(self.active_voices.keys())
-        stolen_voice_id = None
+        with self._lock:
+            if not self.active_voices:
+                return None
+
+            active_voices_list = list(self.active_voices.values())
+
+            if self.steal_strategy == StealStrategy.OLDEST:
+                victim_id = min(active_voices_list, key=lambda v: v.start_time).voice_id
+            
+            elif self.steal_strategy == StealStrategy.QUIETEST:
+                victim_id = min(active_voices_list, key=lambda v: v.current_volume).voice_id
+
+            elif self.steal_strategy == StealStrategy.LOWEST_PRIORITY:
+                # 優先度が同じ場合は最も古いものを選択
+                victim_id = min(active_voices_list, key=lambda v: (v.priority, v.start_time)).voice_id
+
+            # TODO: 他戦略の実装
+            
+            if victim_id:
+                # 短いフェードアウト付きでボイスを停止
+                self.deallocate_voice(victim_id, fade_out=True)
+                self.stats['total_voices_stolen'] += 1
+                self.stats['steal_strategy_usage'][self.steal_strategy] += 1
+                return victim_id
         
-        if self.steal_strategy == StealStrategy.OLDEST:
-            # 最も古いボイスを選択
-            oldest_voice_id = min(candidates, key=lambda vid: self.active_voices[vid].start_time)
-            stolen_voice_id = oldest_voice_id
-            
-        elif self.steal_strategy == StealStrategy.QUIETEST:
-            # 最も音量の小さいボイスを選択
-            quietest_voice_id = min(candidates, key=lambda vid: self.active_voices[vid].current_volume)
-            stolen_voice_id = quietest_voice_id
-            
-        elif self.steal_strategy == StealStrategy.LOWEST_PRIORITY:
-            # 最も優先度の低いボイスを選択
-            if self.enable_priority_system:
-                lowest_priority_voice_id = min(candidates, key=lambda vid: self.active_voices[vid].priority)
-                if self.active_voices[lowest_priority_voice_id].priority < new_priority:
-                    stolen_voice_id = lowest_priority_voice_id
-            
-        elif self.steal_strategy == StealStrategy.SAME_INSTRUMENT:
-            # 同じ楽器のボイスを選択
-            same_instrument_voices = [
-                vid for vid in candidates
-                if self.active_voices[vid].audio_params.instrument == new_audio_params.instrument
-            ]
-            if same_instrument_voices:
-                # 同じ楽器の中で最も古いものを選択
-                stolen_voice_id = min(same_instrument_voices, key=lambda vid: self.active_voices[vid].start_time)
-            else:
-                # 同じ楽器がない場合は最も古いボイス
-                stolen_voice_id = min(candidates, key=lambda vid: self.active_voices[vid].start_time)
-                
-        elif self.steal_strategy == StealStrategy.NEAREST_PITCH:
-            # 最も近い音高のボイスを選択
-            new_pitch = new_audio_params.pitch
-            nearest_voice_id = min(
-                candidates,
-                key=lambda vid: abs(self.active_voices[vid].audio_params.pitch - new_pitch)
-            )
-            stolen_voice_id = nearest_voice_id
-        
-        if stolen_voice_id:
-            self.deallocate_voice(stolen_voice_id, fade_out=True)
-            self.stats['total_voices_stolen'] += 1
-            self.stats['steal_strategy_usage'][self.steal_strategy] += 1
-            
-        return stolen_voice_id
+        return None
     
     def _apply_spatial_processing(
         self,
@@ -411,12 +362,12 @@ class VoiceManager:
             # 距離による音量減衰
             if self.spatial_config.distance_attenuation:
                 distance = np.linalg.norm(spatial_position - self.spatial_config.listener_position)
-                attenuation = self._calculate_distance_attenuation(distance)
+                attenuation = self._calculate_distance_attenuation(float(distance))
                 processed_params.velocity *= attenuation
             
             # 距離によるリバーブ調整
             distance = np.linalg.norm(spatial_position - self.spatial_config.listener_position)
-            reverb_factor = min(distance / self.spatial_config.room_size, 1.0)
+            reverb_factor = min(float(distance) / self.spatial_config.room_size, 1.0)
             processed_params.reverb = min(processed_params.reverb + reverb_factor * 0.3, 1.0)
         
         elif self.spatial_config.mode == SpatialMode.BINAURAL:
@@ -434,83 +385,84 @@ class VoiceManager:
         return processed_params
     
     def _calculate_stereo_pan(self, position: np.ndarray) -> float:
-        """ステレオパンニングを計算"""
-        # リスナーとの相対位置
-        relative_pos = position - self.spatial_config.listener_position
+        """ステレオパンを計算"""
+        # Note: This method is called within a lock
+        x_pos = position[0]
+        listener_x = self.spatial_config.listener_position[0]
+        room_width = self.spatial_config.room_size
         
-        # X座標をパンニングに変換（-1.0～1.0）
-        max_range = self.spatial_config.room_size / 2
-        pan = np.clip(relative_pos[0] / max_range, -1.0, 1.0)
-        
+        # -1 (左) から +1 (右) に正規化
+        pan = np.clip((x_pos - listener_x) / (room_width / 2.0), -1.0, 1.0)
         return pan
     
     def _calculate_distance_attenuation(self, distance: float) -> float:
         """距離減衰を計算"""
-        # 逆二乗則による減衰
-        min_distance = 0.1  # 最小距離（ゼロ除算回避）
-        effective_distance = max(distance, min_distance)
-        
-        # 1メートルでの基準音量を1.0とする
-        attenuation = 1.0 / (effective_distance ** 2)
-        
-        # 空気吸収を考慮
-        air_loss = np.exp(-self.spatial_config.air_absorption * distance)
-        
-        return min(attenuation * air_loss, 1.0)
+        # Note: This method is called within a lock
+        # 簡単な逆二乗則
+        return 1.0 / (1.0 + distance**2 * 0.1)
     
     def get_voice_info(self, voice_id: str) -> Optional[VoiceInfo]:
         """ボイス情報を取得"""
-        return self.active_voices.get(voice_id)
+        with self._lock:
+            return self.active_voices.get(voice_id)
     
-    def get_active_voices_by_instrument(self, instrument: InstrumentType) -> List[str]:
-        """楽器別のアクティブボイス一覧を取得"""
-        return self.instrument_voices[instrument].copy()
+    def get_active_voices_by_instrument(self, instrument: str) -> List[str]:
+        """楽器名でアクティブなボイスを取得"""
+        with self._lock:
+            return self.instrument_voices.get(instrument.upper(), [])
     
     def get_performance_stats(self) -> dict:
-        """パフォーマンス統計取得"""
+        """パフォーマンス統計を取得"""
         with self._lock:
-            stats = self.stats.copy()
-            stats.update({
-                'current_active_voices': len(self.active_voices),
-                'polyphony_usage_percent': (len(self.active_voices) / self.max_polyphony) * 100,
-                'voice_distribution_by_instrument': {
-                    instrument.value: len(voices)
-                    for instrument, voices in self.instrument_voices.items()
-                }
-            })
-            
-            # 平均ポリフォニー計算
+            # 移動平均を計算
             if self.stats['total_voices_created'] > 0:
-                stats['average_polyphony'] = (
-                    sum(len(voices) for voices in self.instrument_voices.values()) /
-                    self.stats['total_voices_created']
+                self.stats['average_polyphony'] = (
+                    np.mean([v.age for v in self.active_voices.values()])
+                    if self.active_voices else 0.0
                 )
-            
-            return stats
+            return self.stats.copy()
+    
+    def get_active_voice_count(self) -> int:
+        """アクティブなボイス数を取得"""
+        with self._lock:
+            return len(self.active_voices)
     
     def reset_stats(self):
-        """統計リセット"""
-        self.stats = {
-            'total_voices_created': 0,
-            'total_voices_stolen': 0,
-            'max_simultaneous_voices': 0,
-            'average_polyphony': 0.0,
-            'steal_strategy_usage': {strategy: 0 for strategy in StealStrategy},
-            'instrument_usage': {instrument: 0 for instrument in InstrumentType},
-            'spatial_processing_time_ms': 0.0
-        }
+        """統計情報をリセット"""
+        with self._lock:
+            self.stats = {
+                'total_voices_created': 0,
+                'total_voices_stolen': 0,
+                'max_simultaneous_voices': 0,
+                'average_polyphony': 0.0,
+                'steal_strategy_usage': {strategy.value: 0 for strategy in StealStrategy},
+                'instrument_usage': {},
+                'spatial_processing_time_ms': 0.0
+            }
     
     def set_steal_strategy(self, strategy: StealStrategy):
-        """ボイススティール戦略を変更"""
-        self.steal_strategy = strategy
+        """ボイススティール戦略を設定"""
+        with self._lock:
+            self.steal_strategy = strategy
     
     def set_max_polyphony(self, max_polyphony: int):
-        """最大ポリフォニー数を変更"""
-        self.max_polyphony = max(1, max_polyphony)
+        """最大ポリフォニー数を設定"""
+        with self._lock:
+            self.max_polyphony = max_polyphony
     
     def update_spatial_config(self, config: SpatialConfig):
         """空間音響設定を更新"""
-        self.spatial_config = config
+        with self._lock:
+            self.spatial_config = config
+    
+    def shutdown(self, fade_out_duration: float = 0.5):
+        """ボイスマネージャをシャットダウン"""
+        with self._lock:
+            all_voices = list(self.active_voices.keys())
+            for voice_id in all_voices:
+                self.deallocate_voice(voice_id, fade_out=True)
+            # ToDo: Implement graceful fadeout for shutdown
+            print("VoiceManager shut down.")
 
 
 # 便利関数

@@ -10,7 +10,7 @@ from dataclasses import dataclass
 import numpy as np
 
 try:
-    from pyorbbecsdk import *
+    from pyorbbecsdk import Pipeline, Config, OBSensorType
 except ImportError:
     # テスト用のモック定義
     class Pipeline:

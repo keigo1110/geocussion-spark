@@ -417,17 +417,31 @@ class SpatialIndex:
         return np.linalg.norm(point - center)
     
     def _ray_box_intersect(self, origin: np.ndarray, direction: np.ndarray, bbox: BoundingBox, max_distance: float) -> bool:
-        """レイとバウンディングボックスの交差判定"""
-        # スラブ法を使用
-        inv_dir = np.where(np.abs(direction) > 1e-8, 1.0 / direction, np.inf)
+        """レイとバウンディングボックスの交差判定（Kay/Kajiyaスラブ法）"""
+        t_min = 0.0
+        t_max = max_distance
+
+        for i in range(3):
+            if abs(direction[i]) < 1e-8:  # レイが軸に平行
+                # 平行なレイがボックスの外側にある場合、交差しない
+                if origin[i] < bbox.min_point[i] or origin[i] > bbox.max_point[i]:
+                    return False
+                # ボックスの内側にある場合、この軸では交差が確定しているが、他の軸の判定は続ける
+            else:
+                inv_dir = 1.0 / direction[i]
+                t1 = (bbox.min_point[i] - origin[i]) * inv_dir
+                t2 = (bbox.max_point[i] - origin[i]) * inv_dir
+
+                if t1 > t2:
+                    t1, t2 = t2, t1
+
+                t_min = max(t_min, t1)
+                t_max = min(t_max, t2)
+
+                if t_min > t_max:
+                    return False
         
-        t1 = (bbox.min_point - origin) * inv_dir
-        t2 = (bbox.max_point - origin) * inv_dir
-        
-        t_min = np.maximum.reduce(np.minimum(t1, t2))
-        t_max = np.minimum.reduce(np.maximum(t1, t2))
-        
-        return t_max >= 0 and t_min <= t_max and t_min <= max_distance
+        return True
     
     def _update_query_stats(self, query_time: float):
         """クエリ統計を更新"""

@@ -9,6 +9,7 @@ import unittest
 import time
 import numpy as np
 from typing import List
+import threading
 
 # テスト対象モジュール
 import sys
@@ -87,6 +88,36 @@ class TestCollisionSearch(unittest.TestCase):
         
         self.assertLess(result.search_time_ms, 10.0)
 
+    def test_searcher_thread_safety(self):
+        """検索クラスのスレッドセーフティテスト"""
+        searcher = self.searcher
+        num_threads = 10
+        iterations = 50
+
+        def worker(hand_id_start):
+            for i in range(iterations):
+                hand = MockTrackedHand(
+                    f"hand_{hand_id_start + i}",
+                    np.random.rand(3) * 2 - 1,
+                    np.random.rand(3) * 0.1
+                )
+                searcher.search_near_hand(hand)
+                searcher.get_performance_stats()
+                if i % 10 == 0:
+                    searcher.clear_cache()
+
+        threads = [threading.Thread(target=worker, args=(i*iterations,)) for i in range(num_threads)]
+
+        for t in threads:
+            t.start()
+        
+        for t in threads:
+            t.join()
+
+        # クラッシュせずに終了すればOK
+        stats = searcher.get_performance_stats()
+        self.assertGreaterEqual(stats['total_searches'], num_threads * iterations)
+
 
 class TestSphereTriangleCollision(unittest.TestCase):
     """球-三角形衝突テスト"""
@@ -146,7 +177,7 @@ class TestCollisionEvents(unittest.TestCase):
             collision_time_ms=1.5
         )
         
-        event = self.event_queue.create_event(
+        event = self.event_queue.update_state(
             collision_info,
             "test_hand",
             np.array([0.5, 0.5, 0.02]),
@@ -156,6 +187,39 @@ class TestCollisionEvents(unittest.TestCase):
         self.assertIsNotNone(event)
         self.assertEqual(event.event_type, EventType.COLLISION_START)
         self.assertGreater(event.intensity.value, 0)
+
+    def test_event_lifecycle(self):
+        """イベントライフサイクル（START, CONTINUE, END）テスト"""
+        hand_id = "lifecycle_hand"
+        hand_pos = np.array([0.1, 0.2, 0.3])
+        hand_vel = np.array([0.0, 0.0, -0.5])
+
+        # 1. 最初の衝突 -> START
+        contact = ContactPoint(np.array([0,0,0]), np.array([0,0,1]), 0.01, 0, np.array([1,0,0]), CollisionType.FACE_COLLISION)
+        info = CollisionInfo(True, [contact], contact, 0.01, np.array([0,0,1]), 1.0)
+        
+        event1 = self.event_queue.update_state(info, hand_id, hand_pos, hand_vel)
+        self.assertIsNotNone(event1)
+        self.assertEqual(event1.event_type, EventType.COLLISION_START)
+
+        # 2. 継続した衝突 -> CONTINUE
+        time.sleep(0.01) # タイムスタンプをずらす
+        info.closest_point.depth = 0.02 # 深度を更新
+        event2 = self.event_queue.update_state(info, hand_id, hand_pos, hand_vel)
+        self.assertIsNotNone(event2)
+        # BUG: 現状はCONTINUEを生成できないため、ここで失敗するはず
+        self.assertEqual(event2.event_type, EventType.COLLISION_CONTINUE, "Expected a CONTINUE event on the second frame")
+        self.assertGreater(event2.duration_ms, 0)
+        self.assertEqual(event1.event_id, event2.event_id) # イベントIDは継続
+
+        # 3. 衝突なし -> END
+        time.sleep(0.01)
+        no_collision_info = CollisionInfo(False, [], None, 0, np.zeros(3), 1.0)
+        event3 = self.event_queue.update_state(no_collision_info, hand_id, hand_pos, hand_vel)
+        self.assertIsNotNone(event3)
+        self.assertEqual(event3.event_type, EventType.COLLISION_END)
+        self.assertGreater(event3.duration_ms, event2.duration_ms)
+        self.assertEqual(event2.event_id, event3.event_id) # イベントIDは継続
 
 
 def run_collision_tests():

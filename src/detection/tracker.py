@@ -11,6 +11,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 import numpy as np
 from scipy.optimize import linear_sum_assignment
+import threading
 
 from .hands3d import Hand3DResult, Hand3DLandmark, HandednessType
 
@@ -113,8 +114,9 @@ class Hand3DTracker:
         self.max_assignment_distance = max_assignment_distance
         self.dt = dt
         
-        # トラッキング対象
+        # トラッキング対象と排他制御ロック
         self.tracked_hands: Dict[str, TrackedHand] = {}
+        self.lock = threading.Lock()
         
         # カルマンフィルタ行列
         self._setup_kalman_matrices()
@@ -169,43 +171,44 @@ class Hand3DTracker:
         """
         start_time = time.perf_counter()
         
-        try:
-            # 1. 予測ステップ（既存トラックの予測）
-            self._predict_existing_tracks()
-            
-            # 2. データアソシエーション（検出結果とトラックの対応付け）
-            assignments = self._assign_detections_to_tracks(hands_3d)
-            
-            # 3. 更新ステップ
-            self._update_assigned_tracks(assignments, hands_3d)
-            
-            # 4. 新しいトラック作成
-            self._create_new_tracks(assignments, hands_3d)
-            
-            # 5. 消失トラックの処理
-            self._handle_lost_tracks()
-            
-            # 6. 統計更新
-            tracking_time = (time.perf_counter() - start_time) * 1000
-            self._update_stats(tracking_time)
-            
-            # アクティブなトラックを返す
-            active_tracks = [
-                track for track in self.tracked_hands.values()
-                if track.state in [TrackingState.TRACKING, TrackingState.INITIALIZING]
-            ]
-            
-            return active_tracks
-            
-        except Exception as e:
-            print(f"Tracking update error: {e}")
-            return []
+        with self.lock:
+            try:
+                # 1. 予測ステップ（既存トラックの予測）
+                self._predict_existing_tracks()
+                
+                # 2. データアソシエーション（検出結果とトラックの対応付け）
+                assignments = self._assign_detections_to_tracks(hands_3d)
+                
+                # 3. 更新ステップ
+                self._update_assigned_tracks(assignments, hands_3d)
+                
+                # 4. 新しいトラック作成
+                self._create_new_tracks(assignments, hands_3d)
+                
+                # 5. 消失トラックの処理
+                self._handle_lost_tracks()
+                
+                # 6. 統計更新
+                tracking_time = (time.perf_counter() - start_time) * 1000
+                self._update_stats(tracking_time)
+                
+                # アクティブなトラックを返す
+                active_tracks = [
+                    track for track in self.tracked_hands.values()
+                    if track.state in [TrackingState.TRACKING, TrackingState.INITIALIZING]
+                ]
+                
+                return active_tracks
+                
+            except Exception as e:
+                # ToDo: Use logger
+                print(f"Tracking update error: {e}")
+                return []
     
     def _predict_existing_tracks(self) -> None:
         """既存トラックの予測"""
-        current_time = time.perf_counter()
-        
-        for track in self.tracked_hands.values():
+        # Note: This method is called within a lock
+        for track in list(self.tracked_hands.values()):
             if track.state == TrackingState.TERMINATED:
                 continue
             
@@ -218,13 +221,6 @@ class Hand3DTracker:
             # 予測値から位置・速度を更新
             track.position = track.state_vector[:3]
             track.velocity = track.state_vector[3:]
-            
-            # 加速度更新（速度の変化率）
-            dt = current_time - track.last_seen_time
-            if dt > 0:
-                # 簡易的な加速度推定
-                prev_velocity = track.velocity
-                track.acceleration = (track.velocity - prev_velocity) / dt
     
     def _assign_detections_to_tracks(
         self, 
@@ -236,6 +232,7 @@ class Hand3DTracker:
         Returns:
             {track_id: detection_index or None}
         """
+        # Note: This method is called within a lock
         if not hands_3d or not self.tracked_hands:
             return {}
         
@@ -295,6 +292,7 @@ class Hand3DTracker:
         hands_3d: List[Hand3DResult]
     ) -> None:
         """割り当てられたトラックの更新"""
+        # Note: This method is called within a lock
         current_time = time.perf_counter()
         
         for track_id, detection_idx in assignments.items():
@@ -312,6 +310,9 @@ class Hand3DTracker:
             track = self.tracked_hands[track_id]
             hand_3d = hands_3d[detection_idx]
             
+            # 加速度計算のために、更新前の速度を保持
+            prev_velocity = track.velocity.copy()
+            
             # カルマンフィルタ更新
             observation = np.array(hand_3d.palm_center_3d)
             
@@ -328,6 +329,14 @@ class Hand3DTracker:
             # トラック情報更新
             track.position = track.state_vector[:3]
             track.velocity = track.state_vector[3:]
+
+            # 加速度を計算
+            dt = current_time - track.last_seen_time
+            if dt > 0:
+                track.acceleration = (track.velocity - prev_velocity) / dt
+            else:
+                track.acceleration = np.zeros(3)
+
             track.confidence_2d = hand_3d.confidence_2d
             track.confidence_3d = hand_3d.confidence_3d
             track.landmarks_3d = hand_3d.landmarks_3d
@@ -356,112 +365,125 @@ class Hand3DTracker:
         hands_3d: List[Hand3DResult]
     ) -> None:
         """新しいトラックの作成"""
-        used_indices = set(
-            idx for idx in assignments.values() if idx is not None
+        # Note: This method is called within a lock
+        unassigned_detections = set(range(len(hands_3d))) - set(
+            det_idx for det_idx in assignments.values() if det_idx is not None
         )
-        
-        for i, hand_3d in enumerate(hands_3d):
-            if i not in used_indices:
-                # 新しいトラック作成
-                track_id = str(uuid.uuid4())
-                
-                new_track = TrackedHand(
-                    id=track_id,
-                    handedness=hand_3d.handedness,
-                    state=TrackingState.INITIALIZING,
-                    position=np.array(hand_3d.palm_center_3d),
-                    velocity=np.zeros(3),
-                    acceleration=np.zeros(3),
-                    confidence_2d=hand_3d.confidence_2d,
-                    confidence_3d=hand_3d.confidence_3d,
-                    confidence_tracking=hand_3d.confidence_3d,
-                    last_seen_time=time.perf_counter(),
-                    track_length=1,
-                    lost_frames=0,
-                    hand_size=0.0,
-                    landmarks_3d=hand_3d.landmarks_3d,
-                    palm_normal=hand_3d.palm_normal
-                )
-                
-                # カルマンフィルタ初期化
-                new_track.covariance_matrix = np.diag([
-                    self.kalman_config.initial_position_variance,
-                    self.kalman_config.initial_position_variance,
-                    self.kalman_config.initial_position_variance,
-                    self.kalman_config.initial_velocity_variance,
-                    self.kalman_config.initial_velocity_variance,
-                    self.kalman_config.initial_velocity_variance
-                ])
-                
-                self.tracked_hands[track_id] = new_track
-                self.performance_stats['total_tracks_created'] += 1
+
+        for det_idx in unassigned_detections:
+            new_hand = hands_3d[det_idx]
+            
+            # 新しいトラックID生成
+            track_id = str(uuid.uuid4())
+            
+            # 新しいトラックを作成
+            new_track = TrackedHand(
+                id=track_id,
+                handedness=new_hand.handedness,
+                state=TrackingState.INITIALIZING,
+                position=np.array(new_hand.palm_center_3d),
+                velocity=np.zeros(3),
+                acceleration=np.zeros(3),
+                confidence_2d=new_hand.confidence_2d,
+                confidence_3d=new_hand.confidence_3d,
+                confidence_tracking=new_hand.confidence_3d,
+                last_seen_time=time.perf_counter(),
+                track_length=1,
+                lost_frames=0,
+                hand_size=0.0,
+                landmarks_3d=new_hand.landmarks_3d,
+                palm_normal=new_hand.palm_normal
+            )
+            
+            # カルマンフィルタ初期化
+            new_track.covariance_matrix = np.diag([
+                self.kalman_config.initial_position_variance,
+                self.kalman_config.initial_position_variance,
+                self.kalman_config.initial_position_variance,
+                self.kalman_config.initial_velocity_variance,
+                self.kalman_config.initial_velocity_variance,
+                self.kalman_config.initial_velocity_variance
+            ])
+            
+            self.tracked_hands[track_id] = new_track
+            self.performance_stats['total_tracks_created'] += 1
     
     def _handle_lost_tracks(self) -> None:
         """消失トラックの処理"""
-        tracks_to_remove = []
-        
+        # Note: This method is called within a lock
+        lost_track_ids = []
+        terminated_track_ids = []
+
         for track_id, track in self.tracked_hands.items():
             if track.state == TrackingState.LOST:
-                if track.track_length < self.min_track_length:
-                    # 短いトラックは削除
-                    tracks_to_remove.append(track_id)
-                else:
-                    # 長いトラックは終了状態に
+                track.lost_frames += 1
+                if track.lost_frames > self.max_lost_frames:
                     track.state = TrackingState.TERMINATED
-        
-        for track_id in tracks_to_remove:
-            del self.tracked_hands[track_id]
+                    terminated_track_ids.append(track_id)
+            elif track.state == TrackingState.INITIALIZING:
+                # 初期化中のトラックも消失カウンタを増やす
+                track.lost_frames += 1
+                if track.lost_frames > 2: # 2フレーム見えなければ削除
+                    terminated_track_ids.append(track_id)
+
+        # 寿命が尽きたトラックを削除
+        for track_id in terminated_track_ids:
+            if track_id in self.tracked_hands:
+                del self.tracked_hands[track_id]
     
     def get_tracked_hand(self, hand_id: str) -> Optional[TrackedHand]:
-        """特定の手を取得"""
-        return self.tracked_hands.get(hand_id)
+        """指定IDのトラッキング済み手情報を取得"""
+        with self.lock:
+            return self.tracked_hands.get(hand_id)
     
     def get_dominant_hand(self) -> Optional[TrackedHand]:
-        """最も信頼度の高い手を取得"""
-        active_tracks = [
-            track for track in self.tracked_hands.values()
-            if track.state == TrackingState.TRACKING
-        ]
-        
-        if not active_tracks:
-            return None
-        
-        return max(active_tracks, key=lambda t: t.confidence_tracking)
+        """主要な手を取得（最も信頼度が高い or 中心に近い）"""
+        with self.lock:
+            active_tracks = [
+                t for t in self.tracked_hands.values() 
+                if t.state == TrackingState.TRACKING
+            ]
+            if not active_tracks:
+                return None
+            
+            # 最も信頼度の高いトラックを返す
+            return max(active_tracks, key=lambda t: t.confidence_tracking)
     
     def reset(self) -> None:
-        """トラッカーリセット"""
-        self.tracked_hands.clear()
-        self.performance_stats['total_tracks_created'] = 0
+        """トラッカーの状態をリセット"""
+        with self.lock:
+            self.tracked_hands.clear()
+            for key in self.performance_stats:
+                if 'avg' not in key:
+                    self.performance_stats[key] = 0
     
     def _update_stats(self, tracking_time_ms: float) -> None:
-        """統計更新"""
+        """統計情報を更新"""
+        # Note: This method is called within a lock
         self.performance_stats['total_updates'] += 1
-        self.performance_stats['tracking_time_ms'] = tracking_time_ms
-        self.performance_stats['active_tracks'] = len([
-            t for t in self.tracked_hands.values()
-            if t.state == TrackingState.TRACKING
-        ])
-        
-        # 移動平均
-        total = self.performance_stats['total_updates']
-        prev_avg = self.performance_stats['avg_tracking_time_ms']
+        self.performance_stats['tracking_time_ms'] += tracking_time_ms
         self.performance_stats['avg_tracking_time_ms'] = (
-            (prev_avg * (total - 1) + tracking_time_ms) / total
+            self.performance_stats['tracking_time_ms'] / self.performance_stats['total_updates']
         )
+        self.performance_stats['active_tracks'] = len([
+            t for t in self.tracked_hands.values() if t.state == TrackingState.TRACKING
+        ])
     
     def get_performance_stats(self) -> Dict[str, Any]:
         """パフォーマンス統計を取得"""
-        return self.performance_stats.copy()
+        with self.lock:
+            # 辞書のコピーを返して、外部での変更を防ぐ
+            return self.performance_stats.copy()
     
     def update_config(self, **kwargs) -> None:
-        """設定の動的更新"""
-        for key, value in kwargs.items():
-            if hasattr(self, key):
-                setattr(self, key, value)
-            elif hasattr(self.kalman_config, key):
-                setattr(self.kalman_config, key, value)
-                # カルマンフィルタ行列を再設定
-                self._setup_kalman_matrices()
+        """トラッカー設定を動的に更新"""
+        with self.lock:
+            for key, value in kwargs.items():
+                if hasattr(self, key):
+                    setattr(self, key, value)
+            
+            # 行列の再計算
+            self._setup_kalman_matrices()
 
 
 # ユーティリティ関数

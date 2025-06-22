@@ -211,18 +211,33 @@ class Hand3DProjector:
         depth_float[depth_float == 0] = np.nan
         
         # ガウシアンフィルタで平滑化
-        if self.depth_filter_kernel_size > 1:
-            # NaNを考慮したフィルタリング
-            valid_mask = ~np.isnan(depth_float)
+        if self.depth_filter_kernel_size > 1 and np.any(~np.isnan(depth_float)):
+            # NaNを考慮した2Dガウシアンフィルタを適用
+            sigma = max(1.0, self.depth_filter_kernel_size / 2.0)
+
+            # NaNsを0で埋めた入力画像
+            depth_no_nan = depth_float.copy()
+            nan_mask = np.isnan(depth_no_nan)
+            depth_no_nan[nan_mask] = 0
+
+            # 重み（NaNでない場所が1）
+            weights = np.ones_like(depth_no_nan)
+            weights[nan_mask] = 0
+
+            # 画像と重みの両方をフィルタリング
+            filtered_depth = ndimage.gaussian_filter(depth_no_nan, sigma=sigma)
+            filtered_weights = ndimage.gaussian_filter(weights, sigma=sigma)
             
-            if np.any(valid_mask):
-                # 有効領域のみフィルタ
-                filtered = np.full_like(depth_float, np.nan)
-                filtered[valid_mask] = ndimage.gaussian_filter(
-                    depth_float[valid_mask].reshape(-1),
-                    sigma=1.0
-                ).reshape(depth_float[valid_mask].shape)
-                depth_float = filtered
+            # ゼロ除算を回避
+            filtered_weights = np.where(filtered_weights > 1e-4, filtered_weights, 1.0)
+            
+            # 正規化
+            normalized_depth = filtered_depth / filtered_weights
+            
+            # 元々NaNだった場所をNaNに戻す
+            normalized_depth[nan_mask] = np.nan
+            
+            return normalized_depth
         
         return depth_float
     

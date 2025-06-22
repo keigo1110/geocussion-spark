@@ -204,16 +204,15 @@ def test_event_performance():
         hand_velocity = np.array([0.05, 0.0, 0.0])
         
         start_time = time.perf_counter()
-        event = event_queue.create_event(
+        event = event_queue.update_state(
             collision_info, f"hand_{i}", hand_position, hand_velocity
         )
-        elapsed = (time.perf_counter() - start_time) * 1000
         
-        times.append(elapsed)
         if event:
+            times.append((time.perf_counter() - start_time) * 1000)
             events_created += 1
         
-        print(f"  イベント {i+1}: {elapsed:.3f}ms")
+        print(f"  イベント {i+1}: {times[-1]:.3f}ms")
     
     avg_time = np.mean(times)
     max_time = np.max(times)
@@ -266,7 +265,7 @@ def test_full_pipeline_performance():
             )
             
             # 3. イベント生成
-            event = event_queue.create_event(
+            event = event_queue.update_state(
                 collision_info, hand.hand_id, hand.position, hand.velocity
             )
             
@@ -275,10 +274,10 @@ def test_full_pipeline_performance():
             if event:
                 frame_events += 1
             
+            total_times.append(pipeline_time)
             print(f"    {hand.hand_id}: {pipeline_time:.3f}ms")
         
         frame_time = (time.perf_counter() - frame_start) * 1000
-        total_times.append(frame_time)
         total_events += frame_events
         
         print(f"  フレーム {frame+1}: {frame_time:.3f}ms, イベント: {frame_events}")
