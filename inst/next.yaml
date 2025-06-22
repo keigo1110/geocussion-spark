@@ -126,3 +126,33 @@ tasks:
     depends_on: [P-MESH-002]
     acceptance_criteria:
       - "有効点抽出の処理時間が大幅に短縮されること。"
+
+id: collision
+title: "衝突判定の精度向上"
+description: "衝突判定の前提となる空間検索の距離計算を修正し、判定の信頼性を向上させる。"
+problems:
+  - id: P-COLLISION-001
+    title: "空間検索における不正確な距離計算"
+    module: "src/collision/search.py"
+    description: |
+      `_calculate_distances`メソッドが、検索点と「三角形の重心」との距離を計算している。
+      これは、真の最短距離（点と三角形上の最近接点との距離）とは異なり、特に細長い三角形などで大きな誤差を生む。
+      この不正確な距離に依存して最近傍の三角形が選択されるため、衝突判定の精度が低下し、衝突が見逃される原因となっている。
+    severity: "High"
+    fix_suggestion: |
+      `sphere_tri.py`に、点と三角形の最短距離を正確に計算するヘルパー関数を新設する。
+      `search.py`の`_calculate_distances`メソッドは、この新しいヘルパー関数を呼び出すように修正し、正確な距離に基づいて候補三角形を絞り込めるようにする。
+
+tasks:
+  - id: T-COLLISION-001
+    description: "`sphere_tri.py`に`point_triangle_distance`ヘルパー関数を実装する"
+    depends_on: [P-COLLISION-001]
+    acceptance_criteria:
+      - "点と三角形の間の正確な最短距離が計算されること。"
+
+  - id: T-COLLISION-002
+    description: "`search.py`が新しい距離計算関数を利用するように修正する"
+    depends_on: [T-COLLISION-001]
+    acceptance_criteria:
+      - "空間検索の結果が、正確な距離に基づいてソート・フィルタリングされるようになること。"
+      - "最終的に、`demo_collision_detection.py`で手が地形に衝突した際に音が発生すること。"

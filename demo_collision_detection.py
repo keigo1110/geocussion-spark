@@ -34,6 +34,9 @@ try:
     from src.debug.dual_viewer import DualViewer
     from src.input.depth_filter import FilterType
     
+    # Orbbec SDK
+    from pyorbbecsdk import Pipeline
+    
     # 地形メッシュ生成
     from src.mesh.projection import PointCloudProjector, ProjectionMethod
     from src.mesh.delaunay import DelaunayTriangulator
