@@ -203,26 +203,29 @@ class Hand3DProjector:
             return None
     
     def _preprocess_depth(self, depth_image: np.ndarray) -> np.ndarray:
-        """深度画像の前処理"""
+        """深度画像の前処理（NaN補間と平滑化）"""
         # uint16 → float32 変換とスケーリング
         depth_float = depth_image.astype(np.float32) / self.depth_scale
         
         # 無効値（0）をNaNに変換
         depth_float[depth_float == 0] = np.nan
         
+        # NaNを補間 (Inpainting)
+        nan_mask = np.isnan(depth_float).astype(np.uint8)
+        if np.any(nan_mask):
+            # OpenCVのinpaint関数を利用
+            # 8bitに正規化してから処理
+            max_val = np.nanmax(depth_float)
+            if max_val > 0:
+                norm_image = (depth_float / max_val * 255).astype(np.uint8)
+                inpainted_norm = cv2.inpaint(norm_image, nan_mask, 3, cv2.INPAINT_TELEA)
+                depth_float = (inpainted_norm.astype(np.float32) / 255.0) * max_val
+        
         # ガウシアンフィルタで平滑化
         if self.depth_filter_kernel_size > 1:
-            # NaNを考慮したフィルタリング
-            valid_mask = ~np.isnan(depth_float)
-            
-            if np.any(valid_mask):
-                # 有効領域のみフィルタ
-                filtered = np.full_like(depth_float, np.nan)
-                filtered[valid_mask] = ndimage.gaussian_filter(
-                    depth_float[valid_mask].reshape(-1),
-                    sigma=1.0
-                ).reshape(depth_float[valid_mask].shape)
-                depth_float = filtered
+            # カーネルサイズは奇数に
+            ksize = self.depth_filter_kernel_size if self.depth_filter_kernel_size % 2 != 0 else self.depth_filter_kernel_size + 1
+            depth_float = cv2.GaussianBlur(depth_float, (ksize, ksize), 0)
         
         return depth_float
     
@@ -249,21 +252,18 @@ class Hand3DProjector:
                 depth_valid=False
             )
         
-        # カメラ座標系への変換
-        fx, fy = self.camera_intrinsics.fx, self.camera_intrinsics.fy
-        cx, cy = self.camera_intrinsics.cx, self.camera_intrinsics.cy
-        
-        x_3d = (u - cx) * depth_z / fx
-        y_3d = (v - cy) * depth_z / fy
-        z_3d = depth_z
+        # 3D座標計算
+        x = (u - self.camera_intrinsics.cx) * depth_z / self.camera_intrinsics.fx
+        y = -(v - self.camera_intrinsics.cy) * depth_z / self.camera_intrinsics.fy  # Y軸を反転
+        z = depth_z
         
         # 信頼度計算（MediaPipe可視性スコア × 深度信頼度）
         confidence_3d = landmark_2d.visibility * depth_confidence
         
         return Hand3DLandmark(
-            x=x_3d,
-            y=y_3d,
-            z=z_3d,
+            x=x,
+            y=y,
+            z=z,
             confidence=confidence_3d,
             depth_valid=True
         )

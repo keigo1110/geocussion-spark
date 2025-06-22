@@ -27,11 +27,11 @@ class TrackingState(Enum):
 class KalmanFilterConfig:
     """カルマンフィルタ設定"""
     # プロセスノイズ（位置の変動）
-    process_noise_position: float = 0.01  # m
+    process_noise_position: float = 0.05  # m
     process_noise_velocity: float = 0.1   # m/s
     
     # 観測ノイズ（3D投影の不確実性）
-    observation_noise: float = 0.02  # m
+    observation_noise: float = 0.05  # m
     
     # 初期共分散
     initial_position_variance: float = 0.1  # m^2

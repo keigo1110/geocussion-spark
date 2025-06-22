@@ -25,3 +25,65 @@ tasks:
     acceptance_criteria:
       - "深度データの精度を損なうことなく、エッジを保持した平滑化が適用されること。"
       - "修正後、`demo_collision_detection.py`で地形メッシュがより詳細に表示されること。"
+
+id: detection
+title: "手検出フェーズのバグ修正と安定化"
+description: "手の3D投影における座標計算のバグを修正し、トラッキングの安定性を向上させることで、衝突検出の前提条件を確立する。"
+problems:
+  - id: P-DETECTION-001
+    title: "3D投影におけるY座標の反転バグ"
+    module: "src/detection/hands3d.py"
+    description: |
+      `_project_landmark_to_3d`メソッド内で、2Dピクセル座標から3D空間座標へ変換する際、Y座標の計算式が誤っている。
+      `y = (v - cy) * depth_z / fy` となっているため、Y軸が反転してしまい、手が常に地形モデルの下側に表示される。
+      これにより、手と地形の衝突が物理的に不可能になっている。
+    severity: "Critical"
+    fix_suggestion: |
+      計算式を `y = -(v - self.camera_intrinsics.cy) * depth_z / self.camera_intrinsics.fy` へ修正し、Open3Dの標準座標系に合わせる。
+
+  - id: P-DETECTION-002
+    title: "深度画像の前処理におけるフィルタリングの不備"
+    module: "src/detection/hands3d.py"
+    description: |
+      `_preprocess_depth`メソッド内のガウシアンフィルタが、`NaN`を考慮しているものの、有効なピクセルのみを抽出して1次元配列として処理しているため、空間的な平滑化が正しく機能していない。
+      `scipy.ndimage.gaussian_filter`は多次元配列を直接扱えるため、現在の実装は非効率かつ効果が薄い。
+    severity: "Medium"
+    fix_suggestion: |
+      `NaN`値を周辺の有効な深度値で補間（inpaint）したのち、画像全体にガウシアンフィルタを適用する方式に変更する。
+      `OpenCV`の`inpaint`関数を利用することで、よりロバストな平滑化が期待できる。
+
+tasks:
+  - id: T-DETECTION-001
+    description: "`_project_landmark_to_3d`メソッドのY座標計算式を修正する"
+    depends_on: [P-DETECTION-001]
+    acceptance_criteria:
+      - "3Dビューワで、手が正しいY座標（上向き）に表示されること。"
+
+  - id: T-DETECTION-002
+    description: "`_preprocess_depth`メソッドのフィルタリング処理を改善する"
+    depends_on: [P-DETECTION-002]
+    acceptance_criteria:
+      - "深度画像がより滑らかになり、ランドマークの3D投影が安定すること。"
+
+id: tracker
+title: "手トラッキングの安定性向上"
+description: "カルマンフィルタのノイズパラメータを調整し、トラッキングのロバスト性を向上させる。"
+problems:
+  - id: P-TRACKER-001
+    title: "トラッキングが不安定になる不適切なノイズパラメータ"
+    module: "src/detection/tracker.py"
+    description: |
+      `KalmanFilterConfig`で設定されているプロセスノイズと観測ノイズの値が小さすぎる。
+      `process_noise_position` (1cm) と `observation_noise` (2cm) は、実際のセンサーノイズや検出のばらつきに対して楽観的すぎるため、フィルタが観測値を棄却しやすくなっている。
+      これにより、トラッキングが不安定になったり、すぐにロストしたりする原因となり、衝突判定の対象となる手が減少する。
+    severity: "Medium"
+    fix_suggestion: |
+      `process_noise_position` を `0.05`、`observation_noise` を `0.05` に変更する。
+      これにより、フィルタの許容度が高まり、より多くの検出結果を追跡に反映できるようになり、トラッキングが安定する。
+
+tasks:
+  - id: T-TRACKER-001
+    description: "`KalmanFilterConfig`のノイズパラメータを調整する"
+    depends_on: [P-TRACKER-001]
+    acceptance_criteria:
+      - "手のトラッキングが途切れにくくなり、より安定して追跡されること。"
