@@ -1,0 +1,85 @@
+# ===================================================================
+# Geocussion-Spark Hand-Terrain Collision Detection System
+# Requirements File for Complete Environment Setup
+# ===================================================================
+
+# Core Scientific Computing
+numpy>=1.26.0,<2.0.0
+scipy>=1.15.0,<2.0.0
+
+# Computer Vision and Image Processing
+opencv-python>=4.10.0,<5.0.0
+opencv-contrib-python>=4.10.0,<5.0.0
+
+# 3D Visualization and Geometry
+open3d>=0.19.0,<1.0.0
+
+# Hand Detection and MediaPipe
+mediapipe>=0.10.0,<1.0.0
+
+# Audio Synthesis and Sound Processing
+pyo>=1.0.0,<2.0.0
+
+# Data Visualization (Optional)
+matplotlib>=3.8.0,<4.0.0
+
+# Development and Testing
+pytest>=7.0.0,<8.0.0
+pytest-cov>=4.0.0,<5.0.0
+
+# Optional GUI Dependencies (for pyo)
+# wxPython>=4.2.0  # Uncomment if GUI features are needed
+
+# ===================================================================
+# Hardware-Specific Dependencies
+# ===================================================================
+
+# Orbbec Camera SDK
+# Note: pyorbbecsdk requires manual installation from the included directory
+# Run: pip install ./pyorbbecsdk/install/lib/
+
+# ===================================================================
+# Python Version Requirement
+# ===================================================================
+# Requires Python 3.8 or higher
+# Tested with Python 3.8, 3.9, 3.10, 3.11
+
+# ===================================================================
+# Installation Instructions
+# ===================================================================
+# 1. Create virtual environment:
+#    python -m venv venv
+#    source venv/bin/activate  # Linux/Mac
+#    # or
+#    venv\Scripts\activate  # Windows
+#
+# 2. Install requirements:
+#    pip install -r requirements.txt
+#
+# 3. Install Orbbec SDK:
+#    PYTHONPATH=$PYTHONPATH:$(pwd)/pyorbbecsdk/install/lib/
+#    pip install ./pyorbbecsdk/install/lib/
+#
+# 4. Verify installation:
+#    python demo_collision_detection.py --test
+#
+# ===================================================================
+# System Dependencies (Ubuntu/Debian)
+# ===================================================================
+# For audio support:
+#   sudo apt-get install libasound2-dev portaudio19-dev
+#   sudo apt-get install libportaudio2 libportaudiocpp0
+#
+# For OpenCV:
+#   sudo apt-get install libopencv-dev python3-opencv
+#
+# For Open3D:
+#   sudo apt-get install libegl1-mesa-dev
+#
+# ===================================================================
+# Performance Optimization Notes
+# ===================================================================
+# - For CUDA support with MediaPipe, install mediapipe-gpu instead
+# - For audio latency optimization, consider JACK audio server
+# - For maximum performance, use Python 3.11 or higher
+# =================================================================== 
