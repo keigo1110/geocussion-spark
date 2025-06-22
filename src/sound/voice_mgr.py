@@ -246,22 +246,17 @@ class VoiceManager:
                 
                 # シンセサイザーからボイス停止
                 if voice_info.synthesizer_voice_id:
-                    if fade_out:
-                        # フェードアウト処理（TODO: 実装）
-                        pass
                     self.synthesizer.stop_voice(voice_info.synthesizer_voice_id)
                 
-                # 楽器別管理から削除
-                instrument = voice_info.audio_params.instrument
-                if voice_id in self.instrument_voices[instrument]:
-                    self.instrument_voices[instrument].remove(voice_id)
-                
-                # ボイス状態更新
-                voice_info.state = VoiceState.FINISHED
-                
-                # アクティブボイスから削除
+                # アクティブリストから削除
                 del self.active_voices[voice_id]
                 
+                # 楽器リストからも削除
+                instrument = voice_info.audio_params.instrument
+                if instrument in self.instrument_voices:
+                    if voice_id in self.instrument_voices[instrument]:
+                        self.instrument_voices[instrument].remove(voice_id)
+            
             except Exception as e:
                 print(f"Error deallocating voice {voice_id}: {e}")
     
@@ -511,6 +506,30 @@ class VoiceManager:
     def update_spatial_config(self, config: SpatialConfig):
         """空間音響設定を更新"""
         self.spatial_config = config
+    
+    def stop_all_voices(self, fade_out_time: float = 0.05):
+        """
+        全てのアクティブなボイスを停止
+        
+        Args:
+            fade_out_time: フェードアウト時間（秒）
+        """
+        with self._lock:
+            # active_voicesのキーのリストをコピーしてイテレート（ループ内で辞書を変更するため）
+            voice_ids_to_stop = list(self.active_voices.keys())
+            
+            for voice_id in voice_ids_to_stop:
+                voice_info = self.active_voices.get(voice_id)
+                if voice_info and voice_info.synthesizer_voice_id:
+                    # TODO: 本来はsynth側でフェードアウトを実装すべきだが、一旦即時停止
+                    self.synthesizer.stop_voice(voice_info.synthesizer_voice_id)
+            
+            # 全てのボイスをクリア
+            self.active_voices.clear()
+            for instrument in self.instrument_voices:
+                self.instrument_voices[instrument].clear()
+            
+            print(f"Stopped all {len(voice_ids_to_stop)} voices.")
 
 
 # 便利関数

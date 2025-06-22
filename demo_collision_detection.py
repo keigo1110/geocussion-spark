@@ -279,116 +279,6 @@ class FullPipelineViewer(DualViewer):
         
         return False
     
-    def process_frame_with_collision(self, color_image, depth_image, points_3d):
-        """フレーム処理（衝突検出まで含む完全パイプライン）"""
-        pipeline_start = time.perf_counter()
-        
-        # 既存の手検出処理
-        hands_2d, hands_3d, tracked_hands = self._process_hands_internal(color_image, depth_image)
-        
-        # フレームカウンタ更新
-        self.frame_counter += 1
-        self.perf_stats['frame_count'] += 1
-        
-        # 地形メッシュ生成（定期的に更新）
-        if (self.enable_mesh_generation and 
-            self.frame_counter - self.last_mesh_update >= self.mesh_update_interval and
-            points_3d is not None and len(points_3d) > 100):
-            
-            mesh_start = time.perf_counter()
-            try:
-                self._update_terrain_mesh(points_3d)
-                self.last_mesh_update = self.frame_counter
-            except Exception as e:
-                print(f"メッシュ生成エラー: {e}")
-            
-            mesh_time = (time.perf_counter() - mesh_start) * 1000
-            self.perf_stats['mesh_generation_time'] = mesh_time
-        
-        # 衝突検出
-        collision_events = []
-        if (self.enable_collision_detection and 
-            self.current_mesh is not None and 
-            tracked_hands and len(tracked_hands) > 0):
-            
-            collision_start = time.perf_counter()
-            try:
-                collision_events = self._detect_collisions(tracked_hands)
-            except Exception as e:
-                print(f"衝突検出エラー: {e}")
-            
-            collision_time = (time.perf_counter() - collision_start) * 1000
-            self.perf_stats['collision_detection_time'] = collision_time
-            self.perf_stats['collision_events_count'] += len(collision_events)
-        
-        # 音響生成
-        if (self.enable_audio_synthesis and self.audio_enabled and 
-            collision_events and len(collision_events) > 0):
-            
-            audio_start = time.perf_counter()
-            try:
-                audio_notes = self._generate_audio(collision_events)
-                self.perf_stats['audio_notes_played'] += audio_notes
-            except Exception as e:
-                print(f"音響生成エラー: {e}")
-            
-            audio_time = (time.perf_counter() - audio_start) * 1000
-            self.perf_stats['audio_synthesis_time'] = audio_time
-        
-        # 可視化更新
-        if self.enable_collision_visualization:
-            self._update_collision_visualization(collision_events)
-        
-        # パフォーマンス統計更新
-        total_time = (time.perf_counter() - pipeline_start) * 1000
-        self.perf_stats['total_pipeline_time'] = total_time
-        
-        # パフォーマンス情報をRGB画像に描画
-        self._draw_performance_info(color_image, collision_events)
-        
-        # 可視化用に保持
-        self.current_tracked_hands = tracked_hands
-        self.current_hands_3d = hands_3d
-        return hands_2d, hands_3d, collision_events
-    
-    def _process_hands_internal(self, color_image, depth_image):
-        """RGB/Depth から 2D→3D→トラッキングまでを実行し結果を返す。
-
-        DualViewer 本体ではフレーム取得と同時に検出処理を行うが、本クラスでは
-        update_frame() から直接 RGB / Depth 行列を受け取る設計なので、必要最小限
-        の処理をここで再実装する。"""
-
-        hands_2d, hands_3d, tracked_hands = [], [], []
-
-        if (not self.enable_hand_detection) or (self.hands_2d is None):
-            return hands_2d, hands_3d, tracked_hands
-
-        try:
-            # 2D 手検出 (MediaPipe は BGR 入力)
-            bgr_image = cv2.cvtColor(color_image, cv2.COLOR_RGB2BGR)
-            hands_2d = self.hands_2d.detect_hands(bgr_image)
-
-            # 2D 検出信頼度でフィルタ
-            from src.detection.hands2d import filter_hands_by_confidence
-            hands_2d = filter_hands_by_confidence(hands_2d, min_confidence=self.min_detection_confidence)
-
-            # 3D 投影
-            if hands_2d and self.projector_3d is not None:
-                hands_3d = self.projector_3d.project_hands_batch(hands_2d, depth_image)
-
-            # カルマンフィルタトラッキング
-            if hands_3d and self.enable_tracking and self.tracker is not None:
-                from src.detection.tracker import filter_stable_hands
-                tracked_hands = self.tracker.update(hands_3d)
-                tracked_hands = filter_stable_hands(tracked_hands, min_confidence=0.7)
-
-        except Exception as e:
-            print(f"_process_hands_internal error: {e}")
-
-        # 可視化用に保持
-        self.current_tracked_hands = tracked_hands
-        return hands_2d, hands_3d, tracked_hands
-    
     def _update_terrain_mesh(self, points_3d):
         """地形メッシュを更新"""
         if points_3d is None or len(points_3d) < 100:
@@ -402,7 +292,6 @@ class FullPipelineViewer(DualViewer):
             triangle_mesh = self.triangulator.triangulate_heightmap(height_map)
             
             if triangle_mesh is None or triangle_mesh.num_triangles == 0:
-                print("三角分割に失敗しました")
                 return
             
             # 3. メッシュ簡略化
@@ -433,9 +322,9 @@ class FullPipelineViewer(DualViewer):
     
     def _detect_collisions(self, tracked_hands):
         """衝突検出を実行"""
-        if (self.collision_searcher is None or 
-            self.collision_tester is None or 
-            not tracked_hands):
+        if self.collision_searcher is None or self.collision_tester is None:
+            return []
+        if not tracked_hands:
             return []
         
         collision_events = []
@@ -669,28 +558,85 @@ class FullPipelineViewer(DualViewer):
         print("="*50)
     
     def update_frame(self, color_image, depth_image, points_3d):
-        """フレーム更新（衝突検出版）"""
+        """
+        フレーム更新（衝突検出版）
+        DualViewerのメインループから毎フレーム呼び出される。
+        """
+        if color_image is None or depth_image is None:
+            return
+
         try:
-            # 衝突検出を含む完全パイプライン処理
-            hands_2d, hands_3d, collision_events = self.process_frame_with_collision(
-                color_image, depth_image, points_3d
-            )
-            
-            # RGB画像の可視化処理（手検出結果を描画）
-            if color_image is not None:
-                self.draw_hands_2d(color_image, hands_2d)
-                self.draw_performance_overlay(color_image)
-            
-            # 3D可視化更新（点群 + メッシュ + 衝突）
-            if self.vis is not None and points_3d is not None:
-                self.update_point_cloud(points_3d)
+            # 1. 手検出（2D -> 3D -> トラッキング）
+            hands_2d, hands_3d, tracked_hands = [], [], []
+            if self.enable_hand_detection and self.hands_2d is not None:
+                bgr_image = cv2.cvtColor(color_image, cv2.COLOR_RGB2BGR)
+                from src.detection.hands2d import filter_hands_by_confidence
                 
-                # 手の3D位置を可視化
-                self.update_hand_3d_visualization()
-        
+                all_hands_2d = self.hands_2d.detect_hands(bgr_image)
+                hands_2d = filter_hands_by_confidence(all_hands_2d, self.min_detection_confidence)
+                
+                if hands_2d and self.projector_3d:
+                    hands_3d = self.projector_3d.project_hands_batch(hands_2d, depth_image)
+                
+                if hands_3d and self.enable_tracking and self.tracker:
+                    # トラッカーに渡す前の最終防衛ラインとして、不正な座標を持つ手を除外
+                    valid_hands_3d = []
+                    for hand in hands_3d:
+                        if hand and hand.position is not None and not np.any(np.isnan(hand.position)):
+                            valid_hands_3d.append(hand)
+                    
+                    if len(valid_hands_3d) > 0:
+                        self.tracker.update(valid_hands_3d)
+
+                    from src.detection.tracker import filter_stable_hands
+                    tracked_hands = filter_stable_hands(self.tracker.get_tracked_hands(), 0.7)
+
+            # 2. フレームカウンタとパイプライン時間計測開始
+            pipeline_start = time.perf_counter()
+            self.frame_counter += 1
+            self.perf_stats['frame_count'] += 1
+
+            # 3. 地形メッシュ生成（定期的）
+            if (self.enable_mesh_generation and 
+                self.frame_counter - self.last_mesh_update >= self.mesh_update_interval and
+                points_3d is not None and len(points_3d) > 100):
+                mesh_start = time.perf_counter()
+                self._update_terrain_mesh(points_3d)
+                self.last_mesh_update = self.frame_counter
+                self.perf_stats['mesh_generation_time'] = (time.perf_counter() - mesh_start) * 1000
+
+            # 4. 衝突検出
+            collision_events = []
+            if (self.enable_collision_detection and self.current_mesh is not None and tracked_hands):
+                collision_start = time.perf_counter()
+                collision_events = self._detect_collisions(tracked_hands)
+                self.perf_stats['collision_detection_time'] = (time.perf_counter() - collision_start) * 1000
+                self.perf_stats['collision_events_count'] += len(collision_events)
+
+            # 5. 音響生成
+            if (self.enable_audio_synthesis and self.audio_enabled and collision_events):
+                audio_start = time.perf_counter()
+                audio_notes = self._generate_audio(collision_events)
+                self.perf_stats['audio_notes_played'] += audio_notes
+                self.perf_stats['audio_synthesis_time'] = (time.perf_counter() - audio_start) * 1000
+            
+            # 6. 可視化情報の更新
+            self.perf_stats['total_pipeline_time'] = (time.perf_counter() - pipeline_start) * 1000
+            self._draw_performance_info(color_image, collision_events)
+            self.draw_hands_2d(color_image, hands_2d)
+            self.draw_performance_overlay(color_image)
+            
+            if self.vis:
+                self.update_point_cloud(points_3d)
+                self.update_hand_3d_visualization(hands_3d)
+                if self.enable_collision_visualization:
+                    self._update_collision_visualization(collision_events)
+
         except Exception as e:
             print(f"フレーム更新エラー: {e}")
-    
+            import traceback
+            traceback.print_exc()
+
     def _initialize_audio_system(self):
         """音響システムを初期化"""
         try:

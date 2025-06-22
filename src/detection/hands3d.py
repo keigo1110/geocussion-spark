@@ -254,9 +254,13 @@ class Hand3DProjector:
         
         # 3D座標計算
         x = (u - self.camera_intrinsics.cx) * depth_z / self.camera_intrinsics.fx
-        y = -(v - self.camera_intrinsics.cy) * depth_z / self.camera_intrinsics.fy  # Y軸を反転
+        y = -(v - self.camera_intrinsics.cy) * depth_z / self.camera_intrinsics.fy
         z = depth_z
         
+        point_3d = np.array([x, y, z])
+        if np.any(np.isnan(point_3d)) or np.any(np.isinf(point_3d)):
+            return None
+
         # 信頼度計算（MediaPipe可視性スコア × 深度信頼度）
         confidence_3d = landmark_2d.visibility * depth_confidence
         

@@ -52,6 +52,19 @@ problems:
       `NaN`値を周辺の有効な深度値で補間（inpaint）したのち、画像全体にガウシアンフィルタを適用する方式に変更する。
       `OpenCV`の`inpaint`関数を利用することで、よりロバストな平滑化が期待できる。
 
+  - id: P-DETECTION-003
+    title: "3D投影におけるNaN座標の生成"
+    module: "src/detection/hands3d.py"
+    description: |
+      `_project_landmark_to_3d`メソッドが、深度が0または無効なピクセルを参照した場合に、結果として`NaN`を含む3D座標を生成してしまう。
+      この不正な座標が後続のトラッキング処理に渡されることで、`Tracking update error: cost matrix is infeasible`という致命的なエラーを引き起こしている。
+      これが原因でトラッキングが失敗し、手が検出されていても衝突判定の対象とならず、結果として音が鳴らない。
+    severity: "Critical"
+    fix_suggestion: |
+      `_project_landmark_to_3d`メソッドの最後で、計算された3D座標 `(x, y, z)` に `NaN` や `inf` が含まれていないかチェックする処理を追加する。
+      もし不正な値が含まれていた場合は、そのランドマークの投影は失敗とみなし、`None`を返すように修正する。
+      これにより、後続の処理に不正なデータが渡るのを防ぎ、システムの安定性を確保する。
+
 tasks:
   - id: T-DETECTION-001
     description: "`_project_landmark_to_3d`メソッドのY座標計算式を修正する"
@@ -64,6 +77,14 @@ tasks:
     depends_on: [P-DETECTION-002]
     acceptance_criteria:
       - "深度画像がより滑らかになり、ランドマークの3D投影が安定すること。"
+
+  - id: T-DETECTION-003
+    description: "`_project_landmark_to_3d`に不正値チェックを追加し、NaNの伝播を防止する"
+    depends_on: [P-DETECTION-003]
+    acceptance_criteria:
+      - "`Tracking update error` が発生しなくなること。"
+      - "手が検出され、追跡が安定して継続されること。"
+      - "デバッグログに `[DEBUG] _detect_collisions` が表示され、衝突判定処理が実行されること。"
 
 id: tracker
 title: "手トラッキングの安定性向上"
@@ -156,3 +177,26 @@ tasks:
     acceptance_criteria:
       - "空間検索の結果が、正確な距離に基づいてソート・フィルタリングされるようになること。"
       - "最終的に、`demo_collision_detection.py`で手が地形に衝突した際に音が発生すること。"
+
+id: sound
+title: "音響システムの安定化とロバスト性向上"
+description: "プログラム終了処理を安定させ、音響モジュールの信頼性を高める。"
+problems:
+  - id: P-SOUND-001
+    title: "全音声停止機能の欠落"
+    module: "src/sound/voice_mgr.py"
+    description: |
+      `VoiceManager`クラスに、現在再生中の全てのボイスを停止するための `stop_all_voices` メソッドが存在しない。
+      これにより、`demo_collision_detection.py` の終了時や、ユーザーが全停止を試みた際に `AttributeError` が発生し、正常なクリーンアップ処理が妨げられている。
+    severity: "Medium"
+    fix_suggestion: |
+      `VoiceManager`クラスに`stop_all_voices`メソッドを新規に実装する。
+      このメソッドは、`self.active_voices`をループ処理し、各ボイスに対応するシンセサイザーの停止メソッド（`self.synthesizer.stop_voice`）を呼び出すことで、再生中の音をすべて安全に停止させる。
+
+tasks:
+  - id: T-SOUND-001
+    description: "`voice_mgr.py` に `stop_all_voices` メソッドを実装する"
+    depends_on: [P-SOUND-001]
+    acceptance_criteria:
+      - "`demo_collision_detection.py` の実行終了時に `AttributeError` が発生しなくなること。"
+      - "デモ実行中に 'Q' キーを押した際に、再生中の音がすべて停止すること。"
