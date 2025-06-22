@@ -306,7 +306,7 @@ class AdaptiveDepthFilter(DepthFilter):
             
             # 平均ノイズレベルに基づくパラメータ調整
             if len(self.noise_level_history) >= 3:
-                avg_noise = np.mean(self.noise_level_history)
+                avg_noise = float(np.mean(self.noise_level_history))
                 self._adapt_parameters(avg_noise)
         
         return super().apply_filter(depth_image)
@@ -324,7 +324,7 @@ class AdaptiveDepthFilter(DepthFilter):
         # Laplacianによるエッジ強度計算
         depth_float = depth_image.astype(np.float32)
         laplacian = cv2.Laplacian(depth_float, cv2.CV_32F)
-        noise_estimate = np.std(laplacian[depth_image > 0])
+        noise_estimate = float(np.std(laplacian[depth_image > 0]))
         return noise_estimate
     
     def _adapt_parameters(self, noise_level: float) -> None:
