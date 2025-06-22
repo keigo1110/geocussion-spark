@@ -44,39 +44,18 @@ class Hand3DLandmark:
 @dataclass
 class Hand3DResult:
     """3D手検出結果"""
-    landmarks_3d: List[Hand3DLandmark]
-    handedness: HandednessType
-    confidence_2d: float  # 2D検出信頼度
-    confidence_3d: float  # 3D推定信頼度
+    id: str
+    landmarks_3d: List[Tuple[float, float, float]]
     palm_center_3d: Tuple[float, float, float]
-    timestamp_ms: float
-    
+    handedness: HandednessType
+    confidence: float
+    confidence_2d: float = 0.0  # 2D検出の信頼度
+    confidence_3d: float = 0.0  # 3D投影の信頼度
+    palm_normal: Optional[np.ndarray] = None  # 手のひら法線ベクトル
+
     @property
-    def valid_landmarks_count(self) -> int:
-        """有効な3Dランドマーク数"""
-        return sum(1 for lm in self.landmarks_3d if lm.depth_valid)
-    
-    @property
-    def palm_normal(self) -> np.ndarray:
-        """手のひらの法線ベクトル推定"""
-        if len(self.landmarks_3d) < 21:
-            return np.array([0, 0, 1])
-        
-        # 手のひらの主要点を使用
-        try:
-            wrist = self.landmarks_3d[0].position
-            mcp_middle = self.landmarks_3d[9].position
-            mcp_pinky = self.landmarks_3d[17].position
-            
-            # 法線ベクトル計算
-            v1 = mcp_middle - wrist
-            v2 = mcp_pinky - wrist
-            normal = np.cross(v1, v2)
-            normal = normal / np.linalg.norm(normal)
-            
-            return normal
-        except:
-            return np.array([0, 0, 1])
+    def position(self):
+        return np.array(self.palm_center_3d)
 
 
 class DepthInterpolationMethod(Enum):
@@ -97,7 +76,9 @@ class Hand3DProjector:
         interpolation_method: DepthInterpolationMethod = DepthInterpolationMethod.LINEAR,
         depth_filter_kernel_size: int = 3,
         max_depth_diff: float = 0.05,  # 5cm
-        min_confidence_3d: float = 0.3
+        min_confidence_3d: float = 0.3,
+        use_guided_filter: bool = False,
+        **guided_filter_params
     ):
         """
         初期化
@@ -109,6 +90,8 @@ class Hand3DProjector:
             depth_filter_kernel_size: 深度フィルタカーネルサイズ
             max_depth_diff: 最大深度差閾値
             min_confidence_3d: 最小3D信頼度
+            use_guided_filter: ガイドフィルタを使用するか
+            **guided_filter_params: ガイドフィルタのパラメータ
         """
         self.camera_intrinsics = camera_intrinsics
         self.depth_scale = depth_scale
@@ -116,6 +99,8 @@ class Hand3DProjector:
         self.depth_filter_kernel_size = depth_filter_kernel_size
         self.max_depth_diff = max_depth_diff
         self.min_confidence_3d = min_confidence_3d
+        self.use_guided_filter = use_guided_filter
+        self.guided_filter_params = guided_filter_params
         
         # パフォーマンス統計
         self.performance_stats = {
@@ -182,14 +167,21 @@ class Hand3DProjector:
             # 手のひら中心の3D座標計算
             palm_center_3d = self._calculate_palm_center_3d(landmarks_3d)
             
+            # landmarks_3dをタプルに変換
+            landmarks_tuples = []
+            for lm in landmarks_3d:
+                landmarks_tuples.append((lm.x, lm.y, lm.z))
+            
             # 結果作成
             result = Hand3DResult(
-                landmarks_3d=landmarks_3d,
-                handedness=hand_2d.handedness,
-                confidence_2d=hand_2d.confidence,
-                confidence_3d=confidence_3d,
+                id=hand_2d.id,
+                landmarks_3d=landmarks_tuples,
                 palm_center_3d=palm_center_3d,
-                timestamp_ms=time.perf_counter() * 1000
+                handedness=hand_2d.handedness,
+                confidence=hand_2d.confidence,
+                confidence_2d=hand_2d.confidence,  # 2D検出信頼度
+                confidence_3d=confidence_3d,  # 3D投影信頼度
+                palm_normal=None  # TODO: 手のひら法線計算の実装
             )
             
             # 統計更新
@@ -203,26 +195,29 @@ class Hand3DProjector:
             return None
     
     def _preprocess_depth(self, depth_image: np.ndarray) -> np.ndarray:
-        """深度画像の前処理"""
+        """深度画像の前処理（NaN補間と平滑化）"""
         # uint16 → float32 変換とスケーリング
         depth_float = depth_image.astype(np.float32) / self.depth_scale
         
         # 無効値（0）をNaNに変換
         depth_float[depth_float == 0] = np.nan
         
+        # NaNを補間 (Inpainting)
+        nan_mask = np.isnan(depth_float).astype(np.uint8)
+        if np.any(nan_mask):
+            # OpenCVのinpaint関数を利用
+            # 8bitに正規化してから処理
+            max_val = np.nanmax(depth_float)
+            if max_val > 0:
+                norm_image = (depth_float / max_val * 255).astype(np.uint8)
+                inpainted_norm = cv2.inpaint(norm_image, nan_mask, 3, cv2.INPAINT_TELEA)
+                depth_float = (inpainted_norm.astype(np.float32) / 255.0) * max_val
+        
         # ガウシアンフィルタで平滑化
         if self.depth_filter_kernel_size > 1:
-            # NaNを考慮したフィルタリング
-            valid_mask = ~np.isnan(depth_float)
-            
-            if np.any(valid_mask):
-                # 有効領域のみフィルタ
-                filtered = np.full_like(depth_float, np.nan)
-                filtered[valid_mask] = ndimage.gaussian_filter(
-                    depth_float[valid_mask].reshape(-1),
-                    sigma=1.0
-                ).reshape(depth_float[valid_mask].shape)
-                depth_float = filtered
+            # カーネルサイズは奇数に
+            ksize = self.depth_filter_kernel_size if self.depth_filter_kernel_size % 2 != 0 else self.depth_filter_kernel_size + 1
+            depth_float = cv2.GaussianBlur(depth_float, (ksize, ksize), 0)
         
         return depth_float
     
@@ -249,21 +244,27 @@ class Hand3DProjector:
                 depth_valid=False
             )
         
-        # カメラ座標系への変換
-        fx, fy = self.camera_intrinsics.fx, self.camera_intrinsics.fy
-        cx, cy = self.camera_intrinsics.cx, self.camera_intrinsics.cy
+        # 3D座標計算
+        x = (u - self.camera_intrinsics.cx) * depth_z / self.camera_intrinsics.fx
+        y = -(v - self.camera_intrinsics.cy) * depth_z / self.camera_intrinsics.fy
+        z = depth_z
         
-        x_3d = (u - cx) * depth_z / fx
-        y_3d = (v - cy) * depth_z / fy
-        z_3d = depth_z
+        # NaNまたは無限大のチェック
+        if np.isnan(x) or np.isnan(y) or np.isnan(z) or np.isinf(x) or np.isinf(y) or np.isinf(z):
+            # 無効な3D座標の場合は無効なランドマークを返す
+            return Hand3DLandmark(
+                x=0.0, y=0.0, z=0.0,
+                confidence=0.0,
+                depth_valid=False
+            )
         
         # 信頼度計算（MediaPipe可視性スコア × 深度信頼度）
         confidence_3d = landmark_2d.visibility * depth_confidence
         
         return Hand3DLandmark(
-            x=x_3d,
-            y=y_3d,
-            z=z_3d,
+            x=x,
+            y=y,
+            z=z,
             confidence=confidence_3d,
             depth_valid=True
         )
@@ -385,7 +386,7 @@ class Hand3DProjector:
         results = []
         batch_start_time = time.perf_counter()
         
-        for hand_2d in hands_2d:
+        for i, hand_2d in enumerate(hands_2d):
             result = self.project_hand_to_3d(hand_2d, depth_image)
             if result:
                 results.append(result)
@@ -393,7 +394,7 @@ class Hand3DProjector:
         batch_time = (time.perf_counter() - batch_start_time) * 1000
         if hands_2d:
             print(f"Batch 3D projection: {len(hands_2d)} hands in {batch_time:.1f}ms "
-                  f"({batch_time/len(hands_2d):.1f}ms/hand)")
+                  f"({batch_time/len(hands_2d):.1f}ms/hand) -> {len(results)} successful")
         
         return results
     
@@ -477,10 +478,9 @@ def create_mock_hand_3d_result() -> Hand3DResult:
         ))
     
     return Hand3DResult(
-        landmarks_3d=landmarks_3d,
-        handedness=HandednessType.RIGHT,
-        confidence_2d=0.95,
-        confidence_3d=0.85,
+        id="mock_id",
+        landmarks_3d=[tuple(lm.position) for lm in landmarks_3d],
         palm_center_3d=(0.1, 0.0, 0.8),
-        timestamp_ms=time.perf_counter() * 1000
+        handedness=HandednessType.RIGHT,
+        confidence=0.85
     ) 

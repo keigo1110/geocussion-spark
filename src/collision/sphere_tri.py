@@ -8,61 +8,14 @@
 
 import time
 from dataclasses import dataclass
-from typing import List, Tuple, Optional, Dict
+from typing import List, Tuple, Optional, Dict, TYPE_CHECKING
 from enum import Enum
 import numpy as np
 
 # 他フェーズとの連携
 from ..mesh.delaunay import TriangleMesh
 from ..mesh.attributes import MeshAttributes
-from .search import SearchResult
-
-
-class CollisionType(Enum):
-    """衝突タイプの列挙"""
-    NO_COLLISION = "none"           # 衝突なし
-    VERTEX_COLLISION = "vertex"     # 頂点との衝突
-    EDGE_COLLISION = "edge"         # エッジとの衝突
-    FACE_COLLISION = "face"         # 面との衝突
-
-
-@dataclass
-class ContactPoint:
-    """接触点情報"""
-    position: np.ndarray            # 接触点の3D座標
-    normal: np.ndarray              # 接触面の法線ベクトル
-    depth: float                    # 侵入深度
-    triangle_index: int             # 衝突した三角形のインデックス
-    barycentric: np.ndarray         # 三角形内の重心座標
-    collision_type: CollisionType   # 衝突タイプ
-    
-    @property
-    def penetration_vector(self) -> np.ndarray:
-        """侵入ベクトルを取得"""
-        return self.normal * self.depth
-
-
-@dataclass
-class CollisionInfo:
-    """衝突情報の総合データ"""
-    has_collision: bool             # 衝突が発生したか
-    contact_points: List[ContactPoint]  # 接触点のリスト
-    closest_point: Optional[ContactPoint]  # 最も近い接触点
-    total_penetration_depth: float  # 総侵入深度
-    collision_normal: np.ndarray    # 全体の衝突法線
-    collision_time_ms: float        # 計算時間
-    
-    @property
-    def num_contacts(self) -> int:
-        """接触点数を取得"""
-        return len(self.contact_points)
-    
-    @property
-    def max_penetration_depth(self) -> float:
-        """最大侵入深度を取得"""
-        if not self.contact_points:
-            return 0.0
-        return max(cp.depth for cp in self.contact_points)
+from .types import CollisionType, ContactPoint, CollisionInfo, SearchResult
 
 
 class SphereTriangleCollision:
@@ -507,6 +460,27 @@ def calculate_contact_point(
         return np.zeros(3), 0.0
     
     return contact_point.position, contact_point.depth
+
+
+def point_triangle_distance(point: np.ndarray, triangle_vertices: np.ndarray) -> float:
+    """
+    点と三角形の最短距離を計算
+    
+    Args:
+        point: 3D点の座標
+        triangle_vertices: 三角形の頂点座標 (3, 3)
+        
+    Returns:
+        最短距離
+    """
+    # _closest_point_on_triangleはインスタンスメソッドなので、
+    # ダミーのインスタンスを作成して呼び出す
+    # TODO: _closest_point_on_triangleを静的メソッドにリファクタリングする
+    s_tri = SphereTriangleCollision(
+        TriangleMesh(vertices=np.zeros((0, 3)), triangles=np.zeros((0, 3)))
+    )
+    _, distance, _, _ = s_tri._closest_point_on_triangle(point, triangle_vertices)
+    return distance
 
 
 def batch_collision_test(

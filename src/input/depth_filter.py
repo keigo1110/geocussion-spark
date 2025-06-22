@@ -26,7 +26,7 @@ class DepthFilter:
     
     def __init__(
         self,
-        filter_types: List[FilterType] = None,
+        filter_types: Optional[List[FilterType]] = None,
         median_kernel_size: int = 5,
         bilateral_d: int = 9,
         bilateral_sigma_color: float = 50.0,
@@ -144,16 +144,19 @@ class DepthFilter:
         filtered = depth_image.copy()
         if np.any(valid_mask):
             # バイラテラルフィルタ（エッジ保持）
-            # 16bitのままでは精度が悪いので一時的に8bitに変換
-            depth_8bit = cv2.convertScaleAbs(depth_image, alpha=255.0/65535.0)
-            filtered_8bit = cv2.bilateralFilter(
-                depth_8bit,
+            # uint16のままではcv2.bilateralFilterが期待通りに動作しないことがあるため、
+            # float32に正規化してから処理し、精度を維持する。
+            depth_float = depth_image.astype(np.float32) / 65535.0
+            
+            filtered_float = cv2.bilateralFilter(
+                depth_float,
                 self.bilateral_d,
-                self.bilateral_sigma_color,
+                self.bilateral_sigma_color / 255.0,  # sigmaColorをfloatスケールに調整
                 self.bilateral_sigma_space
             )
+            
             # 16bitに戻す
-            filtered = (filtered_8bit.astype(np.float32) * 65535.0 / 255.0).astype(np.uint16)
+            filtered = (filtered_float * 65535.0).astype(np.uint16)
         
         self.processing_times['bilateral'] = (time.perf_counter() - start_time) * 1000
         return filtered
@@ -198,6 +201,7 @@ class DepthFilter:
                 new_avg = adaptive_alpha * current_float + (1 - adaptive_alpha) * avg_float
                 self.temporal_avg = new_avg.astype(np.uint16)
             
+            assert self.temporal_avg is not None
             filtered = self.temporal_avg.copy()
         
         self.processing_times['temporal'] = (time.perf_counter() - start_time) * 1000
@@ -246,6 +250,37 @@ class DepthFilter:
                     # 時間フィルタパラメータ変更時は履歴リセット
                     self.reset_temporal_history()
 
+    def _estimate_noise_level(self, depth_image: np.ndarray) -> float:
+        """
+        深度画像のノイズレベルを推定
+        ラプラシアンフィルタの分散をノイズ指標として利用
+        """
+        # ゼロ以外の深度値のみを対象
+        valid_depth = depth_image[depth_image > 0]
+        if valid_depth.size < 100:
+            return 0.0  # 十分なデータがない
+        
+        # 8bitに変換してからラプラシアン適用
+        depth_8bit = cv2.convertScaleAbs(valid_depth, alpha=255.0/valid_depth.max())
+        laplacian_var = cv2.Laplacian(depth_8bit, cv2.CV_64F).var()
+        
+        return float(laplacian_var)
+    
+    def _adapt_parameters(self, noise_level: float) -> None:
+        """ノイズレベルに応じてフィルタパラメータを調整"""
+        if noise_level > 100:  # 高ノイズ
+            self.temporal_alpha = 0.2  # 強い平滑化
+            self.bilateral_sigma_color = 80.0
+            self.median_kernel_size = 7
+        elif noise_level > 50:  # 中ノイズ
+            self.temporal_alpha = 0.3
+            self.bilateral_sigma_color = 50.0
+            self.median_kernel_size = 5
+        else:  # 低ノイズ
+            self.temporal_alpha = 0.5  # 応答性重視
+            self.bilateral_sigma_color = 30.0
+            self.median_kernel_size = 3
+
 
 class AdaptiveDepthFilter(DepthFilter):
     """適応的深度フィルタ（動的パラメータ調整）"""
@@ -253,6 +288,7 @@ class AdaptiveDepthFilter(DepthFilter):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self.noise_level_history: Deque[float] = deque(maxlen=10)
+        self.enable_adaptive = True
         
     def apply_filter(self, depth_image: np.ndarray) -> np.ndarray:
         """
@@ -264,14 +300,14 @@ class AdaptiveDepthFilter(DepthFilter):
         Returns:
             フィルタ済み深度画像
         """
-        # ノイズレベル推定
-        noise_level = self._estimate_noise_level(depth_image)
-        self.noise_level_history.append(noise_level)
-        
-        # 平均ノイズレベルに基づくパラメータ調整
-        if len(self.noise_level_history) >= 3:
-            avg_noise = np.mean(self.noise_level_history)
-            self._adapt_parameters(avg_noise)
+        if self.enable_adaptive:
+            noise_level = self._estimate_noise_level(depth_image)
+            self.noise_level_history.append(noise_level)
+            
+            # 平均ノイズレベルに基づくパラメータ調整
+            if len(self.noise_level_history) >= 3:
+                avg_noise = float(np.mean(self.noise_level_history))
+                self._adapt_parameters(avg_noise)
         
         return super().apply_filter(depth_image)
     
@@ -288,7 +324,7 @@ class AdaptiveDepthFilter(DepthFilter):
         # Laplacianによるエッジ強度計算
         depth_float = depth_image.astype(np.float32)
         laplacian = cv2.Laplacian(depth_float, cv2.CV_32F)
-        noise_estimate = np.std(laplacian[depth_image > 0])
+        noise_estimate = float(np.std(laplacian[depth_image > 0]))
         return noise_estimate
     
     def _adapt_parameters(self, noise_level: float) -> None:

@@ -16,45 +16,8 @@ import numpy as np
 from ..mesh.index import SpatialIndex, BVHNode
 from ..mesh.delaunay import TriangleMesh
 from ..detection.tracker import TrackedHand
-
-
-class SearchStrategy(Enum):
-    """検索戦略の列挙"""
-    SPHERE_QUERY = "sphere"          # 球形検索
-    FRUSTUM_QUERY = "frustum"        # 錐形検索（手の移動方向考慮）
-    ADAPTIVE_RADIUS = "adaptive"     # 適応的半径調整
-    PREDICTIVE = "predictive"        # 予測的検索
-
-
-@dataclass
-class SearchResult:
-    """検索結果データ構造"""
-    triangle_indices: List[int]      # 近傍三角形のインデックス
-    distances: List[float]           # 各三角形への距離
-    search_time_ms: float           # 検索時間
-    query_point: np.ndarray         # 検索点
-    search_radius: float            # 検索半径
-    num_nodes_visited: int          # 訪問したBVHノード数
-    
-    @property
-    def num_triangles(self) -> int:
-        """検索された三角形数を取得"""
-        return len(self.triangle_indices)
-    
-    @property
-    def closest_triangle(self) -> Optional[int]:
-        """最近傍三角形インデックスを取得"""
-        if not self.triangle_indices:
-            return None
-        min_idx = np.argmin(self.distances)
-        return self.triangle_indices[min_idx]
-    
-    @property
-    def closest_distance(self) -> Optional[float]:
-        """最近傍距離を取得"""
-        if not self.distances:
-            return None
-        return min(self.distances)
+from .sphere_tri import point_triangle_distance
+from .types import SearchStrategy, SearchResult
 
 
 class CollisionSearcher:
@@ -248,34 +211,31 @@ class CollisionSearcher:
                 return max(adaptive_radius, self.default_radius * 0.5)
         
         elif self.strategy == SearchStrategy.FRUSTUM_QUERY and hand.velocity is not None:
-            # 移動速度に基づいて調整
+            # 速度に応じて半径を拡大
             speed = np.linalg.norm(hand.velocity)
-            speed_factor = min(speed * 10.0 + 1.0, 3.0)  # 最大3倍まで拡大
-            return min(self.default_radius * speed_factor, self.max_radius)
+            radius = self.default_radius + speed * 0.1  # 速度比例
+            return min(radius, self.max_radius)
         
         return self.default_radius
     
     def _calculate_distances(self, point: np.ndarray, triangle_indices: List[int]) -> List[float]:
-        """三角形への距離を計算"""
-        if not triangle_indices:
-            return []
-        
-        mesh = self.spatial_index.mesh
+        """点と各三角形の正確な最短距離を計算"""
         distances = []
+        if not triangle_indices:
+            return distances
+        
+        mesh_vertices = self.spatial_index.mesh.vertices
+        mesh_triangles = self.spatial_index.mesh.triangles
         
         for tri_idx in triangle_indices:
-            triangle = mesh.triangles[tri_idx]
-            triangle_vertices = mesh.vertices[triangle]
+            triangle_vertices = mesh_vertices[mesh_triangles[tri_idx]]
+            dist = point_triangle_distance(point, triangle_vertices)
+            distances.append(dist)
             
-            # 三角形の重心への距離（簡略化）
-            centroid = np.mean(triangle_vertices, axis=0)
-            distance = np.linalg.norm(point - centroid)
-            distances.append(distance)
-        
         return distances
     
     def _update_radius_feedback(self, radius: float, triangles_found: int):
-        """適応的半径調整のフィードバック更新"""
+        """適応的半径のためのフィードバック更新"""
         self.radius_history.append((radius, triangles_found))
         
         # 成功した半径を記録（三角形が1個以上見つかった場合）

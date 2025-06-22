@@ -184,22 +184,22 @@ class AudioMapper:
             self._update_adaptive_params(event)
         
         audio_params = AudioParameters(
-            pitch=pitch,
-            velocity=velocity,
-            duration=duration,
+            pitch=float(pitch),
+            velocity=float(velocity),
+            duration=float(duration),
             instrument=instrument,
-            timbre=timbre,
-            brightness=brightness,
-            pan=pan,
-            distance=distance,
-            reverb=reverb,
-            attack=attack,
-            decay=decay,
-            sustain=sustain,
-            release=release,
+            timbre=float(timbre),
+            brightness=float(brightness),
+            pan=float(pan),
+            distance=float(distance),
+            reverb=float(reverb),
+            attack=float(attack),
+            decay=float(decay),
+            sustain=float(sustain),
+            release=float(release),
             event_id=event.event_id,
             hand_id=event.hand_id,
-            timestamp=event.timestamp
+            timestamp=float(event.timestamp)
         )
         
         # パフォーマンス統計更新
@@ -276,18 +276,18 @@ class AudioMapper:
         return max(0.01, min(1.0, mapped_velocity))  # 完全無音は避ける
     
     def _map_duration(self, event: CollisionEvent) -> float:
-        """持続時間をマッピング"""
-        # 基本持続時間（楽器タイプに依存）
-        base_duration = 1.0
+        """持続時間をマッピング（打楽器らしく短く）"""
+        # 基本持続時間を大幅に短縮
+        base_duration = 0.8  # 1.0 → 0.8秒に短縮
         
-        # 接触面積による調整
-        area_factor = min(event.contact_area * 1000, 2.0)  # 0-2倍
+        # 接触面積による調整（影響を減少）
+        area_factor = 1.0 + min(event.contact_area * 500, 0.5)  # 最大1.5倍に制限
         
-        # 強度による調整
-        intensity_factor = 0.5 + (event.intensity.value / CollisionIntensity.MAXIMUM.value) * 1.5
+        # 強度による調整（影響を減少）
+        intensity_factor = 0.8 + (event.intensity.value / CollisionIntensity.MAXIMUM.value) * 0.4
         
         duration = base_duration * area_factor * intensity_factor
-        return max(0.1, min(5.0, duration))
+        return max(0.3, min(1.5, duration))  # 0.3-1.5秒の範囲に制限
     
     def _select_instrument(self, event: CollisionEvent) -> InstrumentType:
         """楽器を選択"""
@@ -347,7 +347,7 @@ class AudioMapper:
     def _map_pan(self, event: CollisionEvent) -> float:
         """X座標をステレオパンニングにマッピング"""
         x_min, x_max = self.adaptive_params['x_range']
-        x_pos = event.contact_position[0]
+        x_pos = float(event.contact_position[0])  # numpy.float64 → float変換
         
         if x_max > x_min:
             normalized_x = (x_pos - x_min) / (x_max - x_min)
@@ -356,7 +356,7 @@ class AudioMapper:
         
         # -1.0（左）～ 1.0（右）にマッピング
         pan = (normalized_x - 0.5) * 2.0
-        return max(-1.0, min(1.0, pan))
+        return float(max(-1.0, min(1.0, pan)))  # 確実にPython floatで返す
     
     def _map_distance(self, event: CollisionEvent) -> float:
         """距離感をマッピング"""
@@ -381,14 +381,14 @@ class AudioMapper:
     def _map_envelope(self, event: CollisionEvent, instrument: InstrumentType) -> Tuple[float, float, float, float]:
         """楽器タイプに応じたエンベロープをマッピング"""
         
-        # 楽器ごとのデフォルトエンベロープ
+        # 楽器ごとのデフォルトエンベロープ（打楽器らしく短く調整）
         envelopes = {
-            InstrumentType.MARIMBA: (0.01, 0.1, 0.8, 0.5),
+            InstrumentType.MARIMBA: (0.005, 0.15, 0.0, 0.8),     # 即座にアタック、sustainなし、自然減衰
             InstrumentType.SYNTH_PAD: (0.2, 0.3, 0.9, 1.0),
-            InstrumentType.BELL: (0.02, 0.2, 0.7, 1.2),
-            InstrumentType.CRYSTAL: (0.01, 0.05, 0.6, 0.8),
-            InstrumentType.DRUM: (0.001, 0.05, 0.5, 0.2),
-            InstrumentType.WATER_DROP: (0.05, 0.1, 0.8, 0.3),
+            InstrumentType.BELL: (0.01, 0.3, 0.0, 1.5),          # ベルも短いsustain
+            InstrumentType.CRYSTAL: (0.003, 0.1, 0.0, 1.2),      # クリスタルも打楽器的
+            InstrumentType.DRUM: (0.001, 0.05, 0.0, 0.15),       # ドラムは非常に短い
+            InstrumentType.WATER_DROP: (0.02, 0.08, 0.0, 0.25),  # 水滴も短く
             InstrumentType.WIND: (0.5, 0.5, 0.9, 1.5),
             InstrumentType.STRING: (0.1, 0.2, 0.8, 0.6)
         }

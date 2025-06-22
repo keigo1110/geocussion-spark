@@ -201,7 +201,7 @@ class VoiceManager:
                     start_time=time.perf_counter(),
                     state=VoiceState.ATTACK,
                     priority=priority,
-                    spatial_position=spatial_position or np.array([0.0, 0.0, 0.0]),
+                    spatial_position=spatial_position if spatial_position is not None else np.array([0.0, 0.0, 0.0]),
                     current_volume=audio_params.velocity,
                     current_pan=audio_params.pan,
                     current_reverb=audio_params.reverb
@@ -226,7 +226,9 @@ class VoiceManager:
                 return voice_id
                 
             except Exception as e:
+                import traceback
                 print(f"Error allocating voice: {e}")
+                print(f"Traceback: {traceback.format_exc()}")
                 return None
     
     def deallocate_voice(self, voice_id: str, fade_out: bool = True):
@@ -246,22 +248,17 @@ class VoiceManager:
                 
                 # シンセサイザーからボイス停止
                 if voice_info.synthesizer_voice_id:
-                    if fade_out:
-                        # フェードアウト処理（TODO: 実装）
-                        pass
                     self.synthesizer.stop_voice(voice_info.synthesizer_voice_id)
                 
-                # 楽器別管理から削除
-                instrument = voice_info.audio_params.instrument
-                if voice_id in self.instrument_voices[instrument]:
-                    self.instrument_voices[instrument].remove(voice_id)
-                
-                # ボイス状態更新
-                voice_info.state = VoiceState.FINISHED
-                
-                # アクティブボイスから削除
+                # アクティブリストから削除
                 del self.active_voices[voice_id]
                 
+                # 楽器リストからも削除
+                instrument = voice_info.audio_params.instrument
+                if instrument in self.instrument_voices:
+                    if voice_id in self.instrument_voices[instrument]:
+                        self.instrument_voices[instrument].remove(voice_id)
+            
             except Exception as e:
                 print(f"Error deallocating voice {voice_id}: {e}")
     
@@ -311,16 +308,37 @@ class VoiceManager:
             # TODO: シンセサイザーへのリアルタイム更新
     
     def cleanup_finished_voices(self):
-        """終了したボイスをクリーンアップ"""
+        """終了したボイスをクリーンアップ（スレッドセーフ改善版）"""
+        finished_voices = []
+        
+        # 1. ロック内で終了ボイスリストを作成（辞書変更を避ける）
         with self._lock:
-            finished_voices = []
-            
-            for voice_id, voice_info in self.active_voices.items():
-                if voice_info.estimated_remaining_time <= 0:
-                    finished_voices.append(voice_id)
-            
+            try:
+                current_time = time.perf_counter()
+                for voice_id, voice_info in list(self.active_voices.items()):
+                    if voice_info is None:
+                        finished_voices.append(voice_id)
+                        continue
+                    
+                    # 安全な時間チェック
+                    try:
+                        if voice_info.estimated_remaining_time <= 0.1:  # 100ms余裕を持たせる
+                            finished_voices.append(voice_id)
+                    except Exception:
+                        # 時間計算でエラーが出た場合も削除対象とする
+                        finished_voices.append(voice_id)
+            except Exception as e:
+                print(f"[VOICE-CLEANUP] Error during voice scan: {e}")
+                return
+        
+        # 2. ロック外で安全にクリーンアップ
+        if finished_voices:
+            print(f"[VOICE-CLEANUP] Cleaning up {len(finished_voices)} finished voices")
             for voice_id in finished_voices:
-                self.deallocate_voice(voice_id, fade_out=False)
+                try:
+                    self.deallocate_voice(voice_id, fade_out=False)
+                except Exception as e:
+                    print(f"[VOICE-CLEANUP] Error cleaning voice {voice_id}: {e}")
     
     def _steal_voice(self, new_audio_params: AudioParameters, new_priority: int) -> Optional[str]:
         """
@@ -400,8 +418,9 @@ class VoiceManager:
         Returns:
             空間処理が適用された音響パラメータ
         """
-        # パラメータをコピー
-        processed_params = audio_params
+        # パラメータを深いコピー
+        from copy import deepcopy
+        processed_params = deepcopy(audio_params)
         
         if self.spatial_config.mode == SpatialMode.STEREO_PAN:
             # ステレオパンニング
@@ -511,6 +530,30 @@ class VoiceManager:
     def update_spatial_config(self, config: SpatialConfig):
         """空間音響設定を更新"""
         self.spatial_config = config
+    
+    def stop_all_voices(self, fade_out_time: float = 0.05):
+        """
+        全てのアクティブなボイスを停止
+        
+        Args:
+            fade_out_time: フェードアウト時間（秒）
+        """
+        with self._lock:
+            # active_voicesのキーのリストをコピーしてイテレート（ループ内で辞書を変更するため）
+            voice_ids_to_stop = list(self.active_voices.keys())
+            
+            for voice_id in voice_ids_to_stop:
+                voice_info = self.active_voices.get(voice_id)
+                if voice_info and voice_info.synthesizer_voice_id:
+                    # TODO: 本来はsynth側でフェードアウトを実装すべきだが、一旦即時停止
+                    self.synthesizer.stop_voice(voice_info.synthesizer_voice_id)
+            
+            # 全てのボイスをクリア
+            self.active_voices.clear()
+            for instrument in self.instrument_voices:
+                self.instrument_voices[instrument].clear()
+            
+            print(f"Stopped all {len(voice_ids_to_stop)} voices.")
 
 
 # 便利関数
