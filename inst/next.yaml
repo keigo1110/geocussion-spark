@@ -1,0 +1,27 @@
+id: input
+title: "入力フェーズの品質改善"
+description: "深度フィルタのバグを修正し、点群データの精度を向上させることで、後続のメッシュ生成および衝突検出の信頼性を高める。"
+problems:
+  - id: P-INPUT-001
+    title: "バイラテラルフィルタにおける深度情報の精度劣化"
+    module: "src/input/depth_filter.py"
+    description: |
+      `_apply_bilateral_filter`メソッド内で、16bitの深度データを8bitに変換してからフィルタを適用している。
+      この過程で`cv2.convertScaleAbs`が使用されており、深度情報が65536段階から256段階へと大幅に圧縮され、地形の微細な情報が失われている。
+      これがメッシュ品質の低下を招き、衝突が検出されない根本的な原因となっている。
+    severity: "Critical"
+    fix_suggestion: |
+      深度データを8bitに変換するのではなく、float型に正規化してから`cv2.bilateralFilter`を適用し、結果を16bitに戻すように修正する。
+      これにより、情報の損失を最小限に抑えつつノイズ除去が可能になる。
+
+tasks:
+  - id: T-INPUT-001
+    description: "`_apply_bilateral_filter`メソッドの実装を修正する"
+    depends_on: [P-INPUT-001]
+    steps:
+      - "1. `depth_image` (uint16) を `float32` 型の配列に変換する。"
+      - "2. `cv2.bilateralFilter` をfloat型の配列に適用する。`sigmaColor` パラメータをfloatスケールに合わせて調整する。"
+      - "3. フィルタ適用後のfloat配列をスケールし直し、`uint16` 型に戻す。"
+    acceptance_criteria:
+      - "深度データの精度を損なうことなく、エッジを保持した平滑化が適用されること。"
+      - "修正後、`demo_collision_detection.py`で地形メッシュがより詳細に表示されること。"
