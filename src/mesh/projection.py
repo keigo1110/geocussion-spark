@@ -13,6 +13,7 @@ from typing import Tuple, Optional, List, Union
 import numpy as np
 import cv2
 from scipy import ndimage
+from scipy.stats import binned_statistic_2d
 
 
 class ProjectionMethod(Enum):
@@ -182,60 +183,50 @@ class PointCloudProjector:
         grid_height: int,
         grid_width: int
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """ハイトマップを生成"""
+        """ハイトマップを生成（binned_statistic_2dで高速化）"""
         
-        # 出力配列初期化
-        height_map = np.full((grid_height, grid_width), np.nan, dtype=np.float32)
-        density_map = np.zeros((grid_height, grid_width), dtype=np.int32)
+        # 密度マップ計算
+        density_map, _, _, _ = binned_statistic_2d(
+            x=grid_y, y=grid_x, values=None,
+            statistic='count',
+            bins=(grid_height, grid_width),
+            range=[[0, grid_height], [0, grid_width]],
+            expand_binnumbers=False
+        )
+        density_map = density_map.astype(np.int32)
+        
+        # 最小点数フィルタ
+        valid_mask = density_map >= self.min_points_per_cell
 
-        # ------------------------------------------------------------------
-        # ベクトル化による密度マップ計算 (Python ループ → NumPy へ)
-        # ------------------------------------------------------------------
-        # セルごとの点数を高速に集計
-        np.add.at(density_map, (grid_y, grid_x), 1)
-
-        # 投影方式が DENSITY の場合は高度値も密度をそのまま使用
+        # 投影方式に応じた統計量を計算
         if self.method == ProjectionMethod.DENSITY:
-            height_map[density_map > 0] = density_map[density_map > 0]
-            valid_mask = density_map > 0
-            return height_map, density_map, valid_mask
-
-        # 高度統計用にセルインデックスを作成
-        coords = grid_y * grid_width + grid_x
-        sort_idx = np.argsort(coords)
-        coords_sorted = coords[sort_idx]
-        heights_sorted = heights[sort_idx]
-
-        # 連続区間を検出してセル単位で統計量を算出
-        unique_coords, start_indices = np.unique(coords_sorted, return_index=True)
-
-        for i, coord in enumerate(unique_coords):
-            start = start_indices[i]
-            end = start_indices[i + 1] if i + 1 < len(start_indices) else len(coords_sorted)
-            cell_heights = heights_sorted[start:end]
-
-            if len(cell_heights) < self.min_points_per_cell:
-                continue
-
-            row = coord // grid_width
-            col = coord % grid_width
-
-            # 投影方式に応じて高度計算
+            height_map = density_map.astype(np.float32)
+        else:
+            # 統計関数を選択
             if self.method == ProjectionMethod.MIN_HEIGHT:
-                height_value = np.min(cell_heights)
+                statistic = 'min'
             elif self.method == ProjectionMethod.MAX_HEIGHT:
-                height_value = np.max(cell_heights)
+                statistic = 'max'
             elif self.method == ProjectionMethod.MEAN_HEIGHT:
-                height_value = np.mean(cell_heights)
+                statistic = 'mean'
             elif self.method == ProjectionMethod.MEDIAN_HEIGHT:
-                height_value = np.median(cell_heights)
-            else:
-                height_value = np.mean(cell_heights)
-
-            height_map[row, col] = height_value
+                statistic = 'median'
+            else: # デフォルトは平均
+                statistic = 'mean'
+            
+            # binned_statistic_2dでハイトマップを高速生成
+            height_map, _, _, _ = binned_statistic_2d(
+                x=grid_y, y=grid_x, values=heights,
+                statistic=statistic,
+                bins=(grid_height, grid_width),
+                range=[[0, grid_height], [0, grid_width]]
+            )
         
-        valid_mask = ~np.isnan(height_map)
-        return height_map, density_map, valid_mask
+        # 無効なピクセル（NaNや点数が足りないセル）をマスク
+        valid_mask &= ~np.isnan(height_map)
+        height_map[~valid_mask] = 0  # 無効領域を0で初期化
+
+        return height_map.astype(np.float32), density_map, valid_mask
     
     def _fill_holes(self, heights: np.ndarray, valid_mask: np.ndarray) -> np.ndarray:
         """穴埋め処理（近傍補間）"""

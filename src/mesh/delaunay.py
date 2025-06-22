@@ -179,26 +179,25 @@ class DelaunayTriangulator:
         return mesh
     
     def _extract_valid_points(self, heightmap: HeightMap) -> np.ndarray:
-        """ハイトマップから有効な3D点を抽出"""
+        """ハイトマップから有効な3D点を抽出（ベクトル化による高速化）"""
         height, width = heightmap.shape
-        valid_mask = heightmap.valid_mask
         
-        # グリッド座標生成
-        y_coords, x_coords = np.meshgrid(
-            np.arange(height), np.arange(width), indexing='ij'
-        )
+        # 有効ピクセルのグリッド座標 (row, col) を取得
+        rows, cols = np.where(heightmap.valid_mask)
         
-        # 有効ピクセルのインデックス
-        valid_indices = np.where(valid_mask)
+        if len(rows) == 0:
+            return np.empty((0, 3), dtype=np.float32)
+
+        # グリッド座標から世界座標 (X, Y) へ一括変換
+        min_x, _, min_y, _ = heightmap.bounds
+        world_x = min_x + cols * heightmap.resolution
+        world_y = min_y + (height - 1 - rows) * heightmap.resolution # Y軸の向きを考慮
         
-        # 世界座標に変換
-        points_3d = []
-        for row, col in zip(valid_indices[0], valid_indices[1]):
-            world_x, world_y = heightmap.get_world_coordinates(row, col)
-            world_z = heightmap.heights[row, col]
-            points_3d.append([world_x, world_y, world_z])
+        # Z座標（高さ）を取得
+        world_z = heightmap.heights[rows, cols]
         
-        return np.array(points_3d)
+        # (N, 3) 形式の配列に結合
+        return np.stack([world_x, world_y, world_z], axis=1)
     
     def _adaptive_sampling(self, points: np.ndarray, heightmap: HeightMap) -> np.ndarray:
         """適応的サンプリング（密度に応じてサンプリング率を調整）"""

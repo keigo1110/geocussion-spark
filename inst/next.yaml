@@ -87,3 +87,42 @@ tasks:
     depends_on: [P-TRACKER-001]
     acceptance_criteria:
       - "手のトラッキングが途切れにくくなり、より安定して追跡されること。"
+
+id: mesh
+title: "メッシュ生成のパフォーマンス最適化"
+description: "メッシュ生成パイプラインにおけるボトルネックを解消し、リアルタイム性を向上させる。"
+problems:
+  - id: P-MESH-001
+    title: "ハイトマップ生成における非効率なループ処理"
+    module: "src/mesh/projection.py"
+    description: |
+      `_create_heightmap`メソッド内で、各グリッドセルの高さ（統計値）を計算する際に、Pythonのループと複雑なインデックス操作が使われている。
+      この実装は、点群の規模が大きくなると深刻なパフォーマンスボトルネックとなり、リアルタイム処理の予算を圧迫する。
+    severity: "High"
+    fix_suggestion: |
+      `scipy.stats.binned_statistic_2d`関数を利用して、ハイトマップ生成処理を全面的に書き換える。
+      この関数は、2D点群を指定されたビン（グリッド）に分割し、各ビン内の値の統計量を極めて高速に計算できるため、現在のループ処理を効率的かつ簡潔に置き換えることができる。
+
+  - id: P-MESH-002
+    title: "有効点抽出における非効率なループ処理"
+    module: "src/mesh/delaunay.py"
+    description: |
+      `_extract_valid_points`メソッド内で、ハイトマップから有効な3D点を抽出する際に、Pythonのforループを用いてピクセルを一つずつ世界座標へ変換している。
+      これもハイトマップの解像度が高くなるとパフォーマンスのボトルネックとなる。
+    severity: "Medium"
+    fix_suggestion: |
+      NumPyのベクトル演算とブロードキャストを活用して、ループ処理を完全に排除する。
+      グリッド座標の配列から、一度の行列演算で全ての世界座標を計算することで、処理を大幅に高速化できる。
+
+tasks:
+  - id: T-MESH-001
+    description: "`projection.py`の`_create_heightmap`を`binned_statistic_2d`で書き換える"
+    depends_on: [P-MESH-001]
+    acceptance_criteria:
+      - "ハイトマップ生成の処理時間が大幅に短縮されること。"
+
+  - id: T-MESH-002
+    description: "`delaunay.py`の`_extract_valid_points`をベクトル化する"
+    depends_on: [P-MESH-002]
+    acceptance_criteria:
+      - "有効点抽出の処理時間が大幅に短縮されること。"
