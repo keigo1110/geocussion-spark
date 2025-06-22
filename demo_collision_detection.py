@@ -147,6 +147,10 @@ class FullPipelineViewer(DualViewer):
         self.voice_manager: Optional[VoiceManager] = None
         self.audio_enabled = False  # 音響エンジンの状態
         
+        # 音響クールダウン管理（「叩いた瞬間」のみ音を鳴らす）
+        self.audio_cooldown_time = 0.15  # 150ms間隔での音発生制限
+        self.last_audio_trigger_time = {}  # hand_id別の最後のトリガー時間
+        
         # 状態管理
         self.current_mesh = None
         self.current_collision_points = []
@@ -806,19 +810,38 @@ class FullPipelineViewer(DualViewer):
             self.audio_enabled = False
     
     def _shutdown_audio_system(self):
-        """音響システムを停止"""
+        """音響システムを停止（安全版）"""
         try:
+            print("[AUDIO-SHUTDOWN] 音響システムを停止中...")
+            self.audio_enabled = False  # 最初に無効化して新しい音生成を防ぐ
+            
+            # ボイス管理システムの停止
             if self.voice_manager:
-                self.voice_manager.stop_all_voices()
+                try:
+                    self.voice_manager.stop_all_voices(fade_out_time=0.01)  # 短時間フェード
+                    time.sleep(0.05)  # 少し待機してボイス停止を確実にする
+                    self.voice_manager = None
+                except Exception as e:
+                    print(f"[AUDIO-SHUTDOWN] VoiceManager停止エラー: {e}")
             
+            # シンセサイザーエンジンの停止
             if self.audio_synthesizer:
-                self.audio_synthesizer.stop_engine()
+                try:
+                    self.audio_synthesizer.stop_engine()
+                    time.sleep(0.05)  # 少し待機してエンジン停止を確実にする
+                    self.audio_synthesizer = None
+                except Exception as e:
+                    print(f"[AUDIO-SHUTDOWN] Synthesizer停止エラー: {e}")
             
-            self.audio_enabled = False
-            print("音響システムを停止しました")
+            # 音響マッパーもクリア
+            self.audio_mapper = None
+            
+            print("[AUDIO-SHUTDOWN] 音響システムを停止しました")
         
         except Exception as e:
-            print(f"音響システム停止エラー: {e}")
+            print(f"[AUDIO-SHUTDOWN] 音響システム停止エラー: {e}")
+            # エラーでも状態を無効にする
+            self.audio_enabled = False
     
     def _restart_audio_system(self):
         """音響システムを再起動"""
@@ -828,14 +851,24 @@ class FullPipelineViewer(DualViewer):
             self._initialize_audio_system()
     
     def _generate_audio(self, collision_events):
-        """衝突イベントから音響を生成"""
+        """衝突イベントから音響を生成（クールダウン機構付き）"""
         if not self.audio_enabled or not self.audio_mapper or not self.voice_manager:
             return 0
         
         notes_played = 0
+        current_time = time.perf_counter()
         
         for event in collision_events:
             try:
+                # クールダウンチェック（手ID別）
+                hand_id = event.hand_id
+                last_trigger = self.last_audio_trigger_time.get(hand_id, 0)
+                time_since_last = current_time - last_trigger
+                
+                if time_since_last < self.audio_cooldown_time:
+                    print(f"[AUDIO-COOLDOWN] Hand {hand_id}: {time_since_last*1000:.1f}ms since last trigger, skipping")
+                    continue
+                
                 # 衝突イベントを音響パラメータにマッピング
                 audio_params = self.audio_mapper.map_collision_event(event)
                 
@@ -856,13 +889,19 @@ class FullPipelineViewer(DualViewer):
                 
                 if voice_id:
                     notes_played += 1
+                    # クールダウンタイマー更新
+                    self.last_audio_trigger_time[hand_id] = current_time
+                    print(f"[AUDIO-TRIGGER] Hand {hand_id}: Note triggered (cooldown reset)")
             
             except Exception as e:
                 print(f"音響生成エラー（イベント: {event.event_id}）: {e}")
         
-        # 終了したボイスのクリーンアップ
-        if self.voice_manager:
-            self.voice_manager.cleanup_finished_voices()
+        # 終了したボイスのクリーンアップ（フレーム間隔を空けて負荷軽減）
+        if self.voice_manager and self.frame_count % 10 == 0:  # 10フレームに1回のみ
+            try:
+                self.voice_manager.cleanup_finished_voices()
+            except Exception as e:
+                print(f"[AUDIO-CLEANUP] Error during cleanup: {e}")
         
         return notes_played
     
@@ -894,9 +933,18 @@ class FullPipelineViewer(DualViewer):
         """デストラクタ - 音響システムを適切に停止"""
         try:
             if hasattr(self, 'audio_enabled') and self.audio_enabled:
+                print("[DESTRUCTOR] 音響システムをクリーンアップ中...")
                 self._shutdown_audio_system()
         except Exception as e:
-            print(f"デストラクタでエラー: {e}")
+            print(f"[DESTRUCTOR] デストラクタでエラー: {e}")
+            
+    def cleanup(self):
+        """明示的なクリーンアップメソッド"""
+        try:
+            if self.audio_enabled:
+                self._shutdown_audio_system()
+        except Exception as e:
+            print(f"[CLEANUP] クリーンアップエラー: {e}")
 
     def _process_rgb_display(self, frame_data, collision_events=None) -> bool:
         """

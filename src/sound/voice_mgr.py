@@ -308,16 +308,37 @@ class VoiceManager:
             # TODO: シンセサイザーへのリアルタイム更新
     
     def cleanup_finished_voices(self):
-        """終了したボイスをクリーンアップ"""
+        """終了したボイスをクリーンアップ（スレッドセーフ改善版）"""
+        finished_voices = []
+        
+        # 1. ロック内で終了ボイスリストを作成（辞書変更を避ける）
         with self._lock:
-            finished_voices = []
-            
-            for voice_id, voice_info in self.active_voices.items():
-                if voice_info.estimated_remaining_time <= 0:
-                    finished_voices.append(voice_id)
-            
+            try:
+                current_time = time.perf_counter()
+                for voice_id, voice_info in list(self.active_voices.items()):
+                    if voice_info is None:
+                        finished_voices.append(voice_id)
+                        continue
+                    
+                    # 安全な時間チェック
+                    try:
+                        if voice_info.estimated_remaining_time <= 0.1:  # 100ms余裕を持たせる
+                            finished_voices.append(voice_id)
+                    except Exception:
+                        # 時間計算でエラーが出た場合も削除対象とする
+                        finished_voices.append(voice_id)
+            except Exception as e:
+                print(f"[VOICE-CLEANUP] Error during voice scan: {e}")
+                return
+        
+        # 2. ロック外で安全にクリーンアップ
+        if finished_voices:
+            print(f"[VOICE-CLEANUP] Cleaning up {len(finished_voices)} finished voices")
             for voice_id in finished_voices:
-                self.deallocate_voice(voice_id, fade_out=False)
+                try:
+                    self.deallocate_voice(voice_id, fade_out=False)
+                except Exception as e:
+                    print(f"[VOICE-CLEANUP] Error cleaning voice {voice_id}: {e}")
     
     def _steal_voice(self, new_audio_params: AudioParameters, new_priority: int) -> Optional[str]:
         """

@@ -294,3 +294,49 @@ Geocussion-Spark is a real-time hand-terrain collision detection system using Or
 
 **🎉 CONGRATULATIONS!** 
 **Professional-grade hand-terrain collision detection system with real-time audio synthesis is now fully operational and ready for production use!**
+
+# 音響システムクラッシュ修正 (2024-12-22)
+audio_stability_fix:
+  problem_identified: |
+    音が一回鳴った後にシステムがクラッシュする問題を解決
+    - スレッド競合によるpyoオブジェクトの不正アクセス
+    - ボイスクリーンアップ処理での辞書変更競合
+    - 音響エンジンの不安全な停止処理
+  
+  fixes_applied:
+    threading_safety:
+      - VoiceManager.cleanup_finished_voices()のスレッドセーフ化
+      - ロック内外でのボイス処理分離
+      - 辞書変更競合の解決
+    
+    pyo_object_safety:
+      - ボイス停止処理の複数方法試行
+      - pyoオブジェクトの安全な出力停止
+      - エラー処理での強制削除機構
+    
+    cleanup_optimization:
+      - クリーンアップ頻度の調整（10フレームに1回）
+      - 100ms余裕を持った終了判定
+      - エンジン状態チェック追加
+    
+    shutdown_safety:
+      - 段階的な音響システム停止
+      - 適切な待機時間の設定
+      - エラー時の強制状態クリア
+  
+  results:
+    stability: |
+      ✅ 連続音生成テスト成功（5音連続）
+      ✅ クリーンアップ処理安定化
+      ✅ システム終了時のクラッシュ解決
+      ✅ スレッド競合エラー除去
+    
+    performance:
+      - クリーンアップ負荷軽減
+      - メモリリーク防止
+      - レスポンス性向上
+    
+    audio_quality:
+      - 打楽器らしいマリンバサウンド維持
+      - クールダウン機構による自然な音間隔
+      - FM合成による豊かな音色

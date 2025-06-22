@@ -209,23 +209,39 @@ class AudioSynthesizer:
                 return None
     
     def stop_voice(self, voice_id: str):
-        """特定のボイスを停止"""
+        """特定のボイスを停止（安全版）"""
         with self._lock:
-            if voice_id in self.active_voices:
+            if voice_id not in self.active_voices:
+                return
+                
+            try:
+                voice_data = self.active_voices[voice_id]
+                voice = voice_data.get('voice')
+                
+                # pyoボイスの安全な停止
+                if voice is not None:
+                    try:
+                        # pyoオブジェクトの停止（複数の方法を試行）
+                        if hasattr(voice, 'stop'):
+                            voice.stop()
+                        if hasattr(voice, 'out'):
+                            voice.out(0)  # 出力を停止
+                    except Exception as e:
+                        print(f"[VOICE-STOP] Error stopping pyo voice: {e}")
+                
+                # 管理から削除
+                del self.active_voices[voice_id]
+                self.stats['active_voices_count'] = len(self.active_voices)
+                
+            except Exception as e:
+                print(f"[VOICE-STOP] Error stopping voice {voice_id}: {e}")
+                # エラーでも削除を試行
                 try:
-                    voice_data = self.active_voices[voice_id]
-                    voice = voice_data['voice']
-                    
-                    # ボイス停止
-                    if hasattr(voice, 'stop'):
-                        voice.stop()
-                    
-                    # 管理から削除
-                    del self.active_voices[voice_id]
-                    self.stats['active_voices_count'] = len(self.active_voices)
-                    
-                except Exception as e:
-                    print(f"Error stopping voice {voice_id}: {e}")
+                    if voice_id in self.active_voices:
+                        del self.active_voices[voice_id]
+                        self.stats['active_voices_count'] = len(self.active_voices)
+                except Exception:
+                    pass
     
     def stop_all_voices(self):
         """全ボイスを停止"""
@@ -274,10 +290,10 @@ class AudioSynthesizer:
         
         templates = {
             InstrumentType.MARIMBA: {
-                'oscillator_type': 'sine',
-                'harmonics': [1.0, 0.3, 0.1, 0.05],
-                'formant_freq': [440, 880, 1320],
-                'resonance': 0.8,
+                'oscillator_type': 'fm',
+                'carrier_ratio': 1.0,
+                'modulator_ratio': 4.0,
+                'modulation_index': 2.5,
                 'decay_curve': 'exponential'
             },
             
@@ -420,18 +436,40 @@ class AudioSynthesizer:
             return pyo.Sine(freq=freq)
     
     def cleanup_finished_voices(self):
-        """終了したボイスをクリーンアップ"""
+        """終了したボイスをクリーンアップ（安全版）"""
+        if self.state != EngineState.RUNNING:
+            return
+            
+        finished_voices = []
+        
+        # 1. ロック内で終了ボイスを特定
         with self._lock:
-            current_time = time.perf_counter()
-            finished_voices = []
-            
-            for voice_id, voice_data in self.active_voices.items():
-                elapsed = current_time - voice_data['start_time']
-                if elapsed >= voice_data['duration']:
-                    finished_voices.append(voice_id)
-            
+            try:
+                current_time = time.perf_counter()
+                for voice_id, voice_data in list(self.active_voices.items()):
+                    if voice_data is None:
+                        finished_voices.append(voice_id)
+                        continue
+                    
+                    try:
+                        elapsed = current_time - voice_data['start_time']
+                        duration = voice_data.get('duration', 1.0)
+                        if elapsed >= duration + 0.1:  # 100ms余裕
+                            finished_voices.append(voice_id)
+                    except Exception:
+                        # 時間計算エラーの場合も削除
+                        finished_voices.append(voice_id)
+            except Exception as e:
+                print(f"[SYNTH-CLEANUP] Error during voice scan: {e}")
+                return
+        
+        # 2. ロック外で安全に停止
+        if finished_voices:
             for voice_id in finished_voices:
-                self.stop_voice(voice_id)
+                try:
+                    self.stop_voice(voice_id)
+                except Exception as e:
+                    print(f"[SYNTH-CLEANUP] Error stopping voice {voice_id}: {e}")
     
     def get_performance_stats(self) -> dict:
         """パフォーマンス統計取得"""
