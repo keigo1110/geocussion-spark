@@ -588,10 +588,14 @@ class FullPipelineViewer(DualViewer):
         if not self._components_initialized and hasattr(self, 'camera') and self.camera is not None:
             try:
                 print("Setting up 3D hand detection components...")
-                self.projector_3d = Hand3DProjector(self.camera.depth_intrinsics)
+                # 信頼度閾値を下げてテスト
+                self.projector_3d = Hand3DProjector(
+                    self.camera.depth_intrinsics,
+                    min_confidence_3d=0.1  # 10%に下げてテスト
+                )
                 self.tracker = Hand3DTracker()
                 self._components_initialized = True
-                print("3D hand detection components initialized")
+                print("3D hand detection components initialized with lowered confidence threshold")
             except Exception as e:
                 print(f"3D component initialization error: {e}")
         
@@ -683,9 +687,21 @@ class FullPipelineViewer(DualViewer):
         # 3D投影
         hands_3d = []
         if hands_2d and self.projector_3d is not None:
-            print(f"[DEBUG] Frame {self.frame_count}: Performing 3D projection")
-            hands_3d = self.projector_3d.project_hands_batch(hands_2d, depth_image)
-            print(f"[DEBUG] Frame {self.frame_count}: 3D projection: {len(hands_2d)} input -> {len(hands_3d)} output")
+            print(f"[3D-PROJ] Frame {self.frame_count}: Attempting 3D projection with {len(hands_2d)} 2D hands")
+            try:
+                hands_3d = self.projector_3d.project_hands_batch(hands_2d, depth_image)
+                print(f"[3D-PROJ] Frame {self.frame_count}: 3D projection successful: {len(hands_2d)} input -> {len(hands_3d)} output")
+                if len(hands_3d) == 0:
+                    print(f"[3D-PROJ] Frame {self.frame_count}: WARNING: 3D projection returned 0 results")
+            except Exception as e:
+                print(f"[3D-PROJ] Frame {self.frame_count}: ERROR during 3D projection: {e}")
+                import traceback
+                traceback.print_exc()
+        else:
+            if not hands_2d:
+                print(f"[3D-PROJ] Frame {self.frame_count}: Skipped - no 2D hands")
+            if self.projector_3d is None:
+                print(f"[3D-PROJ] Frame {self.frame_count}: ERROR - projector_3d is None")
         
         # トラッキング
         tracked_hands = []
@@ -710,6 +726,10 @@ class FullPipelineViewer(DualViewer):
         self.performance_stats['hand_detection_time'] = (time.perf_counter() - hand_start_time) * 1000
         print(f"[DEBUG] Frame {self.frame_count}: Detected {len(hands_2d)} hands in 2D, {len(hands_3d)} in 3D, {len(tracked_hands)} tracked")
         
+        # 手が検出された場合のみ詳細ログを出力
+        if len(hands_2d) > 0 or len(hands_3d) > 0 or len(tracked_hands) > 0:
+            print(f"[HANDS] Frame {self.frame_count}: *** HANDS DETECTED *** 2D:{len(hands_2d)} 3D:{len(hands_3d)} Tracked:{len(tracked_hands)}")
+        
         # 衝突検出とメッシュ生成のパイプライン
         pipeline_start = time.perf_counter()
         self.frame_counter = self.frame_count  # フレームカウンターを同期
@@ -719,29 +739,33 @@ class FullPipelineViewer(DualViewer):
             self.frame_count - self.last_mesh_update >= self.mesh_update_interval and
             points_3d is not None and len(points_3d) > 100):
             mesh_start = time.perf_counter()
-            print(f"[DEBUG] Frame {self.frame_count}: Updating terrain mesh with {len(points_3d)} points")
+            print(f"[MESH] Frame {self.frame_count}: *** UPDATING TERRAIN MESH *** with {len(points_3d)} points")
             self._update_terrain_mesh(points_3d)
             self.last_mesh_update = self.frame_count
             self.perf_stats['mesh_generation_time'] = (time.perf_counter() - mesh_start) * 1000
+            print(f"[MESH] Frame {self.frame_count}: Mesh update completed in {self.perf_stats['mesh_generation_time']:.1f}ms")
         
         # 衝突検出
         collision_events = []
         if (self.enable_collision_detection and self.current_mesh is not None and tracked_hands):
-            print(f"[DEBUG] Frame {self.frame_count}: Starting collision detection with {len(tracked_hands)} hands and mesh available")
+            print(f"[COLLISION] Frame {self.frame_count}: *** CHECKING COLLISIONS *** with {len(tracked_hands)} hands and mesh available")
             collision_start = time.perf_counter()
             collision_events = self._detect_collisions(tracked_hands)
-            print(f"[DEBUG] Frame {self.frame_count}: Detected {len(collision_events)} collision events")
             self.perf_stats['collision_detection_time'] = (time.perf_counter() - collision_start) * 1000
             self.perf_stats['collision_events_count'] += len(collision_events)
+            if len(collision_events) > 0:
+                print(f"[COLLISION] Frame {self.frame_count}: *** COLLISION DETECTED! *** {len(collision_events)} events")
+            else:
+                print(f"[COLLISION] Frame {self.frame_count}: No collisions detected")
         
         # 音響生成
         if (self.enable_audio_synthesis and self.audio_enabled and collision_events):
             audio_start = time.perf_counter()
-            print(f"[DEBUG] Frame {self.frame_count}: Generating audio for {len(collision_events)} collision events")
+            print(f"[AUDIO] Frame {self.frame_count}: *** GENERATING AUDIO *** for {len(collision_events)} collision events")
             audio_notes = self._generate_audio(collision_events)
             self.perf_stats['audio_notes_played'] += audio_notes
             self.perf_stats['audio_synthesis_time'] = (time.perf_counter() - audio_start) * 1000
-            print(f"[DEBUG] Frame {self.frame_count}: Generated {audio_notes} audio notes")
+            print(f"[AUDIO] Frame {self.frame_count}: Generated {audio_notes} audio notes in {self.perf_stats['audio_synthesis_time']:.1f}ms")
         
         self.perf_stats['total_pipeline_time'] = (time.perf_counter() - pipeline_start) * 1000
         
@@ -954,7 +978,7 @@ class FullPipelineViewer(DualViewer):
                         color_image = cv2.imdecode(color_data, cv2.IMREAD_COLOR)
                         if color_image is not None:
                             color_image = cv2.cvtColor(color_image, cv2.COLOR_BGR2RGB)
-                    
+                
                 if color_image is not None:
                     # 深度画像サイズに合わせてリサイズ
                     color_image = cv2.resize(color_image, (self.camera.depth_intrinsics.width, self.camera.depth_intrinsics.height))

@@ -164,10 +164,15 @@ class Hand3DProjector:
             # 手のひら中心の3D座標計算
             palm_center_3d = self._calculate_palm_center_3d(landmarks_3d)
             
+            # landmarks_3dをタプルに変換
+            landmarks_tuples = []
+            for lm in landmarks_3d:
+                landmarks_tuples.append((lm.x, lm.y, lm.z))
+            
             # 結果作成
             result = Hand3DResult(
                 id=hand_2d.id,
-                landmarks_3d=[tuple(lm) for lm in landmarks_3d],
+                landmarks_3d=landmarks_tuples,
                 palm_center_3d=palm_center_3d,
                 handedness=hand_2d.handedness,
                 confidence=hand_2d.confidence
@@ -375,7 +380,7 @@ class Hand3DProjector:
         results = []
         batch_start_time = time.perf_counter()
         
-        for hand_2d in hands_2d:
+        for i, hand_2d in enumerate(hands_2d):
             result = self.project_hand_to_3d(hand_2d, depth_image)
             if result:
                 results.append(result)
@@ -383,7 +388,7 @@ class Hand3DProjector:
         batch_time = (time.perf_counter() - batch_start_time) * 1000
         if hands_2d:
             print(f"Batch 3D projection: {len(hands_2d)} hands in {batch_time:.1f}ms "
-                  f"({batch_time/len(hands_2d):.1f}ms/hand)")
+                  f"({batch_time/len(hands_2d):.1f}ms/hand) -> {len(results)} successful")
         
         return results
     
