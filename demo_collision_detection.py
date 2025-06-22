@@ -32,7 +32,7 @@ sys.path.insert(0, PROJECT_ROOT)
 try:
     # 既存の実装をインポート
     from src.debug.dual_viewer import DualViewer
-    from src.input.depth_filter import FilterType
+    from src.input.depth_filter import FilterType, DepthFilter
     
     # Orbbec SDK
     from pyorbbecsdk import Pipeline, FrameSet, Config, OBSensorType, OBFormat
@@ -70,29 +70,18 @@ try:
     # 新しいモジュール
     from dataclasses import dataclass
     from src.input.stream import OrbbecCamera
-    from src.detection.hands2d import MediaPipeHandsWrapper, HandednessType, filter_hands_by_confidence
+    from src.detection.hands2d import MediaPipeHandsWrapper, HandDetectionResult, HandednessType
     from src.detection.hands3d import Hand3DProjector, Hand3DResult
     from src.detection.tracker import Hand3DTracker, TrackedHand
     from src.sound.synth import create_audio_synthesizer
     from src.sound.mapping import AudioMapper, ScaleType, InstrumentType
     from src.sound.voice_mgr import create_voice_manager, allocate_and_play, StealStrategy
+    from src.input.pointcloud import PointCloudConverter
     
 except ImportError as e:
-    print(f"Import error: {e}")
-    print("Please ensure all dependencies are installed and the project structure is correct.")
+    print("Error: Could not import necessary modules")
+    print(f"Details: {e}")
     sys.exit(1)
-
-@dataclass
-class Hand3D:
-    id: str
-    landmarks_3d: List[Tuple[float, float, float]]
-    palm_center_3d: Tuple[float, float, float]
-    handedness: HandednessType
-    confidence: float = 0.0
-    
-    @property
-    def position(self):
-        return self.palm_center_3d
 
 class FullPipelineViewer(DualViewer):
     """全フェーズ統合拡張DualViewer（手検出+メッシュ生成+衝突検出+音響生成）"""
@@ -188,9 +177,14 @@ class FullPipelineViewer(DualViewer):
         
         # カメラ初期化は親クラスで行われるため削除
         self.enable_hand_detection = True
+        self.enable_hand_tracking = True  # 手トラッキングを有効化
         self.enable_tracking = True
-        self.min_detection_confidence = 0.7
-        self.hands_2d = MediaPipeHandsWrapper()
+        self.min_detection_confidence = 0.1  # 検出感度を上げてテスト
+        self.hands_2d = MediaPipeHandsWrapper(
+            min_detection_confidence=self.min_detection_confidence,
+            min_tracking_confidence=0.5,
+            max_num_hands=2
+        )
         # projector_3dとtrackerの初期化は親クラスの初期化後に行う
         self.projector_3d = None
         self.tracker = None
@@ -629,20 +623,15 @@ class FullPipelineViewer(DualViewer):
         if self.enable_hand_detection and self.hands_2d is not None:
             hand_start_time = time.perf_counter()
             
-            # カラー画像の処理
+            # カラー画像を取得（手検出には必須）
             bgr_image = None
             if frame_data.color_frame is not None:
-                print(f"[DEBUG] Frame {self.frame_count}: Color frame available")
                 color_data = np.frombuffer(frame_data.color_frame.get_data(), dtype=np.uint8)
-                print(f"[DEBUG] Frame {self.frame_count}: Color data size: {len(color_data)}")
                 color_format = frame_data.color_frame.get_format()
-                print(f"[DEBUG] Frame {self.frame_count}: Color format: {color_format}")
                 
-                # フォーマットに応じた変換
                 try:
                     from pyorbbecsdk import OBFormat
                 except ImportError:
-                    # テスト用モック
                     class OBFormat:
                         RGB = "RGB"
                         BGR = "BGR"
@@ -650,9 +639,6 @@ class FullPipelineViewer(DualViewer):
                 
                 color_image = None
                 if color_format == OBFormat.RGB:
-                    # RGB形式の場合、カラー画像の実際のサイズを取得
-                    total_pixels = len(color_data) // 3
-                    # 1280x720 想定でリシェイプ
                     color_image = color_data.reshape((720, 1280, 3))
                 elif color_format == OBFormat.BGR:
                     total_pixels = len(color_data) // 3
@@ -669,58 +655,30 @@ class FullPipelineViewer(DualViewer):
                     # RGBからBGRに変換（MediaPipe用）
                     bgr_image = cv2.cvtColor(color_image, cv2.COLOR_RGB2BGR)
                     print(f"[DEBUG] Frame {self.frame_count}: Color image processed, size: {bgr_image.shape}")
+            
+            # カラー画像が利用可能な場合のみ手検出を実行
+            if bgr_image is not None:
+                print(f"[DEBUG] Frame {self.frame_count}: Performing 2D hand detection on image size: {bgr_image.shape}")
+                from src.detection.hands2d import filter_hands_by_confidence
+                
+                all_hands_2d = self.hands_2d.detect_hands(bgr_image)
+                hands_2d = filter_hands_by_confidence(all_hands_2d, self.min_detection_confidence)
+                print(f"[DEBUG] Frame {self.frame_count}: 2D detection: {len(all_hands_2d)} raw -> {len(hands_2d)} filtered")
             else:
-                print(f"[DEBUG] Frame {self.frame_count}: Color frame is None")
-            
-            if bgr_image is None:
-                # カラー画像がない場合は深度画像をグレースケールとして使用
-                bgr_image = cv2.cvtColor(cv2.normalize(depth_image, None, 0, 255, cv2.NORM_MINMAX, dtype=cv2.CV_8U), cv2.COLOR_GRAY2BGR)
-                print(f"[DEBUG] Frame {self.frame_count}: No color frame, using depth as grayscale, size: {bgr_image.shape}")
-            
-            print(f"[DEBUG] Frame {self.frame_count}: Performing 2D hand detection on image size: {bgr_image.shape}")
-            from src.detection.hands2d import filter_hands_by_confidence
-            
-            all_hands_2d = self.hands_2d.detect_hands(bgr_image)
-            hands_2d = filter_hands_by_confidence(all_hands_2d, self.min_detection_confidence)
-            print(f"[DEBUG] Frame {self.frame_count}: 2D detection: {len(all_hands_2d)} raw -> {len(hands_2d)} filtered")
+                print(f"[DEBUG] Frame {self.frame_count}: No color frame available, skipping hand detection")
         
         # 3D投影
         hands_3d = []
         if hands_2d and self.projector_3d is not None:
-            print(f"[3D-PROJ] Frame {self.frame_count}: Attempting 3D projection with {len(hands_2d)} 2D hands")
-            try:
-                hands_3d = self.projector_3d.project_hands_batch(hands_2d, depth_image)
-                print(f"[3D-PROJ] Frame {self.frame_count}: 3D projection successful: {len(hands_2d)} input -> {len(hands_3d)} output")
-                if len(hands_3d) == 0:
-                    print(f"[3D-PROJ] Frame {self.frame_count}: WARNING: 3D projection returned 0 results")
-            except Exception as e:
-                print(f"[3D-PROJ] Frame {self.frame_count}: ERROR during 3D projection: {e}")
-                import traceback
-                traceback.print_exc()
-        else:
-            if not hands_2d:
-                print(f"[3D-PROJ] Frame {self.frame_count}: Skipped - no 2D hands")
-            if self.projector_3d is None:
-                print(f"[3D-PROJ] Frame {self.frame_count}: ERROR - projector_3d is None")
+            print(f"[DEBUG] Frame {self.frame_count}: Performing 3D projection")
+            hands_3d = self.projector_3d.project_hands_batch(hands_2d, depth_image)
+            print(f"[DEBUG] Frame {self.frame_count}: 3D projection: {len(hands_2d)} input -> {len(hands_3d)} output")
         
         # トラッキング
         tracked_hands = []
-        if hands_3d and self.tracker is not None:
-            print(f"[DEBUG] Frame {self.frame_count}: Performing hand tracking")
-            # Hand3DResultをTrackedHandに変換してトラッキング
-            hands_for_tracking = []
-            for hand_3d in hands_3d:
-                # Hand3DResultをHand3Dに変換
-                hand_converted = Hand3D(
-                    id=hand_3d.id,
-                    landmarks_3d=hand_3d.landmarks_3d,
-                    palm_center_3d=hand_3d.palm_center_3d,
-                    handedness=hand_3d.handedness,
-                    confidence=hand_3d.confidence
-                )
-                hands_for_tracking.append(hand_converted)
-            
-            tracked_hands = self.tracker.update(hands_for_tracking)
+        if self.enable_hand_tracking and hands_3d:
+            # Hand3DResultを直接トラッカーに渡す
+            tracked_hands = self.tracker.update(hands_3d)
             print(f"[DEBUG] Frame {self.frame_count}: Tracking: {len(hands_3d)} input -> {len(tracked_hands)} tracked")
         
         self.performance_stats['hand_detection_time'] = (time.perf_counter() - hand_start_time) * 1000
@@ -945,20 +903,15 @@ class FullPipelineViewer(DualViewer):
             if self.enable_hand_detection and self.hands_2d is not None:
                 hand_start_time = time.perf_counter()
                 
-                # カラー画像の処理
+                # カラー画像を取得（手検出には必須）
                 bgr_image = None
                 if frame_data.color_frame is not None:
-                    print(f"[DEBUG] Frame {self.frame_count}: Color frame available")
                     color_data = np.frombuffer(frame_data.color_frame.get_data(), dtype=np.uint8)
-                    print(f"[DEBUG] Frame {self.frame_count}: Color data size: {len(color_data)}")
                     color_format = frame_data.color_frame.get_format()
-                    print(f"[DEBUG] Frame {self.frame_count}: Color format: {color_format}")
                     
-                    # フォーマットに応じた変換
                     try:
                         from pyorbbecsdk import OBFormat
                     except ImportError:
-                        # テスト用モック
                         class OBFormat:
                             RGB = "RGB"
                             BGR = "BGR"
@@ -966,9 +919,6 @@ class FullPipelineViewer(DualViewer):
                     
                     color_image = None
                     if color_format == OBFormat.RGB:
-                        # RGB形式の場合、カラー画像の実際のサイズを取得
-                        total_pixels = len(color_data) // 3
-                        # 1280x720 想定でリシェイプ
                         color_image = color_data.reshape((720, 1280, 3))
                     elif color_format == OBFormat.BGR:
                         total_pixels = len(color_data) // 3
@@ -985,21 +935,18 @@ class FullPipelineViewer(DualViewer):
                     # RGBからBGRに変換（MediaPipe用）
                     bgr_image = cv2.cvtColor(color_image, cv2.COLOR_RGB2BGR)
                     print(f"[DEBUG] Frame {self.frame_count}: Color image processed, size: {bgr_image.shape}")
+                
+                # カラー画像が利用可能な場合のみ手検出を実行
+                if bgr_image is not None:
+                    print(f"[DEBUG] Frame {self.frame_count}: Performing 2D hand detection on image size: {bgr_image.shape}")
+                    from src.detection.hands2d import filter_hands_by_confidence
+                    
+                    all_hands_2d = self.hands_2d.detect_hands(bgr_image)
+                    hands_2d = filter_hands_by_confidence(all_hands_2d, self.min_detection_confidence)
+                    print(f"[DEBUG] Frame {self.frame_count}: 2D detection: {len(all_hands_2d)} raw -> {len(hands_2d)} filtered")
                 else:
-                    print(f"[DEBUG] Frame {self.frame_count}: Color frame is None")
+                    print(f"[DEBUG] Frame {self.frame_count}: No color frame available, skipping hand detection")
             
-            if bgr_image is None:
-                # カラー画像がない場合は深度画像をグレースケールとして使用
-                bgr_image = cv2.cvtColor(cv2.normalize(depth_image, None, 0, 255, cv2.NORM_MINMAX, dtype=cv2.CV_8U), cv2.COLOR_GRAY2BGR)
-                print(f"[DEBUG] Frame {self.frame_count}: No color frame, using depth as grayscale, size: {bgr_image.shape}")
-            
-            print(f"[DEBUG] Frame {self.frame_count}: Performing 2D hand detection on image size: {bgr_image.shape}")
-            from src.detection.hands2d import filter_hands_by_confidence
-            
-            all_hands_2d = self.hands_2d.detect_hands(bgr_image)
-            hands_2d = filter_hands_by_confidence(all_hands_2d, self.min_detection_confidence)
-            print(f"[DEBUG] Frame {self.frame_count}: 2D detection: {len(all_hands_2d)} raw -> {len(hands_2d)} filtered")
-        
             # 3D投影
             hands_3d = []
             if hands_2d and self.projector_3d is not None:
@@ -1009,22 +956,9 @@ class FullPipelineViewer(DualViewer):
             
             # トラッキング
             tracked_hands = []
-            if hands_3d and self.tracker is not None:
-                print(f"[DEBUG] Frame {self.frame_count}: Performing hand tracking")
-                # Hand3DResultをTrackedHandに変換してトラッキング
-                hands_for_tracking = []
-                for hand_3d in hands_3d:
-                    # Hand3DResultをHand3Dに変換
-                    hand_converted = Hand3D(
-                        id=hand_3d.id,
-                        landmarks_3d=hand_3d.landmarks_3d,
-                        palm_center_3d=hand_3d.palm_center_3d,
-                        handedness=hand_3d.handedness,
-                        confidence=hand_3d.confidence
-                    )
-                    hands_for_tracking.append(hand_converted)
-                
-                tracked_hands = self.tracker.update(hands_for_tracking)
+            if self.enable_hand_tracking and hands_3d:
+                # Hand3DResultを直接トラッカーに渡す
+                tracked_hands = self.tracker.update(hands_3d)
                 print(f"[DEBUG] Frame {self.frame_count}: Tracking: {len(hands_3d)} input -> {len(tracked_hands)} tracked")
             
             self.performance_stats['hand_detection_time'] = (time.perf_counter() - hand_start_time) * 1000

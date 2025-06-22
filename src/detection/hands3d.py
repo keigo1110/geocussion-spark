@@ -49,6 +49,9 @@ class Hand3DResult:
     palm_center_3d: Tuple[float, float, float]
     handedness: HandednessType
     confidence: float
+    confidence_2d: float = 0.0  # 2D検出の信頼度
+    confidence_3d: float = 0.0  # 3D投影の信頼度
+    palm_normal: Optional[np.ndarray] = None  # 手のひら法線ベクトル
 
     @property
     def position(self):
@@ -175,7 +178,10 @@ class Hand3DProjector:
                 landmarks_3d=landmarks_tuples,
                 palm_center_3d=palm_center_3d,
                 handedness=hand_2d.handedness,
-                confidence=hand_2d.confidence
+                confidence=hand_2d.confidence,
+                confidence_2d=hand_2d.confidence,  # 2D検出信頼度
+                confidence_3d=confidence_3d,  # 3D投影信頼度
+                palm_normal=None  # TODO: 手のひら法線計算の実装
             )
             
             # 統計更新
