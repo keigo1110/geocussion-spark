@@ -1,0 +1,126 @@
+date: "2025-06-23"
+summary: "GPU acceleration opportunities for demo_collision_detection.py and related modules to improve FPS on systems with NVIDIA RTX 3080 or similar GPUs.  Implementation is NOT done yet – this is an idea backlog only.  Each item lists the current state, candidate GPU approach, expected impact, and priority."
+
+environment:
+  driver_version: "535.230.02"  # confirmed via nvidia-smi
+  cuda_toolkit: "12.2"          # keep aligned with installed driver
+  cudnn_version: "9.x"          # should match CUDA 12.x
+  compute_capability: "8.6"     # RTX 3080
+  python: "3.11"                # current venv (adjust if different)
+  note: "All GPU builds (OpenCV, MediaPipe, Open3D etc.) must target sm_86 and CUDA 12.2 SDK."
+
+# Quick-start host setup commands (record only – already executed partly)
+setup_commands:
+  - sudo apt install nvidia-driver-535
+  - wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-ubuntu2204.pin && \
+    sudo mv cuda-ubuntu2204.pin /etc/apt/preferences.d/cuda-repository-pin-600 && \
+    sudo apt-key adv --fetch-keys https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/3bf863cc.pub && \
+    sudo add-apt-repository "deb https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/ /" && \
+    sudo apt install cuda-toolkit-12-2
+  - export PATH=/usr/local/cuda-12.2/bin:$PATH
+  - export LD_LIBRARY_PATH=/usr/local/cuda-12.2/lib64:$LD_LIBRARY_PATH
+  - pip install cupy-cuda12x torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+  - pip install numba pytorch3d
+  - # Build OpenCV-CUDA wheel (see docs below)
+
+candidates:
+  - name: "2D Hand Detection (MediaPipe)"
+    current: "mediapipe-python CPU graph (TfLite CPU)"
+    gpu_approach: "Switch to MediaPipe GPU graph using TfLite GPU delegate or build mediapipe-cuda.  Enable with the existing --gpu-mediapipe flag and update MediaPipeHandsWrapper to select the GPU pipeline."
+    libraries: ["mediapipe-gpu", "TensorFlow Lite GPU", "CUDA"]
+    expected_gain: "High (hand detection is the main bottleneck; 3-6× speed-up possible)"
+    difficulty: "Medium – requires rebuilding MediaPipe, minor wrapper changes"
+    priority: 1
+
+  - name: "Depth Image Filters (DepthFilter.apply_filter)"
+    current: "NumPy + OpenCV CPU (median/gaussian/bilateral)"
+    gpu_approach: "Port filters to cv2.cuda (CUDA accelerated) or implement custom CUDA kernels with CuPy/CuSignal."
+    libraries: ["OpenCV CUDA", "CuPy"]
+    expected_gain: "Medium (filters run every frame)"
+    difficulty: "Low"
+    priority: 2
+
+  - name: "Point Cloud Conversion (numpy_to_pointcloud)"
+    current: "NumPy CPU reshape & math"
+    gpu_approach: "Use CuPy for depth→XYZ projection or Open3D-CUDA point cloud creation."
+    libraries: ["CuPy", "Open3D (CUDA)"]
+    expected_gain: "Medium"
+    difficulty: "Low"
+    priority: 3
+
+  - name: "3D Hand Projection (Hand3DProjector.project_hands_batch)"
+    current: "NumPy CPU per-pixel lookup"
+    gpu_approach: "Vectorise with CuPy or write a CUDA kernel to sample depth map & intrinsics in parallel."
+    libraries: ["CuPy", "Numba CUDA"]
+    expected_gain: "Medium-High"
+    difficulty: "Medium"
+    priority: 4
+
+  - name: "Delaunay Triangulation of Height Map"
+    current: "scipy.spatial.Delaunay / custom CPU code"
+    gpu_approach: "Replace with GPU implementations such as cuDelaunay (thrust-based) or NVIDIA CGAL GPU demo; alternative: march offset to PyTorch3D or Open3D-CUDA voxel meshing."
+    libraries: ["cuDelaunay", "PyTorch3D", "Open3D CUDA"]
+    expected_gain: "High when mesh updates (can be 50-100 ms)"
+    difficulty: "High (depends on external libs)"
+    priority: 5
+
+  - name: "Mesh Simplification (MeshSimplifier)"
+    current: "open3d.geometry.TriangleMesh.simplify_quadratic_decimation (CPU)"
+    gpu_approach: "Use Open3D-CUDA simplify or PyTorch3D mesh_ops.laplacian_smoothing on GPU."
+    libraries: ["Open3D CUDA", "PyTorch3D"]
+    expected_gain: "Medium"
+    difficulty: "Medium"
+    priority: 6
+
+  - name: "Spatial Index / BVH construction"
+    current: "Python loops & NumPy"
+    gpu_approach: "Build BVH with NVIDIA OptiX or thrust on GPU; alternatively use PyTorch3D BVH utilities on CUDA."
+    libraries: ["OptiX", "PyTorch3D"]
+    expected_gain: "High for large meshes"
+    difficulty: "High"
+    priority: 7
+
+  - name: "Sphere-Triangle Collision Tests"
+    current: "Python loops over triangles"
+    gpu_approach: "Batch collision tests in CUDA kernel (one thread per triangle) or leverage OptiX ray-sphere intersection queries."
+    libraries: ["Numba CUDA", "OptiX", "CuPy"]
+    expected_gain: "High when many triangles"
+    difficulty: "Medium-High"
+    priority: 8
+
+  - name: "OpenCV Color Space Conversions & Resize"
+    current: "cv2.cvtColor / cv2.resize on CPU"
+    gpu_approach: "Replace with cv2.cuda.cvtColor / cv2.cuda.resize.  Batch pre-allocate GPU mats."
+    libraries: ["OpenCV CUDA"]
+    expected_gain: "Low-Medium (few ms/frame)"
+    difficulty: "Low"
+    priority: 9
+
+  - name: "Depth Colormap for Display (applyColorMap)"
+    current: "cv2.applyColorMap CPU"
+    gpu_approach: "cv2.cuda.applyColorMap or custom CUDA kernel"
+    libraries: ["OpenCV CUDA"]
+    expected_gain: "Low"
+    difficulty: "Low"
+    priority: 10
+
+  - name: "Hand Tracking (Kalman in Hand3DTracker)"
+    current: "filterpy / NumPy CPU"
+    gpu_approach: "Little benefit; leave on CPU (Note)"
+    libraries: []
+    expected_gain: "Negligible"
+    difficulty: "N/A"
+    priority: 99
+
+notes:
+  - All priorities are relative; start with top 3 items for quickest win.
+  - Ensure GPU memory transfers are minimised; keep data resident on GPU between pipeline stages when possible.
+  - Some libraries (Open3D CUDA, MediaPipe GPU) may require building from source with CUDA 11.x; document build steps separately.
+  - Mixing CuPy ↔ NumPy requires explicit .get() / .asnumpy() conversions; avoid in hot path.
+  - PyTorch3D: Pre-built wheels for Python 3.11 + CUDA 12.x are not yet published.  Install via source build:
+    ```bash
+    pip install ninja cmake git
+    git clone --recursive https://github.com/facebookresearch/pytorch3d.git
+    cd pytorch3d
+    TORCH_CUDA_ARCH_LIST=8.6 pip install -e .
+    ```

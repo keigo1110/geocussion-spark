@@ -105,7 +105,12 @@ class FullPipelineViewer(DualViewer):
         self.enable_collision_detection = kwargs.pop('enable_collision_detection', True)
         self.enable_collision_visualization = kwargs.pop('enable_collision_visualization', True)
         self.sphere_radius = kwargs.pop('sphere_radius', 0.05)  # 5cm
-        self.mesh_update_interval = kwargs.pop('mesh_update_interval', 5)  # 5フレーム毎に短縮（テスト用）
+        self.mesh_update_interval = kwargs.pop('mesh_update_interval', 5)  # 通常更新間隔（フレーム）
+        # メッシュを手が写っている間はスキップするが、最大このフレーム数を越えたら強制更新する
+        self.max_mesh_skip_frames = kwargs.pop('max_mesh_skip_frames', 60)  # 約2秒 (30fps)
+        
+        # 強制更新リクエストフラグ（N キーでセットされる）
+        self.force_mesh_update_requested = False
         
         # 音響生成関連の設定を追加
         self.enable_audio_synthesis = kwargs.pop('enable_audio_synthesis', False)
@@ -495,8 +500,8 @@ class FullPipelineViewer(DualViewer):
         self._update_collision_visualization()
     
     def _force_mesh_update(self):
-        """メッシュ強制更新"""
-        self.last_mesh_update = 0  # 次フレームで更新されるようにリセット
+        """メッシュ強制更新を次フレームで行うようリクエスト"""
+        self.force_mesh_update_requested = True
     
     def _draw_performance_info(self, color_image, collision_events):
         """パフォーマンス情報をRGB画像に描画"""
@@ -708,16 +713,31 @@ class FullPipelineViewer(DualViewer):
         pipeline_start = time.perf_counter()
         self.frame_counter = self.frame_count  # フレームカウンターを同期
         
-        # 地形メッシュ生成（定期的または初回）
-        mesh_condition_check = (self.enable_mesh_generation and 
-            (self.frame_count - self.last_mesh_update >= self.mesh_update_interval or self.current_mesh is None) and
-            points_3d is not None and len(points_3d) > 100)
+        # 手が存在するか判定
+        hands_present = (len(hands_2d) > 0 or len(hands_3d) > 0 or len(tracked_hands) > 0)
+        frame_diff = self.frame_count - self.last_mesh_update
+
+        # 地形メッシュ生成（条件判定）
+        mesh_condition_check = (
+            self.enable_mesh_generation and (
+                # 強制更新要求がある場合は即更新
+                self.force_mesh_update_requested or
+                # 手が写っていない & 通常間隔を超えた
+                (not hands_present and frame_diff >= self.mesh_update_interval) or
+                # 最大スキップ時間を超えた
+                (frame_diff >= self.max_mesh_skip_frames) or
+                # まだメッシュが無い
+                (self.current_mesh is None)
+            ) and
+            points_3d is not None and len(points_3d) > 100
+        )
         
         # メッシュ生成条件の診断ログ
         if self.frame_count % 10 == 0:  # 10フレーム毎に診断ログ
             print(f"[MESH-DIAG] Frame {self.frame_count}: enable_mesh={self.enable_mesh_generation}, "
-                  f"frame_diff={self.frame_count - self.last_mesh_update}, "
+                  f"frame_diff={frame_diff}, "
                   f"interval={self.mesh_update_interval}, "
+                  f"max_skip={self.max_mesh_skip_frames}, "
                   f"points={len(points_3d) if points_3d is not None else 'None'}, "
                   f"condition={mesh_condition_check}")
         
@@ -726,6 +746,8 @@ class FullPipelineViewer(DualViewer):
             print(f"[MESH] Frame {self.frame_count}: *** UPDATING TERRAIN MESH *** with {len(points_3d)} points")
             self._update_terrain_mesh(points_3d)
             self.last_mesh_update = self.frame_count
+            # 強制更新フラグをクリア
+            self.force_mesh_update_requested = False
             self.perf_stats['mesh_generation_time'] = (time.perf_counter() - mesh_start) * 1000
             print(f"[MESH] Frame {self.frame_count}: Mesh update completed in {self.perf_stats['mesh_generation_time']:.1f}ms")
         
@@ -1262,6 +1284,7 @@ def main():
     parser.add_argument('--no-collision-viz', action='store_true', help='衝突可視化を無効にする')
     parser.add_argument('--mesh-interval', type=int, default=10, help='メッシュ更新間隔（フレーム数）')
     parser.add_argument('--sphere-radius', type=float, default=0.05, help='衝突検出球の半径（メートル）')
+    parser.add_argument('--max-mesh-skip', type=int, default=60, help='手が写っている場合でもこのフレーム数経過で強制更新')
     
     # 音響生成設定
     parser.add_argument('--no-audio', action='store_true', help='音響合成を無効にする')
@@ -1379,7 +1402,8 @@ def main():
             audio_scale=audio_scale,
             audio_instrument=audio_instrument,
             audio_polyphony=args.audio_polyphony,
-            audio_master_volume=args.audio_volume
+            audio_master_volume=args.audio_volume,
+            max_mesh_skip_frames=args.max_mesh_skip
         )
         
         print("\n全フェーズ統合ビューワーを開始します...")
