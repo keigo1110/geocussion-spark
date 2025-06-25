@@ -14,7 +14,7 @@ try:
     from pyorbbecsdk import OBFormat
 except ImportError:
     # テスト用のモック定義（types.pyのOBFormatと統合）
-    from .types import OBFormat
+    from ..types import OBFormat
 
 from .stream import CameraIntrinsics, FrameData
 

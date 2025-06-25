@@ -15,7 +15,7 @@ import numpy as np
 import threading
 
 # 他フェーズとの連携
-from .sphere_tri import CollisionInfo, ContactPoint, CollisionType
+from ..types import CollisionInfo, ContactPoint, CollisionType
 from ..mesh.attributes import MeshAttributes
 from .optimization import optimize_array_operations, memory_efficient_context
 

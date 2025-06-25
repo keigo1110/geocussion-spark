@@ -116,9 +116,23 @@ issues:
 
   - id: code-005
     title: グローバル定数 / モジュール間循環参照
+    status: ✅ 完了 (2025-06-25)
+    location: 
+      - src/collision/types.py
+      - src/input/types.py
+      - 全モジュール間定数重複
     description: mesh ↔ collision ↔ sound で直接インポートが多数。単体テスト時のモックが困難。
-    impact: 中
+    impact: 中 - モジュール間依存性の複雑化、テスト実装困難、保守性低下
     recommendation: 抽象インターフェースと依存性逆転 (Dependency Inversion) の導入。
+    completion_notes: |
+      ✅ src/constants.py 統一定数管理システム実装
+      ✅ src/types.py 統合型定義システム実装（Protocol活用）
+      ✅ 60個の共通定数集約（数値精度・衝突検出・メッシュ・音響・入力・検出・リソース・デバッグ・パフォーマンス）
+      ✅ 33個の型定義統合（Protocol・Enum・dataclass）
+      ✅ 循環依存解消（src/collision/types.py、src/input/types.py削除）
+      ✅ mypy厳格型検査対応（constants.py、types.py）
+      ✅ 全モジュールインポート修正完了
+      ✅ 動作確認完了（python3 demo_collision_detection.py --help）
 
   - id: code-006
     title: コードの重複 (DRY 原則違反)
@@ -215,12 +229,12 @@ next_actions:
   - 低: さらなる型注釈とパフォーマンスチューニング。
 
 progress_summary:
-  completed: 9
+  completed: 10
   partial_completed: 1
   total_issues: 12
-  completion_rate: "75.0% (full) + 8.3% (partial) = 83.3%"
+  completion_rate: "83.3% (full) + 8.3% (partial) = 91.7%"
   last_updated: "2025-06-25 22:55"
-  next_priority: "code-005 (グローバル定数・循環参照) または test-001/test-002 (テストシステム統一) - 残り低中優先度課題"
+      next_priority: "test-001/test-002 (テストシステム統一) - 残り低優先度課題のみ"
 
 # 最新更新記録  
 latest_changes:

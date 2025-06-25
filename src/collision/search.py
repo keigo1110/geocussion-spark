@@ -17,7 +17,7 @@ from ..mesh.index import SpatialIndex, BVHNode
 from ..mesh.delaunay import TriangleMesh
 from ..detection.tracker import TrackedHand
 from .sphere_tri import point_triangle_distance
-from .types import SearchStrategy, SearchResult
+from ..types import SearchStrategy, SearchResult
 from ..config import get_config
 from .optimization import optimize_array_operations, memory_efficient_context
 

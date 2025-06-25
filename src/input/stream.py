@@ -10,7 +10,7 @@ from dataclasses import dataclass
 import numpy as np
 
 # 他フェーズとの連携  
-from .types import FrameData, CameraIntrinsics
+from ..types import FrameData, CameraIntrinsics
 
 # ロギング設定
 from src import get_logger

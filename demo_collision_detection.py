@@ -38,7 +38,7 @@ try:
     from pyorbbecsdk import Pipeline, FrameSet, Config, OBSensorType, OBError
     
     # Import OBFormat from common types
-    from src.input.types import OBFormat
+    from src.types import OBFormat
     
     # 地形メッシュ生成
     from src.mesh.projection import PointCloudProjector, ProjectionMethod
@@ -660,7 +660,7 @@ class FullPipelineViewer(DualViewer):
                 try:
                     from pyorbbecsdk import OBFormat
                 except ImportError:
-                    pass  # Use imported OBFormat from src.input.types
+                    pass  # Use imported OBFormat from src.types
                 
                 color_image = None
                 if color_format == OBFormat.RGB:
@@ -1008,7 +1008,7 @@ class FullPipelineViewer(DualViewer):
                     try:
                         from pyorbbecsdk import OBFormat
                     except ImportError:
-                        pass  # Use imported OBFormat from src.input.types
+                        pass  # Use imported OBFormat from src.types
                 
                     color_image = None
                     if color_format == OBFormat.RGB:
@@ -1076,7 +1076,7 @@ class FullPipelineViewer(DualViewer):
                 try:
                     from pyorbbecsdk import OBFormat
                 except ImportError:
-                    pass  # Use imported OBFormat from src.input.types
+                    pass  # Use imported OBFormat from src.types
                 
                 color_image = None
                 if color_format == OBFormat.RGB:

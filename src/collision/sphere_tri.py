@@ -15,7 +15,12 @@ import numpy as np
 # 他フェーズとの連携
 from ..mesh.delaunay import TriangleMesh
 from ..mesh.attributes import MeshAttributes
-from .types import CollisionType, ContactPoint, CollisionInfo, SearchResult
+from ..types import CollisionType, ContactPoint, CollisionInfo, SearchResult
+from ..constants import (
+    COLLISION_TOLERANCE, 
+    MAX_CONTACTS_PER_SPHERE,
+    NUMERICAL_TOLERANCE
+)
 
 
 class SphereTriangleCollision:
@@ -25,9 +30,9 @@ class SphereTriangleCollision:
         self,
         mesh: TriangleMesh,
         mesh_attributes: Optional[MeshAttributes] = None,
-        collision_tolerance: float = 1e-6,      # 衝突判定の許容誤差
+        collision_tolerance: float = COLLISION_TOLERANCE,      # 衝突判定の許容誤差
         enable_face_culling: bool = False,      # 裏面カリング
-        max_contacts_per_sphere: int = 10       # 球あたりの最大接触点数
+        max_contacts_per_sphere: int = MAX_CONTACTS_PER_SPHERE       # 球あたりの最大接触点数
     ):
         """
         初期化
