@@ -1,32 +1,63 @@
 #!/usr/bin/env python3
 """
-Geocussion-SP デュアルウィンドウビューワー デモ
-RGB可視化ウィンドウ + 点群ビューワーのリアルタイム表示
+Geocussion-SP デュアルウィンドウビューワー デモ（互換性エイリアス）
+
+注意: このスクリプトは互換性のために残されています。
+新しい統一デモシステムを使用することを推奨します:
+    python demo_unified.py --mode basic
 
 使用方法:
     python demo_dual_viewer.py
-
-必要な依存関係:
-    - pyorbbecsdk (Orbbecカメラ)
-    - open3d
-    - opencv-python
-    - numpy
 """
 
 import sys
 import os
-import argparse
 
 # プロジェクトルートをパスに追加
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, PROJECT_ROOT)
 
+print("【互換性モード】demo_dual_viewer.py")
+print("新しい統一デモシステムにリダイレクトしています...")
+print("今後は 'python demo_unified.py --mode basic' をご使用ください。")
+print()
+
+# 引数を統一システム用に変換
+unified_args = ['--mode', 'basic']
+
+# 既存の引数を統一システムの引数に変換
+original_args = sys.argv[1:]
+for arg in original_args:
+    if arg == '--test':
+        unified_args.append('--test')
+    elif arg == '--no-filter':
+        unified_args.append('--no-filter')
+    elif arg.startswith('--filter-type='):
+        filter_type = arg.split('=')[1]
+        unified_args.extend(['--filter-type', filter_type])
+    elif arg.startswith('--update-interval='):
+        interval = arg.split('=')[1]
+        unified_args.extend(['--update-interval', interval])
+    elif arg.startswith('--point-size='):
+        size = arg.split('=')[1]
+        unified_args.extend(['--point-size', size])
+    elif arg.startswith('--window-width='):
+        width = arg.split('=')[1]
+        unified_args.extend(['--window-width', width])
+    elif arg.startswith('--window-height='):
+        height = arg.split('=')[1]
+        unified_args.extend(['--window-height', height])
+
+# 統一システムに移譲
+sys.argv = ['demo_unified.py'] + unified_args
+
 try:
-    from src.debug.dual_viewer import DualViewer
-    from src.input.depth_filter import FilterType
+    from src.demo.runner import main
+    exit_code = main()
+    sys.exit(exit_code)
 except ImportError as e:
-    print(f"Import error: {e}")
-    print("Please ensure all dependencies are installed and the project structure is correct.")
+    print(f"エラー: 統一デモシステムを読み込めません: {e}")
+    print("demo_unified.py を直接実行してください。")
     sys.exit(1)
 
 
