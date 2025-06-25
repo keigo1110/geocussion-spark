@@ -343,6 +343,62 @@ class CollisionSearcher:
         }
         self.clear_cache()
 
+    def search_near_hand_optimized(
+        self,
+        hand: 'TrackedHand',
+        override_radius: Optional[float] = None,
+        enable_broadphase: bool = True
+    ) -> SearchResult:
+        """
+        最適化された手近傍三角形検索（ブロードフェーズ前処理付き）
+        
+        Args:
+            hand: 追跡された手
+            override_radius: 検索半径のオーバーライド
+            enable_broadphase: ブロードフェーズ最適化の有効化
+            
+        Returns:
+            検索結果（三角形インデックスと距離）
+        """
+        search_radius = override_radius or self.default_radius
+        
+        if enable_broadphase and hasattr(self.spatial_index, 'kdtree') and self.spatial_index.kdtree:
+            # Phase 1: KD-Tree による粗い近傍検索
+            candidate_indices = self.spatial_index.query_point(hand.position, search_radius * 1.5)
+            
+            if len(candidate_indices) == 0:
+                return SearchResult(triangle_indices=[], distances=[])
+                
+            # Phase 2: 候補三角形のみで精密距離計算
+            candidate_triangles = self.spatial_index.mesh.triangles[candidate_indices]
+            triangle_vertices = self.spatial_index.mesh.vertices[candidate_triangles]
+            
+            # 距離計算（最適化された候補のみ）
+            distances = []
+            for i, triangle_verts in enumerate(triangle_vertices):
+                dist = self._calculate_distance_to_triangle(hand.position, triangle_verts)
+                distances.append(dist)
+            
+            # 検索半径内の三角形をフィルタ
+            valid_mask = np.array(distances) <= search_radius
+            final_indices = np.array(candidate_indices)[valid_mask]
+            final_distances = np.array(distances)[valid_mask]
+            
+            # ソートして返す
+            sort_indices = np.argsort(final_distances)
+            return SearchResult(
+                triangle_indices=final_indices[sort_indices].tolist(),
+                distances=final_distances[sort_indices].tolist()
+            )
+        else:
+            # Fallback: 従来の全探索
+            return self.search_near_hand(hand, override_radius)
+    
+    def _calculate_distance_to_triangle(self, point: np.ndarray, triangle_vertices: np.ndarray) -> float:
+        """点と三角形の距離を計算"""
+        from ..collision.distance import point_triangle_distance_vectorized
+        return point_triangle_distance_vectorized(point, triangle_vertices)
+
 
 # 便利関数
 
