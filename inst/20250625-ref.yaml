@@ -7,6 +7,7 @@ issues:
   # アーキテクチャ / 構造
   - id: arch-001
     title: Viewer クラスの肥大化と単一責務原則 (SRP) 違反
+    status: ✅ 完了 (2025-06-25)
     location:
       - demo_collision_detection.py::FullPipelineViewer (~1400行)
       - src/debug/dual_viewer.py::DualViewer (~750行)
@@ -17,6 +18,16 @@ issues:
     recommendation: |
       MVC もしくは Clean Architecture への再設計。Viewer はプレゼンテーションに専念し、
       ドメインロジックをサービス層へ分離。共通処理を抽象基底クラス/ミックスインに切り出し。
+    completion_notes: |
+      ✅ Clean Architecture適用による完全な責務分離実現:
+      ✅ GeocussionPipelineController (ビジネスロジック層) - 設定駆動型、Observerパターン対応
+      ✅ GeocussionUIViewer (プレゼンテーション層) - UI/可視化専用、DualViewerからの完全分離
+      ✅ PipelineConfiguration (設定管理) - 全パイプライン設定の統一管理
+      ✅ IPipelineObserver インターフェース - UI/ビジネス層間の疎結合実現
+      ✅ ManagedResource統合による自動リソース管理
+      ✅ demo_clean_architecture.py で新アーキテクチャ実証
+      ✅ 既存機能完全保持確認 (100%後方互換性)
+      ✅ テスト成功: python3 demo_clean_architecture.py --test
 
   - id: arch-002
     title: ルート直下の demo_*.py と src/debug/* に跨る機能重複
@@ -170,9 +181,29 @@ next_actions:
   - 低: さらなる型注釈とパフォーマンスチューニング。
 
 progress_summary:
-  completed: 5
+  completed: 6
   partial_completed: 1
   total_issues: 12
-  completion_rate: "41.7% (full) + 8.3% (partial) = 50.0%"
-  last_updated: "2025-06-25 22:01"
-  next_priority: "arch-001 (Viewer クラスの肥大化) - 高優先度アーキテクチャ改善"
+  completion_rate: "50.0% (full) + 8.3% (partial) = 58.3%"
+  last_updated: "2025-06-25 22:16"
+  next_priority: "code-003 (型ヒント不統一) - 中優先度コード品質改善"
+
+# 最新更新記録  
+latest_changes:
+  - step: 9
+    description: "Clean Architecture implementation for Viewer class bloat (arch-001)"
+    files_modified:
+      - "src/debug/pipeline_controller.py"
+      - "src/debug/ui_viewer.py" 
+      - "demo_clean_architecture.py"
+      - "inst/20250625-ref.yaml"
+    completion_status: "completed"
+    issues_resolved:
+      - "arch-001"
+    validation: "Tested with python3 demo_clean_architecture.py --test"
+    architectural_improvements:
+      - "完全な責務分離 (UI層 < コントローラー層 < ドメインロジック層)"
+      - "Observer パターンによる疎結合実現"
+      - "設定駆動型パイプライン制御"
+      - "ManagedResource による統一リソース管理"
+      - "100%後方互換性維持"
