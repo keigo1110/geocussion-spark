@@ -18,6 +18,7 @@ from ..mesh.delaunay import TriangleMesh
 from ..detection.tracker import TrackedHand
 from .sphere_tri import point_triangle_distance
 from .types import SearchStrategy, SearchResult
+from ..config import get_config
 
 
 class CollisionSearcher:
@@ -26,29 +27,33 @@ class CollisionSearcher:
     def __init__(
         self,
         spatial_index: SpatialIndex,
-        default_radius: float = 0.05,      # デフォルト検索半径 (5cm)
-        max_radius: float = 0.2,           # 最大検索半径 (20cm)
+        default_radius: Optional[float] = None,
+        max_radius: Optional[float] = None,
         strategy: SearchStrategy = SearchStrategy.ADAPTIVE_RADIUS,
-        enable_caching: bool = True,       # 結果キャッシュ
-        max_cache_size: int = 100          # キャッシュサイズ
+        enable_caching: Optional[bool] = None,
+        max_cache_size: Optional[int] = None
     ):
         """
         初期化
         
         Args:
             spatial_index: メッシュフェーズで構築されたBVH空間インデックス
-            default_radius: デフォルト検索半径
-            max_radius: 最大検索半径
+            default_radius: デフォルト検索半径（Noneの場合は設定ファイルから取得）
+            max_radius: 最大検索半径（Noneの場合は設定ファイルから取得）
             strategy: 検索戦略
-            enable_caching: 結果キャッシュを有効にするか
-            max_cache_size: キャッシュの最大サイズ
+            enable_caching: 結果キャッシュを有効にするか（Noneの場合は設定ファイルから取得）
+            max_cache_size: キャッシュの最大サイズ（Noneの場合は設定ファイルから取得）
         """
+        # 設定値を取得
+        config = get_config()
+        collision_config = config.collision
+        
         self.spatial_index = spatial_index
-        self.default_radius = default_radius
-        self.max_radius = max_radius
+        self.default_radius = default_radius if default_radius is not None else collision_config.default_search_radius
+        self.max_radius = max_radius if max_radius is not None else collision_config.max_search_radius
         self.strategy = strategy
-        self.enable_caching = enable_caching
-        self.max_cache_size = max_cache_size
+        self.enable_caching = enable_caching if enable_caching is not None else True  # デフォルトTrue
+        self.max_cache_size = max_cache_size if max_cache_size is not None else collision_config.max_cache_size
         
         # キャッシュ
         self.search_cache = {}  # {(x, y, z, radius): SearchResult}

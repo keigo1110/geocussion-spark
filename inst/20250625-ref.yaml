@@ -48,10 +48,18 @@ issues:
 
   - id: code-002
     title: Magic Number / 設定値のハードコーディング
+    status: ✅ 完了 (2025-06-25)
     location: collision/*, detection/*, demo_*.py 他
     description: 半径や閾値等がコードに直接埋め込まれており、設定変更が困難。
     impact: 中
     recommendation: 設定ファイル (YAML/INI) と dataclass Config へ集約。
+    completion_notes: |
+      ✅ src/config.py 統一設定システム実装 (AudioConfig, CollisionConfig, MeshConfig, InputConfig, DetectionConfig)
+      ✅ PyYAML依存関係をrequirements.txtに追加
+      ✅ src/collision/search.py でハードコード値を設定システムに移行
+      ✅ src/sound/synth.py で後方互換性を保持しつつ設定システム統合
+      ✅ 設定ファイル (.yaml) またはデフォルト値の自動選択機能
+      ✅ 動作確認完了 (既存機能に影響なし)
 
   - id: code-003
     title: 型ヒントの欠落・不統一
@@ -150,9 +158,9 @@ next_actions:
   - 低: さらなる型注釈とパフォーマンスチューニング。
 
 progress_summary:
-  completed: 3
+  completed: 4
   partial_completed: 1
   total_issues: 12
-  completion_rate: "25.0% (full) + 8.3% (partial) = 33.3%"
-  last_updated: "2025-06-25"
-  next_priority: "arch-001 (Viewer クラスの肥大化) または code-002 (Magic Number のハードコーディング)"
+  completion_rate: "33.3% (full) + 8.3% (partial) = 41.6%"
+  last_updated: "2025-06-25 21:53"
+  next_priority: "arch-001 (Viewer クラスの肥大化) - 高優先度アーキテクチャ改善"

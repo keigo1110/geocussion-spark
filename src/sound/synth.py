@@ -21,6 +21,7 @@ except ImportError:
 
 # 他フェーズとの連携
 from .mapping import AudioParameters, InstrumentType
+from ..config import get_config, AudioConfig as GlobalAudioConfig
 
 
 class EngineState(Enum):
@@ -34,7 +35,7 @@ class EngineState(Enum):
 
 @dataclass
 class AudioConfig:
-    """音響設定データ"""
+    """音響設定データ（後方互換性のため）"""
     sample_rate: int = 44100        # サンプリングレート
     buffer_size: int = 256          # バッファサイズ
     channels: int = 2               # チャンネル数（ステレオ）
@@ -43,6 +44,23 @@ class AudioConfig:
     max_polyphony: int = 32         # 最大ポリフォニー数
     master_volume: float = 0.7      # マスターボリューム
     reverb_level: float = 0.3       # リバーブレベル
+    
+    @classmethod
+    def from_global_config(cls, global_config: Optional[GlobalAudioConfig] = None) -> 'AudioConfig':
+        """グローバル設定から音響設定を作成"""
+        if global_config is None:
+            global_config = get_config().audio
+        
+        return cls(
+            sample_rate=global_config.sample_rate,
+            buffer_size=global_config.buffer_size,
+            channels=global_config.channels,
+            audio_driver=global_config.audio_driver,
+            enable_duplex=global_config.enable_duplex,
+            max_polyphony=global_config.max_polyphony,
+            master_volume=global_config.master_volume,
+            reverb_level=global_config.reverb_level
+        )
     
     @property
     def latency_ms(self) -> float:
@@ -69,7 +87,7 @@ class AudioSynthesizer:
             enable_effects: エフェクトを有効にするか
             enable_spatial_audio: 空間音響を有効にするか
         """
-        self.config = config or AudioConfig()
+        self.config = config or AudioConfig.from_global_config()
         self.enable_physical_modeling = enable_physical_modeling
         self.enable_effects = enable_effects
         self.enable_spatial_audio = enable_spatial_audio
