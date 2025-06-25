@@ -15,7 +15,10 @@ import numpy as np
 # 他フェーズとの連携
 from ..mesh.index import SpatialIndex, BVHNode
 from ..mesh.delaunay import TriangleMesh
-from ..detection.tracker import TrackedHand
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from ..detection.tracker import TrackedHand
 from .sphere_tri import point_triangle_distance
 from ..types import SearchStrategy, SearchResult
 from ..config import get_config
@@ -78,7 +81,7 @@ class CollisionSearcher:
         }
     
     @optimize_array_operations
-    def search_near_hand(self, hand: TrackedHand, override_radius: Optional[float] = None) -> SearchResult:
+    def search_near_hand(self, hand: 'TrackedHand', override_radius: Optional[float] = None) -> SearchResult:
         """
         手の位置周辺の三角形を検索
         
@@ -137,7 +140,7 @@ class CollisionSearcher:
         )
     
     @optimize_array_operations
-    def batch_search_hands(self, hands: List[TrackedHand]) -> List[SearchResult]:
+    def batch_search_hands(self, hands: List['TrackedHand']) -> List[SearchResult]:
         """
         複数の手を一括検索
         
@@ -210,7 +213,7 @@ class CollisionSearcher:
         
         return result
     
-    def _determine_search_radius(self, hand: TrackedHand, override_radius: Optional[float]) -> float:
+    def _determine_search_radius(self, hand: 'TrackedHand', override_radius: Optional[float]) -> float:
         """検索半径を決定"""
         if override_radius is not None:
             return min(override_radius, self.max_radius)

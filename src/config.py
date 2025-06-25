@@ -133,36 +133,44 @@ class MeshConfig:
 
 @dataclass
 class InputConfig:
-    """入力システム設定"""
+    """入力フェーズの設定"""
     # カメラ設定
-    default_depth_width: int = 640
-    default_depth_height: int = 480
-    default_depth_fps: int = 30
-    
-    # 深度処理設定
-    depth_scale: float = 1000.0          # mm to m conversion
-    min_depth: float = 0.1               # 10cm
-    max_depth: float = 10.0              # 10m
-    
-    # 点群変換設定
-    point_cloud_downsample: bool = True
-    downsample_factor: int = 2
+    enable_color: bool = True
+    depth_width: Optional[int] = None  # None=デフォルト、424=低解像度
+    depth_height: Optional[int] = None # None=デフォルト、240=低解像度
     
     # フィルタ設定
-    enable_temporal_filter: bool = True
-    temporal_alpha: float = 0.1
-    enable_bilateral_filter: bool = True
-    bilateral_diameter: int = 5
-    bilateral_sigma_color: float = 10.0
-    bilateral_sigma_space: float = 10.0
+    enable_filter: bool = True
+    filter_type: str = "bilateral"  # bilateral, gaussian, median
+    
+    # 深度設定  
+    min_depth: float = 0.2
+    max_depth: float = 3.0
+    depth_scale: float = 1000.0
+    
+    # 点群設定
+    enable_pointcloud: bool = True
+    point_size: float = 2.0
+    
+    # パフォーマンス最適化設定
+    enable_low_resolution_mode: bool = False  # True=424x240、False=848x480
+    
+    def apply_low_resolution_mode(self) -> None:
+        """低解像度モードを適用"""
+        if self.enable_low_resolution_mode:
+            self.depth_width = 424
+            self.depth_height = 240
+        else:
+            self.depth_width = None
+            self.depth_height = None
 
 
 @dataclass
 class DetectionConfig:
     """手検出設定"""
     # MediaPipe設定
-    min_detection_confidence: float = 0.7
-    min_tracking_confidence: float = 0.5
+    min_detection_confidence: float = 0.3  # 0.7 → 0.3 より低い閾値で検出感度向上
+    min_tracking_confidence: float = 0.3   # 0.5 → 0.3 トラッキング感度も向上
     max_num_hands: int = 2
     
     # 3D投影設定
