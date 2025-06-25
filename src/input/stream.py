@@ -118,8 +118,10 @@ class OrbbecCamera:
             )
             print(f"Depth intrinsics: fx={depth_intrinsic.fx}, fy={depth_intrinsic.fy}, "
                   f"cx={depth_intrinsic.cx}, cy={depth_intrinsic.cy}")
-        except Exception:
+        except (AttributeError, TypeError, ValueError) as e:
             # デフォルト値使用
+            import logging
+            logging.warning(f"Failed to get depth intrinsics, using defaults: {e}")
             print("Using default depth intrinsics")
             self.depth_intrinsics = CameraIntrinsics(
                 fx=depth_profile.get_width(),
@@ -152,11 +154,15 @@ class OrbbecCamera:
                         width=color_profile.get_width(),
                         height=color_profile.get_height()
                     )
-                except Exception:
+                except (AttributeError, TypeError, ValueError) as e:
+                    import logging
+                    logging.warning(f"Failed to get color intrinsics: {e}")
                     self.color_intrinsics = None
                 
                 print(f"Color: {color_profile.get_width()}x{color_profile.get_height()}@{color_profile.get_fps()}fps")
-        except Exception:
+        except (AttributeError, RuntimeError) as e:
+            import logging
+            logging.info(f"Color sensor setup failed (expected if no color sensor): {e}")
             print("No color sensor available")
             self.has_color = False
     

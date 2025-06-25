@@ -35,8 +35,10 @@ try:
     from src.input.depth_filter import FilterType, DepthFilter
     
     # Orbbec SDK
-    from pyorbbecsdk import Pipeline, FrameSet, Config, OBSensorType, OBFormat
-    from pyorbbecsdk import OBError
+    from pyorbbecsdk import Pipeline, FrameSet, Config, OBSensorType, OBError
+    
+    # Import OBFormat from common types
+    from src.input.types import OBFormat
     
     # 地形メッシュ生成
     from src.mesh.projection import PointCloudProjector, ProjectionMethod
@@ -653,10 +655,7 @@ class FullPipelineViewer(DualViewer):
                 try:
                     from pyorbbecsdk import OBFormat
                 except ImportError:
-                    class OBFormat:
-                        RGB = "RGB"
-                        BGR = "BGR"
-                        MJPG = "MJPG"
+                    pass  # Use imported OBFormat from src.input.types
                 
                 color_image = None
                 if color_format == OBFormat.RGB:
@@ -1004,10 +1003,7 @@ class FullPipelineViewer(DualViewer):
                     try:
                         from pyorbbecsdk import OBFormat
                     except ImportError:
-                        class OBFormat:
-                            RGB = "RGB"
-                            BGR = "BGR"
-                            MJPG = "MJPG"
+                        pass  # Use imported OBFormat from src.input.types
                 
                     color_image = None
                     if color_format == OBFormat.RGB:
@@ -1075,11 +1071,7 @@ class FullPipelineViewer(DualViewer):
                 try:
                     from pyorbbecsdk import OBFormat
                 except ImportError:
-                    # テスト用モック
-                    class OBFormat:
-                        RGB = "RGB"
-                        BGR = "BGR"
-                        MJPG = "MJPG"
+                    pass  # Use imported OBFormat from src.input.types
                 
                 color_image = None
                 if color_format == OBFormat.RGB:

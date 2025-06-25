@@ -1,0 +1,121 @@
+date: "2025-06-25"
+summary: |
+  Geocussion-SP コードベースは機能要件を満たしているものの、可読性・保守性・拡張性の観点で改善余地が多々あります。
+  本ドキュメントは現状の実装上の主な問題点を列挙し、リファクタリング時に優先して解決すべき課題を整理したものです。完了したらチェック入れましょう。
+
+issues:
+  # アーキテクチャ / 構造
+  - id: arch-001
+    title: Viewer クラスの肥大化と単一責務原則 (SRP) 違反
+    location:
+      - demo_collision_detection.py::FullPipelineViewer (~1400行)
+      - src/debug/dual_viewer.py::DualViewer (~750行)
+    description: |
+      UI 表示、デバイス I/O、手検出、メッシュ生成、衝突判定、音響合成など複数のレイヤを 1 クラスに集約しており、
+      クラスの責務が不明瞭。重複実装 (DualViewer/FullPipelineViewer) も多く、バグ修正が波及しやすい。
+    impact: 高 – 保守コスト増大、機能追加時のリグレッションリスク大。
+    recommendation: |
+      MVC もしくは Clean Architecture への再設計。Viewer はプレゼンテーションに専念し、
+      ドメインロジックをサービス層へ分離。共通処理を抽象基底クラス/ミックスインに切り出し。
+
+  - id: arch-002
+    title: ルート直下の demo_*.py と src/debug/* に跨る機能重複
+    location:
+      - demo_collision_detection.py
+      - src/debug/dual_viewer.py
+    description: |
+      デモスクリプトが production コードをコピーした形で存在し、ロジック／UI が二重管理になっている。
+    impact: 中 – 仕様差異やバグが片方にのみ修正される恐れ。
+    recommendation: |
+      demo 用エントリポイントは最小限に留め、実装は src/ 配下の再利用可能なモジュールへ集約。
+
+  # コーディング規約 / 品質
+  - id: code-001
+    title: ロギング API 不使用・print デバッグの氾濫
+    location: 全体 (tests/ を除く実装コード)
+    description: print() がログ用途で多用されており、実運用時に制御不能。
+    impact: 中 – パフォーマンス低下、本番での機密情報流出リスク。
+    recommendation: Python 標準 logging へ置換し、ログレベル/ハンドラを設定可能に。
+
+  - id: code-002
+    title: Magic Number / 設定値のハードコーディング
+    location: collision/*, detection/*, demo_*.py 他
+    description: 半径や閾値等がコードに直接埋め込まれており、設定変更が困難。
+    impact: 中
+    recommendation: 設定ファイル (YAML/INI) と dataclass Config へ集約。
+
+  - id: code-003
+    title: 型ヒントの欠落・不統一
+    location: 入力 / サウンド系モジュールなど
+    description: 一部関数で戻り値・引数の型が未定義。mypy で型安全性を担保できない。
+    impact: 低〜中
+    recommendation: PEP 484 準拠の型注釈を追加し、CI で mypy を実行。
+
+  - id: code-004
+    title: CollisionEventQueue の設計不備
+    location: src/collision/events.py
+    description: create_collision_event() が都度ローカル Queue を生成しており、イベントが他コンポーネントへ伝播しない。
+    impact: 高 – 衝突イベントがフレーム間で共有されず、音響フェーズの実装が複雑化。
+    recommendation: Queue をシングルトン化または DI コンテナで共有。イベントバス設計を検討。
+
+  - id: code-005
+    title: グローバル定数 / モジュール間循環参照
+    description: mesh ↔ collision ↔ sound で直接インポートが多数。単体テスト時のモックが困難。
+    impact: 中
+    recommendation: 抽象インターフェースと依存性逆転 (Dependency Inversion) の導入。
+
+  - id: code-006
+    title: コードの重複 (DRY 原則違反)
+    location:
+      - demo_collision_detection.py
+      - src/debug/dual_viewer.py
+    description: |
+      `OBFormat` のような内部クラスが複数の場所で繰り返し定義されている。
+      これはバグの温床となり、仕様変更時の修正漏れを引き起こす。
+    impact: 中 – コードの肥大化、保守性の低下。
+    recommendation: |
+      共通の型定義は `src/input/types.py` のような共有モジュールに集約し、各所からインポートして利用する。
+
+  - id: code-007
+    title: 不適切な例外処理
+    location:
+      - src/debug/dual_viewer.py::_update_hand_markers
+      - demo_collision_detection.py::main
+    description: |
+      `except Exception:` や `except:` のように広範な例外をキャッチし、
+      単に `print()` や `pass` で処理を終えている箇所が散見される。
+      これにより、本来対処すべきエラーが隠蔽され、デバッグが困難になる。
+    impact: 高 – アプリケーションが予期せぬ状態で動作し続ける、根本原因の特定が困難になる。
+    recommendation: |
+      - 例外は可能な限り具体的にキャッチする (e.g., `except ValueError:`).
+      - エラーを無視せず、logging モジュールで適切なレベル (ERROR, CRITICAL) で記録する.
+      - 復帰不能なエラーの場合は、アプリケーションを正常に終了させるか、上位の呼び出し元に例外を再送出する。
+
+  # テスト / CI
+  - id: test-001
+    title: ユニットテストと e2e デモの混在
+    description: demo_collision_detection.py にテストモードが内包されており、CI が複雑。
+    impact: 低
+    recommendation: pytest に統一し、tests/ 以下に分離。CI ワークフローで自動実行。
+
+  - id: test-002
+    title: テストコード内の print() 依存
+    description: 性能測定・結果表示を print で行っているため、CI 判定が困難。
+    recommendation: assert と logging へ変更し、ベンチマークは pytest-benchmark 等で測定。
+
+  # パフォーマンス / リソース
+  - id: perf-001
+    title: open3d Geometry 追加/削除の度にビューワを再描画
+    location: src/debug/dual_viewer.py::_update_hand_markers()
+    impact: 中 – フレームレート低下。
+    recommendation: Geometry の再利用またはバッチ更新に切り替え。
+
+  - id: perf-002
+    title: numpy 配列コピーの多用
+    description: 衝突判定で np.array.copy() が頻発し GC 負荷増。
+    recommendation: 不変データを参照渡しし、必要時のみコピー。
+
+next_actions:
+  - 優先度高: arch-001, code-004 を解決し、システム全体に API 境界を定義する。
+  - 中: logging, 設定ファイル化, テスト基盤整備。
+  - 低: さらなる型注釈とパフォーマンスチューニング。

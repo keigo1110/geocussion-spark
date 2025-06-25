@@ -324,8 +324,10 @@ class VoiceManager:
                     try:
                         if voice_info.estimated_remaining_time <= 0.1:  # 100ms余裕を持たせる
                             finished_voices.append(voice_id)
-                    except Exception:
+                    except (AttributeError, TypeError, ValueError) as e:
                         # 時間計算でエラーが出た場合も削除対象とする
+                        import logging
+                        logging.warning(f"Voice time calculation error for {voice_id}: {e}")
                         finished_voices.append(voice_id)
             except Exception as e:
                 print(f"[VOICE-CLEANUP] Error during voice scan: {e}")
