@@ -1,0 +1,455 @@
+[0;34m[INFO][0m ユニットテスト実行中...
+============================= test session starts ==============================
+platform linux -- Python 3.10.12, pytest-7.4.4, pluggy-1.6.0
+rootdir: /home/zigen4/geocussion-spark
+configfile: pytest.ini
+collected 101 items / 20 deselected / 81 selected
+
+tests/collision_test.py EEEEE                                            [  6%]
+tests/detection_test.py EEEEEEEEEEEEEEEE                                 [ 25%]
+tests/input_test.py EEEEEEEEE                                            [ 37%]
+tests/memory_optimization_test.py EEEEEEEEEEEE                           [ 51%]
+tests/mesh_test.py EEEEEEEEEEEEEEEEEEEEEEEEEE                            [ 83%]
+tests/sound_test.py EEEEEEEEEEEEE                                        [100%]
+
+==================================== ERRORS ====================================
+___________ ERROR at setup of TestCollisionSearch.test_basic_search ____________
+tests/conftest.py:37: in setup_test_logging
+    setup_logging(level=logging.DEBUG, log_to_file=False)
+E   TypeError: setup_logging() got an unexpected keyword argument 'log_to_file'
+______ ERROR at setup of TestSphereTriangleCollision.test_face_collision _______
+tests/conftest.py:37: in setup_test_logging
+    setup_logging(level=logging.DEBUG, log_to_file=False)
+E   TypeError: setup_logging() got an unexpected keyword argument 'log_to_file'
+__________ ERROR at setup of TestCollisionEvents.test_event_creation ___________
+tests/conftest.py:37: in setup_test_logging
+    setup_logging(level=logging.DEBUG, log_to_file=False)
+E   TypeError: setup_logging() got an unexpected keyword argument 'log_to_file'
+______ ERROR at setup of TestCollisionEventQueue.test_shared_event_queue _______
+tests/conftest.py:37: in setup_test_logging
+    setup_logging(level=logging.DEBUG, log_to_file=False)
+E   TypeError: setup_logging() got an unexpected keyword argument 'log_to_file'
+______ ERROR at setup of TestCollisionEventQueue.test_singleton_behavior _______
+tests/conftest.py:37: in setup_test_logging
+    setup_logging(level=logging.DEBUG, log_to_file=False)
+E   TypeError: setup_logging() got an unexpected keyword argument 'log_to_file'
+_______ ERROR at setup of TestHandDetection2D.test_confidence_filtering ________
+tests/conftest.py:37: in setup_test_logging
+    setup_logging(level=logging.DEBUG, log_to_file=False)
+E   TypeError: setup_logging() got an unexpected keyword argument 'log_to_file'
+_________ ERROR at setup of TestHandDetection2D.test_mock_hand_result __________
+tests/conftest.py:37: in setup_test_logging
+    setup_logging(level=logging.DEBUG, log_to_file=False)
+E   TypeError: setup_logging() got an unexpected keyword argument 'log_to_file'
+______ ERROR at setup of TestHandDetection2D.test_wrapper_initialization _______
+tests/conftest.py:37: in setup_test_logging
+    setup_logging(level=logging.DEBUG, log_to_file=False)
+E   TypeError: setup_logging() got an unexpected keyword argument 'log_to_file'
+_________ ERROR at setup of TestHand3DProjection.test_batch_projection _________
+tests/conftest.py:37: in setup_test_logging
+    setup_logging(level=logging.DEBUG, log_to_file=False)
+E   TypeError: setup_logging() got an unexpected keyword argument 'log_to_file'
+_______ ERROR at setup of TestHand3DProjection.test_depth_interpolation ________
+tests/conftest.py:37: in setup_test_logging
+    setup_logging(level=logging.DEBUG, log_to_file=False)
+E   TypeError: setup_logging() got an unexpected keyword argument 'log_to_file'
+________ ERROR at setup of TestHand3DProjection.test_intrinsics_update _________
+tests/conftest.py:37: in setup_test_logging
+    setup_logging(level=logging.DEBUG, log_to_file=False)
+E   TypeError: setup_logging() got an unexpected keyword argument 'log_to_file'
+__________ ERROR at setup of TestHand3DProjection.test_mock_3d_result __________
+tests/conftest.py:37: in setup_test_logging
+    setup_logging(level=logging.DEBUG, log_to_file=False)
+E   TypeError: setup_logging() got an unexpected keyword argument 'log_to_file'
+_____ ERROR at setup of TestHand3DProjection.test_projector_initialization _____
+tests/conftest.py:37: in setup_test_logging
+    setup_logging(level=logging.DEBUG, log_to_file=False)
+E   TypeError: setup_logging() got an unexpected keyword argument 'log_to_file'
+___________ ERROR at setup of TestHandTracking.test_data_association ___________
+tests/conftest.py:37: in setup_test_logging
+    setup_logging(level=logging.DEBUG, log_to_file=False)
+E   TypeError: setup_logging() got an unexpected keyword argument 'log_to_file'
+_______ ERROR at setup of TestHandTracking.test_kalman_filter_prediction _______
+tests/conftest.py:37: in setup_test_logging
+    setup_logging(level=logging.DEBUG, log_to_file=False)
+E   TypeError: setup_logging() got an unexpected keyword argument 'log_to_file'
+_________ ERROR at setup of TestHandTracking.test_lost_track_handling __________
+tests/conftest.py:37: in setup_test_logging
+    setup_logging(level=logging.DEBUG, log_to_file=False)
+E   TypeError: setup_logging() got an unexpected keyword argument 'log_to_file'
+__________ ERROR at setup of TestHandTracking.test_new_track_creation __________
+tests/conftest.py:37: in setup_test_logging
+    setup_logging(level=logging.DEBUG, log_to_file=False)
+E   TypeError: setup_logging() got an unexpected keyword argument 'log_to_file'
+________ ERROR at setup of TestHandTracking.test_tracker_initialization ________
+tests/conftest.py:37: in setup_test_logging
+    setup_logging(level=logging.DEBUG, log_to_file=False)
+E   TypeError: setup_logging() got an unexpected keyword argument 'log_to_file'
+_________ ERROR at setup of TestHandTracking.test_tracking_continuity __________
+tests/conftest.py:37: in setup_test_logging
+    setup_logging(level=logging.DEBUG, log_to_file=False)
+E   TypeError: setup_logging() got an unexpected keyword argument 'log_to_file'
+________ ERROR at setup of TestDetectionIntegration.test_full_pipeline _________
+tests/conftest.py:37: in setup_test_logging
+    setup_logging(level=logging.DEBUG, log_to_file=False)
+E   TypeError: setup_logging() got an unexpected keyword argument 'log_to_file'
+____ ERROR at setup of TestDetectionIntegration.test_multi_frame_stability _____
+tests/conftest.py:37: in setup_test_logging
+    setup_logging(level=logging.DEBUG, log_to_file=False)
+E   TypeError: setup_logging() got an unexpected keyword argument 'log_to_file'
+____ ERROR at setup of TestCameraIntrinsics.test_camera_intrinsics_creation ____
+tests/conftest.py:37: in setup_test_logging
+    setup_logging(level=logging.DEBUG, log_to_file=False)
+E   TypeError: setup_logging() got an unexpected keyword argument 'log_to_file'
+___ ERROR at setup of TestPointCloudConverter.test_converter_initialization ____
+tests/conftest.py:37: in setup_test_logging
+    setup_logging(level=logging.DEBUG, log_to_file=False)
+E   TypeError: setup_logging() got an unexpected keyword argument 'log_to_file'
+______ ERROR at setup of TestPointCloudConverter.test_numpy_to_pointcloud ______
+tests/conftest.py:37: in setup_test_logging
+    setup_logging(level=logging.DEBUG, log_to_file=False)
+E   TypeError: setup_logging() got an unexpected keyword argument 'log_to_file'
+_______ ERROR at setup of TestPointCloudConverter.test_update_intrinsics _______
+tests/conftest.py:37: in setup_test_logging
+    setup_logging(level=logging.DEBUG, log_to_file=False)
+E   TypeError: setup_logging() got an unexpected keyword argument 'log_to_file'
+____________ ERROR at setup of TestDepthFilter.test_combined_filter ____________
+tests/conftest.py:37: in setup_test_logging
+    setup_logging(level=logging.DEBUG, log_to_file=False)
+E   TypeError: setup_logging() got an unexpected keyword argument 'log_to_file'
+_________ ERROR at setup of TestDepthFilter.test_filter_initialization _________
+tests/conftest.py:37: in setup_test_logging
+    setup_logging(level=logging.DEBUG, log_to_file=False)
+E   TypeError: setup_logging() got an unexpected keyword argument 'log_to_file'
+_____________ ERROR at setup of TestDepthFilter.test_median_filter _____________
+tests/conftest.py:37: in setup_test_logging
+    setup_logging(level=logging.DEBUG, log_to_file=False)
+E   TypeError: setup_logging() got an unexpected keyword argument 'log_to_file'
+___________ ERROR at setup of TestDepthFilter.test_parameter_update ____________
+tests/conftest.py:37: in setup_test_logging
+    setup_logging(level=logging.DEBUG, log_to_file=False)
+E   TypeError: setup_logging() got an unexpected keyword argument 'log_to_file'
+_____________ ERROR at setup of TestIntegration.test_full_pipeline _____________
+tests/conftest.py:37: in setup_test_logging
+    setup_logging(level=logging.DEBUG, log_to_file=False)
+E   TypeError: setup_logging() got an unexpected keyword argument 'log_to_file'
+_______________ ERROR at setup of TestArrayPool.test_array_reuse _______________
+tests/conftest.py:37: in setup_test_logging
+    setup_logging(level=logging.DEBUG, log_to_file=False)
+E   TypeError: setup_logging() got an unexpected keyword argument 'log_to_file'
+_____________ ERROR at setup of TestArrayPool.test_pool_size_limit _____________
+tests/conftest.py:37: in setup_test_logging
+    setup_logging(level=logging.DEBUG, log_to_file=False)
+E   TypeError: setup_logging() got an unexpected keyword argument 'log_to_file'
+_________ ERROR at setup of TestArrayPool.test_temporary_array_context _________
+tests/conftest.py:37: in setup_test_logging
+    setup_logging(level=logging.DEBUG, log_to_file=False)
+E   TypeError: setup_logging() got an unexpected keyword argument 'log_to_file'
+__________ ERROR at setup of TestInPlaceOperations.test_clamp_inplace __________
+tests/conftest.py:37: in setup_test_logging
+    setup_logging(level=logging.DEBUG, log_to_file=False)
+E   TypeError: setup_logging() got an unexpected keyword argument 'log_to_file'
+________ ERROR at setup of TestInPlaceOperations.test_normalize_inplace ________
+tests/conftest.py:37: in setup_test_logging
+    setup_logging(level=logging.DEBUG, log_to_file=False)
+E   TypeError: setup_logging() got an unexpected keyword argument 'log_to_file'
+__________ ERROR at setup of TestInPlaceOperations.test_scale_inplace __________
+tests/conftest.py:37: in setup_test_logging
+    setup_logging(level=logging.DEBUG, log_to_file=False)
+E   TypeError: setup_logging() got an unexpected keyword argument 'log_to_file'
+________ ERROR at setup of TestInPlaceOperations.test_subtract_inplace _________
+tests/conftest.py:37: in setup_test_logging
+    setup_logging(level=logging.DEBUG, log_to_file=False)
+E   TypeError: setup_logging() got an unexpected keyword argument 'log_to_file'
+_ ERROR at setup of TestMemoryEfficientContext.test_context_provides_utilities _
+tests/conftest.py:37: in setup_test_logging
+    setup_logging(level=logging.DEBUG, log_to_file=False)
+E   TypeError: setup_logging() got an unexpected keyword argument 'log_to_file'
+_____ ERROR at setup of TestMemoryEfficientContext.test_context_statistics _____
+tests/conftest.py:37: in setup_test_logging
+    setup_logging(level=logging.DEBUG, log_to_file=False)
+E   TypeError: setup_logging() got an unexpected keyword argument 'log_to_file'
+___ ERROR at setup of TestPerformanceBenchmark.test_memory_usage_comparison ____
+tests/conftest.py:37: in setup_test_logging
+    setup_logging(level=logging.DEBUG, log_to_file=False)
+E   TypeError: setup_logging() got an unexpected keyword argument 'log_to_file'
+__ ERROR at setup of TestOptimizationIntegration.test_decorator_functionality __
+tests/conftest.py:37: in setup_test_logging
+    setup_logging(level=logging.DEBUG, log_to_file=False)
+E   TypeError: setup_logging() got an unexpected keyword argument 'log_to_file'
+____ ERROR at setup of TestOptimizationIntegration.test_reference_tracking _____
+tests/conftest.py:37: in setup_test_logging
+    setup_logging(level=logging.DEBUG, log_to_file=False)
+E   TypeError: setup_logging() got an unexpected keyword argument 'log_to_file'
+_______ ERROR at setup of TestPointCloudProjection.test_basic_projection _______
+tests/conftest.py:37: in setup_test_logging
+    setup_logging(level=logging.DEBUG, log_to_file=False)
+E   TypeError: setup_logging() got an unexpected keyword argument 'log_to_file'
+____ ERROR at setup of TestPointCloudProjection.test_coordinate_conversion _____
+tests/conftest.py:37: in setup_test_logging
+    setup_logging(level=logging.DEBUG, log_to_file=False)
+E   TypeError: setup_logging() got an unexpected keyword argument 'log_to_file'
+______ ERROR at setup of TestPointCloudProjection.test_projection_methods ______
+tests/conftest.py:37: in setup_test_logging
+    setup_logging(level=logging.DEBUG, log_to_file=False)
+E   TypeError: setup_logging() got an unexpected keyword argument 'log_to_file'
+___ ERROR at setup of TestPointCloudProjection.test_projector_initialization ___
+tests/conftest.py:37: in setup_test_logging
+    setup_logging(level=logging.DEBUG, log_to_file=False)
+E   TypeError: setup_logging() got an unexpected keyword argument 'log_to_file'
+___ ERROR at setup of TestDelaunayTriangulation.test_heightmap_triangulation ___
+tests/conftest.py:37: in setup_test_logging
+    setup_logging(level=logging.DEBUG, log_to_file=False)
+E   TypeError: setup_logging() got an unexpected keyword argument 'log_to_file'
+____ ERROR at setup of TestDelaunayTriangulation.test_points_triangulation _____
+tests/conftest.py:37: in setup_test_logging
+    setup_logging(level=logging.DEBUG, log_to_file=False)
+E   TypeError: setup_logging() got an unexpected keyword argument 'log_to_file'
+______ ERROR at setup of TestDelaunayTriangulation.test_triangle_quality _______
+tests/conftest.py:37: in setup_test_logging
+    setup_logging(level=logging.DEBUG, log_to_file=False)
+E   TypeError: setup_logging() got an unexpected keyword argument 'log_to_file'
+_ ERROR at setup of TestDelaunayTriangulation.test_triangulator_initialization _
+tests/conftest.py:37: in setup_test_logging
+    setup_logging(level=logging.DEBUG, log_to_file=False)
+E   TypeError: setup_logging() got an unexpected keyword argument 'log_to_file'
+____ ERROR at setup of TestMeshSimplification.test_adaptive_simplification _____
+tests/conftest.py:37: in setup_test_logging
+    setup_logging(level=logging.DEBUG, log_to_file=False)
+E   TypeError: setup_logging() got an unexpected keyword argument 'log_to_file'
+______ ERROR at setup of TestMeshSimplification.test_basic_simplification ______
+tests/conftest.py:37: in setup_test_logging
+    setup_logging(level=logging.DEBUG, log_to_file=False)
+E   TypeError: setup_logging() got an unexpected keyword argument 'log_to_file'
+_____ ERROR at setup of TestMeshSimplification.test_simplification_methods _____
+tests/conftest.py:37: in setup_test_logging
+    setup_logging(level=logging.DEBUG, log_to_file=False)
+E   TypeError: setup_logging() got an unexpected keyword argument 'log_to_file'
+___ ERROR at setup of TestMeshSimplification.test_simplifier_initialization ____
+tests/conftest.py:37: in setup_test_logging
+    setup_logging(level=logging.DEBUG, log_to_file=False)
+E   TypeError: setup_logging() got an unexpected keyword argument 'log_to_file'
+__ ERROR at setup of TestMeshSimplification.test_target_count_simplification ___
+tests/conftest.py:37: in setup_test_logging
+    setup_logging(level=logging.DEBUG, log_to_file=False)
+E   TypeError: setup_logging() got an unexpected keyword argument 'log_to_file'
+_____ ERROR at setup of TestMeshAttributes.test_calculator_initialization ______
+tests/conftest.py:37: in setup_test_logging
+    setup_logging(level=logging.DEBUG, log_to_file=False)
+E   TypeError: setup_logging() got an unexpected keyword argument 'log_to_file'
+________ ERROR at setup of TestMeshAttributes.test_complete_attributes _________
+tests/conftest.py:37: in setup_test_logging
+    setup_logging(level=logging.DEBUG, log_to_file=False)
+E   TypeError: setup_logging() got an unexpected keyword argument 'log_to_file'
+_______ ERROR at setup of TestMeshAttributes.test_curvature_calculation ________
+tests/conftest.py:37: in setup_test_logging
+    setup_logging(level=logging.DEBUG, log_to_file=False)
+E   TypeError: setup_logging() got an unexpected keyword argument 'log_to_file'
+________ ERROR at setup of TestMeshAttributes.test_gradient_calculation ________
+tests/conftest.py:37: in setup_test_logging
+    setup_logging(level=logging.DEBUG, log_to_file=False)
+E   TypeError: setup_logging() got an unexpected keyword argument 'log_to_file'
+__________ ERROR at setup of TestMeshAttributes.test_triangle_normals __________
+tests/conftest.py:37: in setup_test_logging
+    setup_logging(level=logging.DEBUG, log_to_file=False)
+E   TypeError: setup_logging() got an unexpected keyword argument 'log_to_file'
+___________ ERROR at setup of TestMeshAttributes.test_vertex_normals ___________
+tests/conftest.py:37: in setup_test_logging
+    setup_logging(level=logging.DEBUG, log_to_file=False)
+E   TypeError: setup_logging() got an unexpected keyword argument 'log_to_file'
+__________ ERROR at setup of TestSpatialIndex.test_bvh_index_creation __________
+tests/conftest.py:37: in setup_test_logging
+    setup_logging(level=logging.DEBUG, log_to_file=False)
+E   TypeError: setup_logging() got an unexpected keyword argument 'log_to_file'
+________ ERROR at setup of TestSpatialIndex.test_kdtree_index_creation _________
+tests/conftest.py:37: in setup_test_logging
+    setup_logging(level=logging.DEBUG, log_to_file=False)
+E   TypeError: setup_logging() got an unexpected keyword argument 'log_to_file'
+_____________ ERROR at setup of TestSpatialIndex.test_point_query ______________
+tests/conftest.py:37: in setup_test_logging
+    setup_logging(level=logging.DEBUG, log_to_file=False)
+E   TypeError: setup_logging() got an unexpected keyword argument 'log_to_file'
+______________ ERROR at setup of TestSpatialIndex.test_ray_query _______________
+tests/conftest.py:37: in setup_test_logging
+    setup_logging(level=logging.DEBUG, log_to_file=False)
+E   TypeError: setup_logging() got an unexpected keyword argument 'log_to_file'
+_____________ ERROR at setup of TestSpatialIndex.test_sphere_query _____________
+tests/conftest.py:37: in setup_test_logging
+    setup_logging(level=logging.DEBUG, log_to_file=False)
+E   TypeError: setup_logging() got an unexpected keyword argument 'log_to_file'
+___________ ERROR at setup of TestMeshIntegration.test_full_pipeline ___________
+tests/conftest.py:37: in setup_test_logging
+    setup_logging(level=logging.DEBUG, log_to_file=False)
+E   TypeError: setup_logging() got an unexpected keyword argument 'log_to_file'
+________ ERROR at setup of TestMeshIntegration.test_pipeline_stability _________
+tests/conftest.py:37: in setup_test_logging
+    setup_logging(level=logging.DEBUG, log_to_file=False)
+E   TypeError: setup_logging() got an unexpected keyword argument 'log_to_file'
+____________ ERROR at setup of TestAudioMapping.test_basic_mapping _____________
+tests/conftest.py:37: in setup_test_logging
+    setup_logging(level=logging.DEBUG, log_to_file=False)
+E   TypeError: setup_logging() got an unexpected keyword argument 'log_to_file'
+_________ ERROR at setup of TestAudioMapping.test_instrument_selection _________
+tests/conftest.py:37: in setup_test_logging
+    setup_logging(level=logging.DEBUG, log_to_file=False)
+E   TypeError: setup_logging() got an unexpected keyword argument 'log_to_file'
+____________ ERROR at setup of TestAudioMapping.test_pitch_mapping _____________
+tests/conftest.py:37: in setup_test_logging
+    setup_logging(level=logging.DEBUG, log_to_file=False)
+E   TypeError: setup_logging() got an unexpected keyword argument 'log_to_file'
+___________ ERROR at setup of TestAudioMapping.test_spatial_mapping ____________
+tests/conftest.py:37: in setup_test_logging
+    setup_logging(level=logging.DEBUG, log_to_file=False)
+E   TypeError: setup_logging() got an unexpected keyword argument 'log_to_file'
+___________ ERROR at setup of TestAudioMapping.test_velocity_mapping ___________
+tests/conftest.py:37: in setup_test_logging
+    setup_logging(level=logging.DEBUG, log_to_file=False)
+E   TypeError: setup_logging() got an unexpected keyword argument 'log_to_file'
+_____ ERROR at setup of TestAudioSynthesizer.test_audio_parameter_creation _____
+tests/conftest.py:37: in setup_test_logging
+    setup_logging(level=logging.DEBUG, log_to_file=False)
+E   TypeError: setup_logging() got an unexpected keyword argument 'log_to_file'
+_________ ERROR at setup of TestAudioSynthesizer.test_engine_lifecycle _________
+tests/conftest.py:37: in setup_test_logging
+    setup_logging(level=logging.DEBUG, log_to_file=False)
+E   TypeError: setup_logging() got an unexpected keyword argument 'log_to_file'
+______ ERROR at setup of TestAudioSynthesizer.test_voice_management_basic ______
+tests/conftest.py:37: in setup_test_logging
+    setup_logging(level=logging.DEBUG, log_to_file=False)
+E   TypeError: setup_logging() got an unexpected keyword argument 'log_to_file'
+___________ ERROR at setup of TestVoiceManager.test_polyphony_limit ____________
+tests/conftest.py:37: in setup_test_logging
+    setup_logging(level=logging.DEBUG, log_to_file=False)
+E   TypeError: setup_logging() got an unexpected keyword argument 'log_to_file'
+__________ ERROR at setup of TestVoiceManager.test_spatial_processing __________
+tests/conftest.py:37: in setup_test_logging
+    setup_logging(level=logging.DEBUG, log_to_file=False)
+E   TypeError: setup_logging() got an unexpected keyword argument 'log_to_file'
+___________ ERROR at setup of TestVoiceManager.test_steal_strategies ___________
+tests/conftest.py:37: in setup_test_logging
+    setup_logging(level=logging.DEBUG, log_to_file=False)
+E   TypeError: setup_logging() got an unexpected keyword argument 'log_to_file'
+___________ ERROR at setup of TestVoiceManager.test_voice_allocation ___________
+tests/conftest.py:37: in setup_test_logging
+    setup_logging(level=logging.DEBUG, log_to_file=False)
+E   TypeError: setup_logging() got an unexpected keyword argument 'log_to_file'
+_______ ERROR at setup of TestSoundIntegration.test_end_to_end_pipeline ________
+tests/conftest.py:37: in setup_test_logging
+    setup_logging(level=logging.DEBUG, log_to_file=False)
+E   TypeError: setup_logging() got an unexpected keyword argument 'log_to_file'
+=============================== warnings summary ===============================
+tests/test_performance_unified.py:26
+  /home/zigen4/geocussion-spark/tests/test_performance_unified.py:26: PytestUnknownMarkWarning: Unknown pytest.mark.performance - is this a typo?  You can register custom marks to avoid this warning - for details, see https://docs.pytest.org/en/stable/how-to/mark.html
+    @pytest.mark.performance
+
+tests/test_performance_unified.py:27
+  /home/zigen4/geocussion-spark/tests/test_performance_unified.py:27: PytestUnknownMarkWarning: Unknown pytest.mark.slow - is this a typo?  You can register custom marks to avoid this warning - for details, see https://docs.pytest.org/en/stable/how-to/mark.html
+    @pytest.mark.slow
+
+tests/test_performance_unified.py:208
+  /home/zigen4/geocussion-spark/tests/test_performance_unified.py:208: PytestUnknownMarkWarning: Unknown pytest.mark.benchmark - is this a typo?  You can register custom marks to avoid this warning - for details, see https://docs.pytest.org/en/stable/how-to/mark.html
+    @pytest.mark.benchmark
+
+tests/conftest.py:220
+  /home/zigen4/geocussion-spark/tests/conftest.py:220: PytestUnknownMarkWarning: Unknown pytest.mark.performance - is this a typo?  You can register custom marks to avoid this warning - for details, see https://docs.pytest.org/en/stable/how-to/mark.html
+    item.add_marker(pytest.mark.performance)
+
+tests/conftest.py:221
+  /home/zigen4/geocussion-spark/tests/conftest.py:221: PytestUnknownMarkWarning: Unknown pytest.mark.slow - is this a typo?  You can register custom marks to avoid this warning - for details, see https://docs.pytest.org/en/stable/how-to/mark.html
+    item.add_marker(pytest.mark.slow)
+
+tests/conftest.py:225
+  /home/zigen4/geocussion-spark/tests/conftest.py:225: PytestUnknownMarkWarning: Unknown pytest.mark.unit - is this a typo?  You can register custom marks to avoid this warning - for details, see https://docs.pytest.org/en/stable/how-to/mark.html
+    item.add_marker(pytest.mark.unit)
+
+tests/conftest.py:223
+  /home/zigen4/geocussion-spark/tests/conftest.py:223: PytestUnknownMarkWarning: Unknown pytest.mark.integration - is this a typo?  You can register custom marks to avoid this warning - for details, see https://docs.pytest.org/en/stable/how-to/mark.html
+    item.add_marker(pytest.mark.integration)
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+============================= slowest 10 durations =============================
+
+(10 durations < 0.005s hidden.  Use -vv to show these durations.)
+=========================== short test summary info ============================
+ERROR tests/collision_test.py::TestCollisionSearch::test_basic_search - TypeE...
+ERROR tests/collision_test.py::TestSphereTriangleCollision::test_face_collision
+ERROR tests/collision_test.py::TestCollisionEvents::test_event_creation - Typ...
+ERROR tests/collision_test.py::TestCollisionEventQueue::test_shared_event_queue
+ERROR tests/collision_test.py::TestCollisionEventQueue::test_singleton_behavior
+ERROR tests/detection_test.py::TestHandDetection2D::test_confidence_filtering
+ERROR tests/detection_test.py::TestHandDetection2D::test_mock_hand_result - T...
+ERROR tests/detection_test.py::TestHandDetection2D::test_wrapper_initialization
+ERROR tests/detection_test.py::TestHand3DProjection::test_batch_projection - ...
+ERROR tests/detection_test.py::TestHand3DProjection::test_depth_interpolation
+ERROR tests/detection_test.py::TestHand3DProjection::test_intrinsics_update
+ERROR tests/detection_test.py::TestHand3DProjection::test_mock_3d_result - Ty...
+ERROR tests/detection_test.py::TestHand3DProjection::test_projector_initialization
+ERROR tests/detection_test.py::TestHandTracking::test_data_association - Type...
+ERROR tests/detection_test.py::TestHandTracking::test_kalman_filter_prediction
+ERROR tests/detection_test.py::TestHandTracking::test_lost_track_handling - T...
+ERROR tests/detection_test.py::TestHandTracking::test_new_track_creation - Ty...
+ERROR tests/detection_test.py::TestHandTracking::test_tracker_initialization
+ERROR tests/detection_test.py::TestHandTracking::test_tracking_continuity - T...
+ERROR tests/detection_test.py::TestDetectionIntegration::test_full_pipeline
+ERROR tests/detection_test.py::TestDetectionIntegration::test_multi_frame_stability
+ERROR tests/input_test.py::TestCameraIntrinsics::test_camera_intrinsics_creation
+ERROR tests/input_test.py::TestPointCloudConverter::test_converter_initialization
+ERROR tests/input_test.py::TestPointCloudConverter::test_numpy_to_pointcloud
+ERROR tests/input_test.py::TestPointCloudConverter::test_update_intrinsics - ...
+ERROR tests/input_test.py::TestDepthFilter::test_combined_filter - TypeError:...
+ERROR tests/input_test.py::TestDepthFilter::test_filter_initialization - Type...
+ERROR tests/input_test.py::TestDepthFilter::test_median_filter - TypeError: s...
+ERROR tests/input_test.py::TestDepthFilter::test_parameter_update - TypeError...
+ERROR tests/input_test.py::TestIntegration::test_full_pipeline - TypeError: s...
+ERROR tests/memory_optimization_test.py::TestArrayPool::test_array_reuse - Ty...
+ERROR tests/memory_optimization_test.py::TestArrayPool::test_pool_size_limit
+ERROR tests/memory_optimization_test.py::TestArrayPool::test_temporary_array_context
+ERROR tests/memory_optimization_test.py::TestInPlaceOperations::test_clamp_inplace
+ERROR tests/memory_optimization_test.py::TestInPlaceOperations::test_normalize_inplace
+ERROR tests/memory_optimization_test.py::TestInPlaceOperations::test_scale_inplace
+ERROR tests/memory_optimization_test.py::TestInPlaceOperations::test_subtract_inplace
+ERROR tests/memory_optimization_test.py::TestMemoryEfficientContext::test_context_provides_utilities
+ERROR tests/memory_optimization_test.py::TestMemoryEfficientContext::test_context_statistics
+ERROR tests/memory_optimization_test.py::TestPerformanceBenchmark::test_memory_usage_comparison
+ERROR tests/memory_optimization_test.py::TestOptimizationIntegration::test_decorator_functionality
+ERROR tests/memory_optimization_test.py::TestOptimizationIntegration::test_reference_tracking
+ERROR tests/mesh_test.py::TestPointCloudProjection::test_basic_projection - T...
+ERROR tests/mesh_test.py::TestPointCloudProjection::test_coordinate_conversion
+ERROR tests/mesh_test.py::TestPointCloudProjection::test_projection_methods
+ERROR tests/mesh_test.py::TestPointCloudProjection::test_projector_initialization
+ERROR tests/mesh_test.py::TestDelaunayTriangulation::test_heightmap_triangulation
+ERROR tests/mesh_test.py::TestDelaunayTriangulation::test_points_triangulation
+ERROR tests/mesh_test.py::TestDelaunayTriangulation::test_triangle_quality - ...
+ERROR tests/mesh_test.py::TestDelaunayTriangulation::test_triangulator_initialization
+ERROR tests/mesh_test.py::TestMeshSimplification::test_adaptive_simplification
+ERROR tests/mesh_test.py::TestMeshSimplification::test_basic_simplification
+ERROR tests/mesh_test.py::TestMeshSimplification::test_simplification_methods
+ERROR tests/mesh_test.py::TestMeshSimplification::test_simplifier_initialization
+ERROR tests/mesh_test.py::TestMeshSimplification::test_target_count_simplification
+ERROR tests/mesh_test.py::TestMeshAttributes::test_calculator_initialization
+ERROR tests/mesh_test.py::TestMeshAttributes::test_complete_attributes - Type...
+ERROR tests/mesh_test.py::TestMeshAttributes::test_curvature_calculation - Ty...
+ERROR tests/mesh_test.py::TestMeshAttributes::test_gradient_calculation - Typ...
+ERROR tests/mesh_test.py::TestMeshAttributes::test_triangle_normals - TypeErr...
+ERROR tests/mesh_test.py::TestMeshAttributes::test_vertex_normals - TypeError...
+ERROR tests/mesh_test.py::TestSpatialIndex::test_bvh_index_creation - TypeErr...
+ERROR tests/mesh_test.py::TestSpatialIndex::test_kdtree_index_creation - Type...
+ERROR tests/mesh_test.py::TestSpatialIndex::test_point_query - TypeError: set...
+ERROR tests/mesh_test.py::TestSpatialIndex::test_ray_query - TypeError: setup...
+ERROR tests/mesh_test.py::TestSpatialIndex::test_sphere_query - TypeError: se...
+ERROR tests/mesh_test.py::TestMeshIntegration::test_full_pipeline - TypeError...
+ERROR tests/mesh_test.py::TestMeshIntegration::test_pipeline_stability - Type...
+ERROR tests/sound_test.py::TestAudioMapping::test_basic_mapping - TypeError: ...
+ERROR tests/sound_test.py::TestAudioMapping::test_instrument_selection - Type...
+ERROR tests/sound_test.py::TestAudioMapping::test_pitch_mapping - TypeError: ...
+ERROR tests/sound_test.py::TestAudioMapping::test_spatial_mapping - TypeError...
+ERROR tests/sound_test.py::TestAudioMapping::test_velocity_mapping - TypeErro...
+ERROR tests/sound_test.py::TestAudioSynthesizer::test_audio_parameter_creation
+ERROR tests/sound_test.py::TestAudioSynthesizer::test_engine_lifecycle - Type...
+ERROR tests/sound_test.py::TestAudioSynthesizer::test_voice_management_basic
+ERROR tests/sound_test.py::TestVoiceManager::test_polyphony_limit - TypeError...
+ERROR tests/sound_test.py::TestVoiceManager::test_spatial_processing - TypeEr...
+ERROR tests/sound_test.py::TestVoiceManager::test_steal_strategies - TypeErro...
+ERROR tests/sound_test.py::TestVoiceManager::test_voice_allocation - TypeErro...
+ERROR tests/sound_test.py::TestSoundIntegration::test_end_to_end_pipeline - T...
+================ 20 deselected, 7 warnings, 81 errors in 2.40s =================

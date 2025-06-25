@@ -12,10 +12,12 @@ from typing import List, Dict, Optional, Callable
 from enum import Enum, IntEnum
 from collections import deque
 import numpy as np
+import threading
 
 # 他フェーズとの連携
-from .sphere_tri import CollisionInfo, ContactPoint, CollisionType
+from ..types import CollisionInfo, ContactPoint, CollisionType
 from ..mesh.attributes import MeshAttributes
+from .optimization import optimize_array_operations, memory_efficient_context
 
 
 class EventType(Enum):
@@ -98,6 +100,7 @@ class CollisionEventQueue:
             'queue_overflows': 0
         }
     
+    @optimize_array_operations
     def create_event(
         self,
         collision_info: CollisionInfo,
@@ -105,7 +108,7 @@ class CollisionEventQueue:
         hand_position: np.ndarray,
         hand_velocity: Optional[np.ndarray] = None
     ) -> Optional[CollisionEvent]:
-        """衝突イベントを作成"""
+        """衝突イベントを作成（メモリ最適化版）"""
         if not collision_info.has_collision:
             return self._end_active_event(hand_id)
         
@@ -116,29 +119,39 @@ class CollisionEventQueue:
         velocity = np.linalg.norm(hand_velocity) if hand_velocity is not None else 0.0
         intensity = self._calculate_intensity(collision_info, velocity)
         
-        event = CollisionEvent(
-            event_id=f"collision_{self.event_counter:06d}",
-            event_type=EventType.COLLISION_START,
-            timestamp=time.perf_counter(),
-            duration_ms=0.0,
-            
-            contact_position=primary_contact.position.copy(),
-            hand_position=hand_position.copy(),
-            surface_normal=primary_contact.normal.copy(),
-            
-            intensity=intensity,
-            velocity=velocity,
-            penetration_depth=primary_contact.depth,
-            contact_area=self._estimate_contact_area(collision_info),
-            
-            pitch_hint=max(0.0, min(1.0, primary_contact.position[1])),
-            timbre_hint=0.5,
-            spatial_position=np.array([primary_contact.position[0], 0.0, primary_contact.position[2]]),
-            
-            triangle_index=primary_contact.triangle_index,
-            hand_id=hand_id,
-            collision_type=primary_contact.collision_type
-        )
+        # メモリ効率的なコンテキストでイベント作成
+        with memory_efficient_context() as ctx:
+            # 空間位置をプールから取得して計算
+            pool = ctx['pool']
+            with pool.temporary_array((3,), 'float32') as spatial_pos:
+                spatial_pos[0] = primary_contact.position[0]
+                spatial_pos[1] = 0.0
+                spatial_pos[2] = primary_contact.position[2]
+                
+                event = CollisionEvent(
+                    event_id=f"collision_{self.event_counter:06d}",
+                    event_type=EventType.COLLISION_START,
+                    timestamp=time.perf_counter(),
+                    duration_ms=0.0,
+                    
+                    # 配列参照のコピーを最小化
+                    contact_position=primary_contact.position.copy(),  # 必要最小限のコピー
+                    hand_position=hand_position.copy(),               # 必要最小限のコピー
+                    surface_normal=primary_contact.normal.copy(),     # 必要最小限のコピー
+                    
+                    intensity=intensity,
+                    velocity=velocity,
+                    penetration_depth=primary_contact.depth,
+                    contact_area=self._estimate_contact_area(collision_info),
+                    
+                    pitch_hint=max(0.0, min(1.0, primary_contact.position[1])),
+                    timbre_hint=0.5,
+                    spatial_position=spatial_pos.copy(),  # 一時配列のコピー
+                    
+                    triangle_index=primary_contact.triangle_index,
+                    hand_id=hand_id,
+                    collision_type=primary_contact.collision_type
+                )
         
         self.event_counter += 1
         self.active_events[hand_id] = event
@@ -234,32 +247,79 @@ class CollisionEventQueue:
         return self.stats.copy()
 
 
-# 便利関数
+# シングルトンキューマネージャー
+class _CollisionEventQueueSingleton:
+    """シングルトンキューインスタンス管理"""
+    _instance: Optional[CollisionEventQueue] = None
+    _lock = threading.Lock()
+    
+    @classmethod
+    def get_instance(cls) -> CollisionEventQueue:
+        """グローバルキューインスタンスを取得"""
+        if cls._instance is None:
+            with cls._lock:
+                if cls._instance is None:
+                    cls._instance = CollisionEventQueue()
+        return cls._instance
+    
+    @classmethod
+    def reset_instance(cls) -> None:
+        """インスタンスをリセット（テスト用）"""
+        with cls._lock:
+            cls._instance = None
+
+
+def get_global_collision_queue() -> CollisionEventQueue:
+    """グローバル衝突イベントキューを取得"""
+    return _CollisionEventQueueSingleton.get_instance()
+
+
+def reset_global_collision_queue() -> None:
+    """グローバル衝突イベントキューをリセット（テスト用）"""
+    _CollisionEventQueueSingleton.reset_instance()
+
+
+# 便利関数（改善版）
 def create_collision_event(
     collision_info: CollisionInfo,
     hand_id: str,
     hand_position: np.ndarray,
     hand_velocity: Optional[np.ndarray] = None
 ) -> Optional[CollisionEvent]:
-    """衝突イベントを作成（簡単なインターフェース）"""
-    queue = CollisionEventQueue()
+    """衝突イベントを作成（グローバルキュー使用）"""
+    queue = get_global_collision_queue()
     return queue.create_event(collision_info, hand_id, hand_position, hand_velocity)
 
 
+@optimize_array_operations
 def process_collision_events(
     collision_infos: List[CollisionInfo],
     hand_ids: List[str],
     hand_positions: List[np.ndarray],
     hand_velocities: Optional[List[np.ndarray]] = None
 ) -> List[CollisionEvent]:
-    """複数の衝突情報を一括処理"""
-    queue = CollisionEventQueue()
+    """複数の衝突情報を一括処理（メモリ最適化版）"""
+    queue = get_global_collision_queue()
     events = []
     
-    for i, (collision_info, hand_id, hand_pos) in enumerate(zip(collision_infos, hand_ids, hand_positions)):
-        velocity = hand_velocities[i] if hand_velocities else None
-        event = queue.create_event(collision_info, hand_id, hand_pos, velocity)
-        if event:
-            events.append(event)
+    # メモリ効率的なコンテキストで一括処理
+    with memory_efficient_context() as ctx:
+        for i, (collision_info, hand_id, hand_pos) in enumerate(zip(collision_infos, hand_ids, hand_positions)):
+            velocity = hand_velocities[i] if hand_velocities else None
+            event = queue.create_event(collision_info, hand_id, hand_pos, velocity)
+            if event:
+                events.append(event)
     
-    return events 
+    return events
+
+
+def get_collision_events(max_events: Optional[int] = None) -> List[CollisionEvent]:
+    """グローバルキューからイベントを取得"""
+    queue = get_global_collision_queue()
+    return queue.get_events(max_events)
+
+
+def get_collision_stats() -> dict:
+    """グローバルキューの統計を取得"""
+    queue = get_global_collision_queue()
+    return queue.get_stats() 

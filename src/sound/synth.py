@@ -21,6 +21,11 @@ except ImportError:
 
 # 他フェーズとの連携
 from .mapping import AudioParameters, InstrumentType
+from ..config import get_config, AudioConfig as GlobalAudioConfig
+from ..resource_manager import ManagedResource, get_resource_manager
+from .. import get_logger
+
+logger = get_logger(__name__)
 
 
 class EngineState(Enum):
@@ -34,7 +39,7 @@ class EngineState(Enum):
 
 @dataclass
 class AudioConfig:
-    """音響設定データ"""
+    """音響設定データ（後方互換性のため）"""
     sample_rate: int = 44100        # サンプリングレート
     buffer_size: int = 256          # バッファサイズ
     channels: int = 2               # チャンネル数（ステレオ）
@@ -44,21 +49,39 @@ class AudioConfig:
     master_volume: float = 0.7      # マスターボリューム
     reverb_level: float = 0.3       # リバーブレベル
     
+    @classmethod
+    def from_global_config(cls, global_config: Optional[GlobalAudioConfig] = None) -> 'AudioConfig':
+        """グローバル設定から音響設定を作成"""
+        if global_config is None:
+            global_config = get_config().audio
+        
+        return cls(
+            sample_rate=global_config.sample_rate,
+            buffer_size=global_config.buffer_size,
+            channels=global_config.channels,
+            audio_driver=global_config.audio_driver,
+            enable_duplex=global_config.enable_duplex,
+            max_polyphony=global_config.max_polyphony,
+            master_volume=global_config.master_volume,
+            reverb_level=global_config.reverb_level
+        )
+    
     @property
     def latency_ms(self) -> float:
         """レイテンシーをミリ秒で取得"""
         return (self.buffer_size / self.sample_rate) * 1000
 
 
-class AudioSynthesizer:
-    """pyo音響合成エンジン"""
+class AudioSynthesizer(ManagedResource):
+    """pyo音響合成エンジン（リソース管理対応）"""
     
     def __init__(
         self,
         config: Optional[AudioConfig] = None,
         enable_physical_modeling: bool = True,
         enable_effects: bool = True,
-        enable_spatial_audio: bool = True
+        enable_spatial_audio: bool = True,
+        resource_id: Optional[str] = None
     ):
         """
         初期化
@@ -68,8 +91,13 @@ class AudioSynthesizer:
             enable_physical_modeling: 物理モデリングを有効にするか
             enable_effects: エフェクトを有効にするか
             enable_spatial_audio: 空間音響を有効にするか
+            resource_id: リソースID（自動生成される場合はNone）
         """
-        self.config = config or AudioConfig()
+        # ManagedResourceの初期化
+        resource_id = resource_id or f"audio_synth_{int(time.time() * 1000000)}"
+        super().__init__(resource_id)
+        
+        self.config = config or AudioConfig.from_global_config()
         self.enable_physical_modeling = enable_physical_modeling
         self.enable_effects = enable_effects
         self.enable_spatial_audio = enable_spatial_audio
@@ -98,7 +126,15 @@ class AudioSynthesizer:
         # スレッド安全性
         self._lock = threading.Lock()
         
-        print(f"AudioSynthesizer initialized with config: {self.config}")
+        logger.info(f"AudioSynthesizer initialized: {self.resource_id}, config: {self.config}")
+        
+        # リソースマネージャーに自動登録
+        manager = get_resource_manager()
+        manager.register_resource(self, memory_estimate=50 * 1024 * 1024)  # 50MB推定
+    
+    def initialize(self) -> bool:
+        """リソース初期化（ManagedResourceインターフェース）"""
+        return self.start_engine()
     
     def start_engine(self) -> bool:
         """
@@ -141,6 +177,15 @@ class AudioSynthesizer:
             self.state = EngineState.ERROR
             return False
     
+    def cleanup(self) -> bool:
+        """リソースクリーンアップ（ManagedResourceインターフェース）"""
+        try:
+            self.stop_engine()
+            return True
+        except Exception as e:
+            logger.error(f"Error in cleanup for {self.resource_id}: {e}")
+            return False
+    
     def stop_engine(self):
         """音響エンジンを停止"""
         try:
@@ -149,17 +194,48 @@ class AudioSynthesizer:
             # 全ボイスを停止
             self.stop_all_voices()
             
-            # サーバー停止
+            # pyoサーバーの完全なクリーンアップ
             if self.server:
-                self.server.stop()
-                self.server.shutdown()
-                self.server = None
+                try:
+                    # サーバーからすべてのオブジェクトを削除
+                    if hasattr(self.server, 'getStreams'):
+                        for stream in self.server.getStreams():
+                            try:
+                                stream.stop()
+                            except Exception:
+                                pass
+                    
+                    # サーバー停止と完全シャットダウン
+                    self.server.stop()
+                    self.server.shutdown()
+                    
+                    # インスタンス削除
+                    del self.server
+                    self.server = None
+                    
+                except Exception as e:
+                    logger.error(f"Error during pyo server shutdown: {e}")
+            
+            # 楽器インスタンスのクリーンアップ
+            for instrument_type, instrument in self.instruments.items():
+                try:
+                    if instrument and hasattr(instrument, 'stop'):
+                        instrument.stop()
+                except Exception as e:
+                    logger.error(f"Error stopping instrument {instrument_type}: {e}")
+            self.instruments.clear()
+            
+            # エフェクトのクリーンアップ
+            self.reverb = None
+            
+            # アクティブボイスの強制クリア
+            self.active_voices.clear()
             
             self.state = EngineState.STOPPED
-            print("Audio engine stopped")
+            logger.info("Audio engine stopped and cleaned up")
             
         except Exception as e:
-            print(f"Error stopping audio engine: {e}")
+            logger.error(f"Error stopping audio engine: {e}")
             self.state = EngineState.ERROR
     
     def play_audio_parameters(self, params: AudioParameters) -> Optional[str]:
@@ -493,6 +569,19 @@ class AudioSynthesizer:
             'average_latency_ms': 0.0,
             'cpu_usage': 0.0
         }
+    
+    @property
+    def resource_type(self) -> str:
+        """リソースタイプ（ManagedResourceインターフェース）"""
+        return "audio_synthesizer"
+    
+    def get_memory_usage(self) -> int:
+        """メモリ使用量を取得（ManagedResourceインターフェース）"""
+        # 概算値の計算
+        base_memory = 10 * 1024 * 1024  # 10MB基本
+        voice_memory = len(self.active_voices) * 1024 * 1024  # 1MB/ボイス
+        instrument_memory = len(self.instruments) * 5 * 1024 * 1024  # 5MB/楽器
+        return base_memory + voice_memory + instrument_memory
 
 
 # 便利関数

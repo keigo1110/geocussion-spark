@@ -17,7 +17,9 @@ from ..mesh.index import SpatialIndex, BVHNode
 from ..mesh.delaunay import TriangleMesh
 from ..detection.tracker import TrackedHand
 from .sphere_tri import point_triangle_distance
-from .types import SearchStrategy, SearchResult
+from ..types import SearchStrategy, SearchResult
+from ..config import get_config
+from .optimization import optimize_array_operations, memory_efficient_context
 
 
 class CollisionSearcher:
@@ -26,29 +28,33 @@ class CollisionSearcher:
     def __init__(
         self,
         spatial_index: SpatialIndex,
-        default_radius: float = 0.05,      # デフォルト検索半径 (5cm)
-        max_radius: float = 0.2,           # 最大検索半径 (20cm)
+        default_radius: Optional[float] = None,
+        max_radius: Optional[float] = None,
         strategy: SearchStrategy = SearchStrategy.ADAPTIVE_RADIUS,
-        enable_caching: bool = True,       # 結果キャッシュ
-        max_cache_size: int = 100          # キャッシュサイズ
+        enable_caching: Optional[bool] = None,
+        max_cache_size: Optional[int] = None
     ):
         """
         初期化
         
         Args:
             spatial_index: メッシュフェーズで構築されたBVH空間インデックス
-            default_radius: デフォルト検索半径
-            max_radius: 最大検索半径
+            default_radius: デフォルト検索半径（Noneの場合は設定ファイルから取得）
+            max_radius: 最大検索半径（Noneの場合は設定ファイルから取得）
             strategy: 検索戦略
-            enable_caching: 結果キャッシュを有効にするか
-            max_cache_size: キャッシュの最大サイズ
+            enable_caching: 結果キャッシュを有効にするか（Noneの場合は設定ファイルから取得）
+            max_cache_size: キャッシュの最大サイズ（Noneの場合は設定ファイルから取得）
         """
+        # 設定値を取得
+        config = get_config()
+        collision_config = config.collision
+        
         self.spatial_index = spatial_index
-        self.default_radius = default_radius
-        self.max_radius = max_radius
+        self.default_radius = default_radius if default_radius is not None else collision_config.default_search_radius
+        self.max_radius = max_radius if max_radius is not None else collision_config.max_search_radius
         self.strategy = strategy
-        self.enable_caching = enable_caching
-        self.max_cache_size = max_cache_size
+        self.enable_caching = enable_caching if enable_caching is not None else True  # デフォルトTrue
+        self.max_cache_size = max_cache_size if max_cache_size is not None else collision_config.max_cache_size
         
         # キャッシュ
         self.search_cache = {}  # {(x, y, z, radius): SearchResult}
@@ -71,6 +77,7 @@ class CollisionSearcher:
             'nodes_visited_total': 0
         }
     
+    @optimize_array_operations
     def search_near_hand(self, hand: TrackedHand, override_radius: Optional[float] = None) -> SearchResult:
         """
         手の位置周辺の三角形を検索
@@ -129,6 +136,7 @@ class CollisionSearcher:
             num_nodes_visited=total_nodes_visited
         )
     
+    @optimize_array_operations
     def batch_search_hands(self, hands: List[TrackedHand]) -> List[SearchResult]:
         """
         複数の手を一括検索
@@ -142,13 +150,15 @@ class CollisionSearcher:
         start_time = time.perf_counter()
         results = []
         
-        for hand in hands:
-            if hand.position is not None:
-                result = self.search_near_hand(hand)
-                results.append(result)
-            else:
-                # 無効な手の場合は空の結果
-                results.append(SearchResult([], [], 0.0, np.zeros(3), 0.0, 0))
+        # メモリ効率的なコンテキストで処理
+        with memory_efficient_context() as ctx:
+            for hand in hands:
+                if hand.position is not None:
+                    result = self.search_near_hand(hand)
+                    results.append(result)
+                else:
+                    # 無効な手の場合は空の結果
+                    results.append(SearchResult([], [], 0.0, np.zeros(3), 0.0, 0))
         
         # パフォーマンス統計更新
         batch_time = (time.perf_counter() - start_time) * 1000
@@ -180,11 +190,13 @@ class CollisionSearcher:
         
         search_time = (time.perf_counter() - start_time) * 1000
         
-        result = SearchResult(
+        # 最適化版SearchResultを使用（point.copy()を回避）
+        from .optimization import create_optimized_search_result
+        result = create_optimized_search_result(
             triangle_indices=triangle_indices,
             distances=distances,
             search_time_ms=search_time,
-            query_point=point.copy(),
+            query_point=point,  # copy()せず参照を使用
             search_radius=radius,
             num_nodes_visited=nodes_visited
         )
@@ -219,18 +231,30 @@ class CollisionSearcher:
         return self.default_radius
     
     def _calculate_distances(self, point: np.ndarray, triangle_indices: List[int]) -> List[float]:
-        """点と各三角形の正確な最短距離を計算"""
+        """点と各三角形の正確な最短距離を計算（最適化版）"""
         distances = []
         if not triangle_indices:
             return distances
         
+        # 最適化された距離計算を使用
+        from .distance import get_distance_calculator
+        calculator = get_distance_calculator()
+        
         mesh_vertices = self.spatial_index.mesh.vertices
         mesh_triangles = self.spatial_index.mesh.triangles
         
-        for tri_idx in triangle_indices:
-            triangle_vertices = mesh_vertices[mesh_triangles[tri_idx]]
-            dist = point_triangle_distance(point, triangle_vertices)
-            distances.append(dist)
+        # バッチ計算が可能な場合はそれを使用
+        if len(triangle_indices) > 3:  # バッチ化の閾値
+            triangle_vertices_batch = mesh_vertices[mesh_triangles[triangle_indices]]  # (M, 3, 3)
+            points_batch = np.array([point])  # (1, 3)
+            distance_matrix = calculator.calculate_batch_distances(points_batch, triangle_vertices_batch)
+            distances = distance_matrix[0].tolist()
+        else:
+            # 少数の場合は従来通り個別計算
+            for tri_idx in triangle_indices:
+                triangle_vertices = mesh_vertices[mesh_triangles[tri_idx]]
+                dist = calculator.calculate_point_triangle_distance(point, triangle_vertices)
+                distances.append(dist)
             
         return distances
     

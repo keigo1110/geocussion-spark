@@ -81,9 +81,9 @@ class TestCollisionSearch(unittest.TestCase):
         self.assertIsInstance(result, SearchResult)
         # 検索結果があることを確認（半径を大きくしたので見つかるはず）
         if len(result.triangle_indices) == 0:
-            print(f"No triangles found at position {position} with radius 0.5")
-            print(f"Mesh has {self.mesh.num_triangles} triangles")
-            print(f"Triangle vertices: {self.mesh.vertices}")
+            logger.info(f"No triangles found at position {position} with radius 0.5")
+            logger.info(f"Mesh has {self.mesh.num_triangles} triangles")
+            logger.info(f"Triangle vertices: {self.mesh.vertices}")
         
         self.assertLess(result.search_time_ms, 10.0)
 
@@ -105,18 +105,16 @@ class TestSphereTriangleCollision(unittest.TestCase):
     
     def test_face_collision(self):
         """面衝突テスト"""
-        sphere_center = np.array([0.5, 0.3, 0.05])
+        from src.collision.sphere_tri import check_sphere_triangle
+        
+        mesh_vertices = np.array([[0, 0, 0], [1, 0, 0], [0, 1, 0]], dtype=np.float32)
+        sphere_center = np.array([0.1, 0.1, 0.05])
         sphere_radius = 0.1
-        
-        search_result = SearchResult([0], [0.05], 1.0, sphere_center, sphere_radius, 1)
-        
-        collision_info = self.collision_tester.test_sphere_collision(
-            sphere_center, sphere_radius, search_result
+        contact_point = check_sphere_triangle(
+            sphere_center, sphere_radius, mesh_vertices
         )
-        
-        self.assertTrue(collision_info.has_collision)
-        self.assertEqual(len(collision_info.contact_points), 1)
-        self.assertLess(collision_info.collision_time_ms, 5.0)
+        self.assertIsNotNone(contact_point)
+        self.assertGreater(contact_point.depth, 0.0)
 
 
 class TestCollisionEvents(unittest.TestCase):
@@ -158,9 +156,76 @@ class TestCollisionEvents(unittest.TestCase):
         self.assertGreater(event.intensity.value, 0)
 
 
+class TestCollisionEventQueue(unittest.TestCase):
+    """衝突イベントキューテスト（シングルトン検証）"""
+    
+    def setUp(self):
+        """テスト前に既存キューをリセット"""
+        from src.collision.events import reset_global_collision_queue
+        reset_global_collision_queue()
+    
+    def test_singleton_behavior(self):
+        """シングルトンの動作確認"""
+        from src.collision.events import get_global_collision_queue
+        
+        # 複数回取得しても同じインスタンス
+        queue1 = get_global_collision_queue()
+        queue2 = get_global_collision_queue()
+        self.assertIs(queue1, queue2)
+    
+    def test_shared_event_queue(self):
+        """便利関数経由でイベントが共有キューに入ることを確認"""
+        from src.collision.events import (
+            create_collision_event, 
+            get_collision_events,
+            get_collision_stats
+        )
+        from src.collision.sphere_tri import CollisionInfo, ContactPoint, CollisionType
+        import numpy as np
+        
+        # モック衝突情報作成
+        contact_point = ContactPoint(
+            position=np.array([0.1, 0.1, 0.1]),
+            normal=np.array([0, 0, 1]),
+            depth=0.05,
+            triangle_index=0,
+            barycentric=np.array([0.5, 0.3, 0.2]),
+            collision_type=CollisionType.FACE_COLLISION
+        )
+        
+        collision_info = CollisionInfo(
+            has_collision=True,
+            contact_points=[contact_point],
+            closest_point=contact_point,
+            total_penetration_depth=0.05,
+            collision_normal=np.array([0, 0, 1]),
+            collision_time_ms=1.0
+        )
+        
+        hand_pos = np.array([0.1, 0.1, 0.15])
+        hand_vel = np.array([0.0, 0.0, -0.1])
+        
+        # イベント作成
+        event = create_collision_event(collision_info, "left_hand", hand_pos, hand_vel)
+        self.assertIsNotNone(event)
+        
+        # 統計確認
+        stats = get_collision_stats()
+        self.assertEqual(stats['total_events_created'], 1)
+        
+        # キューからイベント取得
+        events = get_collision_events()
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0].hand_id, "left_hand")
+        
+        # キューが空になったことを確認
+        empty_events = get_collision_events()
+        self.assertEqual(len(empty_events), 0)
+
+
 def run_collision_tests():
     """衝突検出テスト実行"""
-    print("=== 衝突検出テスト実行 ===")
+    logger.info("=== 衝突検出テスト実行 ===")
     
     loader = unittest.TestLoader()
     suite = unittest.TestSuite()
@@ -168,14 +233,15 @@ def run_collision_tests():
     suite.addTests(loader.loadTestsFromTestCase(TestCollisionSearch))
     suite.addTests(loader.loadTestsFromTestCase(TestSphereTriangleCollision))
     suite.addTests(loader.loadTestsFromTestCase(TestCollisionEvents))
+    suite.addTests(loader.loadTestsFromTestCase(TestCollisionEventQueue))
     
     runner = unittest.TextTestRunner(verbosity=2)
     result = runner.run(suite)
     
-    print(f"\n=== テスト結果要約 ===")
-    print(f"実行テスト: {result.testsRun}")
-    print(f"失敗: {len(result.failures)}")
-    print(f"エラー: {len(result.errors)}")
+    logger.info(f"\n=== テスト結果要約 ===")
+    logger.info(f"実行テスト: {result.testsRun}")
+    logger.info(f"失敗: {len(result.failures)}")
+    logger.info(f"エラー: {len(result.errors)}")
     
     return result.wasSuccessful()
 

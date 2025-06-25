@@ -527,10 +527,10 @@ class TestMeshIntegration(unittest.TestCase):
         self.assertEqual(attributes.num_vertices, simplified_mesh.num_vertices)
         self.assertGreater(index.stats['num_nodes'], 0)
         
-        print(f"Full pipeline completed in {total_time:.2f}ms")
-        print(f"  - Original mesh: {mesh.num_triangles} triangles")
-        print(f"  - Simplified mesh: {simplified_mesh.num_triangles} triangles")
-        print(f"  - BVH nodes: {index.stats['num_nodes']}")
+        logger.info(f"Full pipeline completed in {total_time:.2f}ms")
+        logger.info(f"  - Original mesh: {mesh.num_triangles} triangles")
+        logger.info(f"  - Simplified mesh: {simplified_mesh.num_triangles} triangles")
+        logger.info(f"  - BVH nodes: {index.stats['num_nodes']}")
     
     def test_pipeline_stability(self):
         """パイプライン安定性テスト"""

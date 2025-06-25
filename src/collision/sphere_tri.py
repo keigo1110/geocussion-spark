@@ -15,7 +15,12 @@ import numpy as np
 # 他フェーズとの連携
 from ..mesh.delaunay import TriangleMesh
 from ..mesh.attributes import MeshAttributes
-from .types import CollisionType, ContactPoint, CollisionInfo, SearchResult
+from ..types import CollisionType, ContactPoint, CollisionInfo, SearchResult
+from ..constants import (
+    COLLISION_TOLERANCE, 
+    MAX_CONTACTS_PER_SPHERE,
+    NUMERICAL_TOLERANCE
+)
 
 
 class SphereTriangleCollision:
@@ -25,9 +30,9 @@ class SphereTriangleCollision:
         self,
         mesh: TriangleMesh,
         mesh_attributes: Optional[MeshAttributes] = None,
-        collision_tolerance: float = 1e-6,      # 衝突判定の許容誤差
+        collision_tolerance: float = COLLISION_TOLERANCE,      # 衝突判定の許容誤差
         enable_face_culling: bool = False,      # 裏面カリング
-        max_contacts_per_sphere: int = 10       # 球あたりの最大接触点数
+        max_contacts_per_sphere: int = MAX_CONTACTS_PER_SPHERE       # 球あたりの最大接触点数
     ):
         """
         初期化
@@ -464,7 +469,7 @@ def calculate_contact_point(
 
 def point_triangle_distance(point: np.ndarray, triangle_vertices: np.ndarray) -> float:
     """
-    点と三角形の最短距離を計算
+    点と三角形の最短距離を計算（最適化版への移行）
     
     Args:
         point: 3D点の座標
@@ -473,14 +478,10 @@ def point_triangle_distance(point: np.ndarray, triangle_vertices: np.ndarray) ->
     Returns:
         最短距離
     """
-    # _closest_point_on_triangleはインスタンスメソッドなので、
-    # ダミーのインスタンスを作成して呼び出す
-    # TODO: _closest_point_on_triangleを静的メソッドにリファクタリングする
-    s_tri = SphereTriangleCollision(
-        TriangleMesh(vertices=np.zeros((0, 3)), triangles=np.zeros((0, 3)))
-    )
-    _, distance, _, _ = s_tri._closest_point_on_triangle(point, triangle_vertices)
-    return distance
+    # 最適化された距離計算を使用
+    from .distance import get_distance_calculator
+    calculator = get_distance_calculator()
+    return calculator.calculate_point_triangle_distance(point, triangle_vertices)
 
 
 def batch_collision_test(

@@ -35,8 +35,10 @@ try:
     from src.input.depth_filter import FilterType, DepthFilter
     
     # Orbbec SDK
-    from pyorbbecsdk import Pipeline, FrameSet, Config, OBSensorType, OBFormat
-    from pyorbbecsdk import OBError
+    from pyorbbecsdk import Pipeline, FrameSet, Config, OBSensorType, OBError
+    
+    # Import OBFormat from common types
+    from src.types import OBFormat
     
     # 地形メッシュ生成
     from src.mesh.projection import PointCloudProjector, ProjectionMethod
@@ -78,7 +80,12 @@ try:
     from src.sound.voice_mgr import create_voice_manager, allocate_and_play, StealStrategy
     from src.input.pointcloud import PointCloudConverter
     
+    # ロギング設定
+    from src import get_logger
+    logger = get_logger(__name__)
+    
 except ImportError as e:
+    # ロギングが利用できない場合は従来のprint()を使用
     print("Error: Could not import necessary modules")
     print(f"Details: {e}")
     sys.exit(1)
@@ -398,7 +405,7 @@ class FullPipelineViewer(DualViewer):
                            self.current_collision_points.append(cp.position)
                         print(f"[DEBUG] _detect_collisions: Hand {i} generated collision event with {len(info.contact_points)} contact points")
             except Exception as e:
-                print(f"[DEBUG] _detect_collisions: Error processing hand {i}: {e}")
+                logger.error(f"[DEBUG] _detect_collisions: Error processing hand {i}: {e}")
         
         print(f"[DEBUG] _detect_collisions: Total collision events: {len(events)}")
         return events
@@ -653,10 +660,7 @@ class FullPipelineViewer(DualViewer):
                 try:
                     from pyorbbecsdk import OBFormat
                 except ImportError:
-                    class OBFormat:
-                        RGB = "RGB"
-                        BGR = "BGR"
-                        MJPG = "MJPG"
+                    pass  # Use imported OBFormat from src.types
                 
                 color_image = None
                 if color_format == OBFormat.RGB:
@@ -1004,10 +1008,7 @@ class FullPipelineViewer(DualViewer):
                     try:
                         from pyorbbecsdk import OBFormat
                     except ImportError:
-                        class OBFormat:
-                            RGB = "RGB"
-                            BGR = "BGR"
-                            MJPG = "MJPG"
+                        pass  # Use imported OBFormat from src.types
                 
                     color_image = None
                     if color_format == OBFormat.RGB:
@@ -1075,11 +1076,7 @@ class FullPipelineViewer(DualViewer):
                 try:
                     from pyorbbecsdk import OBFormat
                 except ImportError:
-                    # テスト用モック
-                    class OBFormat:
-                        RGB = "RGB"
-                        BGR = "BGR"
-                        MJPG = "MJPG"
+                    pass  # Use imported OBFormat from src.types
                 
                 color_image = None
                 if color_format == OBFormat.RGB:

@@ -9,6 +9,14 @@ from typing import Optional, Tuple, Dict, Any
 from dataclasses import dataclass
 import numpy as np
 
+# 他フェーズとの連携  
+from ..types import FrameData, CameraIntrinsics
+
+# ロギング設定
+from src import get_logger
+from ..resource_manager import ManagedResource, get_resource_manager
+logger = get_logger(__name__)
+
 try:
     from pyorbbecsdk import *
 except ImportError:
@@ -49,16 +57,21 @@ class FrameData:
     frame_number: int = 0
 
 
-class OrbbecCamera:
-    """Orbbec カメラ抽象化クラス"""
+class OrbbecCamera(ManagedResource):
+    """Orbbec カメラ抽象化クラス（リソース管理対応）"""
     
-    def __init__(self, enable_color: bool = True):
+    def __init__(self, enable_color: bool = True, resource_id: Optional[str] = None):
         """
         初期化
         
         Args:
             enable_color: カラーストリームを有効にするか
+            resource_id: リソースID（自動生成される場合はNone）
         """
+        # ManagedResourceの初期化
+        resource_id = resource_id or f"orbbec_camera_{int(time.time() * 1000000)}"
+        super().__init__(resource_id)
+        
         self.pipeline: Optional[Pipeline] = None
         self.config: Optional[Config] = None
         self.depth_intrinsics: Optional[CameraIntrinsics] = None
@@ -67,6 +80,10 @@ class OrbbecCamera:
         self.is_started = False
         self.enable_color = enable_color
         self.frame_count = 0
+        
+        # リソースマネージャーに自動登録
+        manager = get_resource_manager()
+        manager.register_resource(self, memory_estimate=100 * 1024 * 1024)  # 100MB推定
         
     def initialize(self) -> bool:
         """
@@ -90,20 +107,20 @@ class OrbbecCamera:
             return True
             
         except Exception as e:
-            print(f"Camera initialization error: {e}")
+            logger.error(f"Camera initialization error: {e}")
             return False
     
     def _setup_depth_stream(self) -> bool:
         """深度ストリームを設定"""
         depth_profile_list = self.pipeline.get_stream_profile_list(OBSensorType.DEPTH_SENSOR)
         if depth_profile_list is None:
-            print("No depth sensor found!")
+            logger.error("No depth sensor found!")
             return False
         
         depth_profile = depth_profile_list.get_default_video_stream_profile()
         self.config.enable_stream(depth_profile)
         
-        print(f"Depth: {depth_profile.get_width()}x{depth_profile.get_height()}@{depth_profile.get_fps()}fps")
+        logger.info(f"Depth: {depth_profile.get_width()}x{depth_profile.get_height()}@{depth_profile.get_fps()}fps")
         
         # 深度カメラ内部パラメータ取得
         try:
@@ -116,11 +133,12 @@ class OrbbecCamera:
                 width=depth_profile.get_width(),
                 height=depth_profile.get_height()
             )
-            print(f"Depth intrinsics: fx={depth_intrinsic.fx}, fy={depth_intrinsic.fy}, "
+            logger.info(f"Depth intrinsics: fx={depth_intrinsic.fx}, fy={depth_intrinsic.fy}, "
                   f"cx={depth_intrinsic.cx}, cy={depth_intrinsic.cy}")
-        except Exception:
+        except (AttributeError, TypeError, ValueError) as e:
             # デフォルト値使用
-            print("Using default depth intrinsics")
+            logger.warning(f"Failed to get depth intrinsics, using defaults: {e}")
+            logger.info("Using default depth intrinsics")
             self.depth_intrinsics = CameraIntrinsics(
                 fx=depth_profile.get_width(),
                 fy=depth_profile.get_width(),
@@ -152,12 +170,14 @@ class OrbbecCamera:
                         width=color_profile.get_width(),
                         height=color_profile.get_height()
                     )
-                except Exception:
+                except (AttributeError, TypeError, ValueError) as e:
+                    logger.warning(f"Failed to get color intrinsics: {e}")
                     self.color_intrinsics = None
                 
-                print(f"Color: {color_profile.get_width()}x{color_profile.get_height()}@{color_profile.get_fps()}fps")
-        except Exception:
-            print("No color sensor available")
+                logger.info(f"Color: {color_profile.get_width()}x{color_profile.get_height()}@{color_profile.get_fps()}fps")
+        except (AttributeError, RuntimeError) as e:
+            logger.info(f"Color sensor setup failed (expected if no color sensor): {e}")
+            logger.info("No color sensor available")
             self.has_color = False
     
     def start(self) -> bool:
@@ -168,24 +188,58 @@ class OrbbecCamera:
             成功した場合True
         """
         if not self.pipeline or not self.config:
-            print("Camera not initialized")
+            logger.error("Camera not initialized")
             return False
             
         try:
             self.pipeline.start(self.config)
             self.is_started = True
-            print("Pipeline started!")
+            logger.info("Pipeline started!")
             return True
         except Exception as e:
-            print(f"Failed to start pipeline: {e}")
+            logger.error(f"Failed to start pipeline: {e}")
+            return False
+    
+    def cleanup(self) -> bool:
+        """リソースクリーンアップ（ManagedResourceインターフェース）"""
+        try:
+            self.stop()
+            if self.pipeline:
+                # パイプラインの完全なクリーンアップ
+                try:
+                    del self.pipeline
+                    self.pipeline = None
+                except Exception as e:
+                    logger.error(f"Error cleaning up pipeline: {e}")
+            
+            if self.config:
+                try:
+                    del self.config
+                    self.config = None
+                except Exception as e:
+                    logger.error(f"Error cleaning up config: {e}")
+            
+            self.depth_intrinsics = None
+            self.color_intrinsics = None
+            self.has_color = False
+            self.is_started = False
+            
+            logger.info(f"Camera resource cleaned up: {self.resource_id}")
+            return True
+        except Exception as e:
+            logger.error(f"Error in camera cleanup: {e}")
             return False
     
     def stop(self) -> None:
         """ストリーミング停止"""
         if self.pipeline and self.is_started:
-            self.pipeline.stop()
-            self.is_started = False
-            print("Pipeline stopped")
+            try:
+                self.pipeline.stop()
+                self.is_started = False
+                logger.info("Pipeline stopped")
+            except Exception as e:
+                logger.error(f"Error stopping pipeline: {e}")
+                self.is_started = False
     
     def get_frame(self, timeout_ms: int = 100) -> Optional[FrameData]:
         """
@@ -216,7 +270,7 @@ class OrbbecCamera:
             return frame_data
             
         except Exception as e:
-            print(f"Frame acquisition error: {e}")
+            logger.error(f"Frame acquisition error: {e}")
             return None
     
     def get_stats(self) -> Dict[str, Any]:
@@ -239,4 +293,18 @@ class OrbbecCamera:
     
     def __exit__(self, exc_type, exc_val, exc_tb):
         """コンテキストマネージャー: 終了"""
-        self.stop() 
+        self.stop()
+    
+    @property
+    def resource_type(self) -> str:
+        """リソースタイプ（ManagedResourceインターフェース）"""
+        return "orbbec_camera"
+    
+    def get_memory_usage(self) -> int:
+        """メモリ使用量を取得（ManagedResourceインターフェース）"""
+        # 概算値の計算
+        base_memory = 50 * 1024 * 1024  # 50MB基本
+        if self.has_color:
+            base_memory += 30 * 1024 * 1024  # カラーで+30MB
+        frame_buffer_memory = self.frame_count * 1024  # 1KB/フレーム
+        return base_memory + frame_buffer_memory 

@@ -1,34 +1,69 @@
 #!/usr/bin/env python3
 """
-Geocussion-SP 手検出フェーズ統合デモ（DualViewer使用）
-拡張されたDualViewerを使用した手検出機能付きリアルタイム処理
+Geocussion-SP 手検出フェーズ統合デモ（互換性エイリアス）
+
+注意: このスクリプトは互換性のために残されています。
+新しい統一デモシステムを使用することを推奨します:
+    python demo_unified.py --mode hands
 
 使用方法:
     python demo_hand_detection.py
-
-機能:
-    - RGB画像 + 深度画像 + 3D点群の同時表示
-    - 2D手検出 (MediaPipe) with RGB画像での可視化
-    - 3D投影 (深度マップ参照)
-    - カルマンフィルタによるトラッキング
-    - リアルタイムパフォーマンス計測
 """
 
 import sys
 import os
-import argparse
 
 # プロジェクトルートをパスに追加
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, PROJECT_ROOT)
 
+print("【互換性モード】demo_hand_detection.py")
+print("新しい統一デモシステムにリダイレクトしています...")
+print("今後は 'python demo_unified.py --mode hands' をご使用ください。")
+print()
+
+# 引数を統一システム用に変換
+unified_args = ['--mode', 'hands']
+
+# 既存の引数を統一システムの引数に変換
+original_args = sys.argv[1:]
+for arg in original_args:
+    if arg == '--test':
+        unified_args.append('--test')
+    elif arg == '--no-filter':
+        unified_args.append('--no-filter')
+    elif arg == '--no-hand-detection':
+        unified_args.append('--no-hand-detection')
+    elif arg == '--no-tracking':
+        unified_args.append('--no-tracking')
+    elif arg == '--gpu-mediapipe':
+        unified_args.append('--gpu')
+    elif arg.startswith('--min-confidence='):
+        confidence = arg.split('=')[1]
+        unified_args.extend(['--detection-confidence', confidence])
+    elif arg.startswith('--update-interval='):
+        interval = arg.split('=')[1]
+        unified_args.extend(['--update-interval', interval])
+    elif arg.startswith('--point-size='):
+        size = arg.split('=')[1]
+        unified_args.extend(['--point-size', size])
+    elif arg.startswith('--window-width='):
+        width = arg.split('=')[1]
+        unified_args.extend(['--window-width', width])
+    elif arg.startswith('--window-height='):
+        height = arg.split('=')[1]
+        unified_args.extend(['--window-height', height])
+
+# 統一システムに移譲
+sys.argv = ['demo_unified.py'] + unified_args
+
 try:
-    from src.debug.dual_viewer import DualViewer
-    from src.input.depth_filter import FilterType
-    
+    from src.demo.runner import main
+    exit_code = main()
+    sys.exit(exit_code)
 except ImportError as e:
-    print(f"Import error: {e}")
-    print("Please ensure all dependencies are installed and the project structure is correct.")
+    print(f"エラー: 統一デモシステムを読み込めません: {e}")
+    print("demo_unified.py を直接実行してください。")
     sys.exit(1)
 
 

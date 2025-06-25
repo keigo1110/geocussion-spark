@@ -77,7 +77,7 @@ def create_test_mesh(complexity: str = "medium") -> TriangleMesh:
 
 def test_search_performance():
     """空間検索のパフォーマンステスト"""
-    print("\n=== 空間検索パフォーマンステスト ===")
+    logger.info("\n=== 空間検索パフォーマンステスト ===")
     
     # 異なる複雑度のメッシュでテスト
     complexities = ["simple", "medium", "complex"]
@@ -87,7 +87,7 @@ def test_search_performance():
         spatial_index = SpatialIndex(mesh, index_type=IndexType.BVH)
         searcher = CollisionSearcher(spatial_index, default_radius=0.1)
         
-        print(f"\n{complexity.upper()}メッシュ ({mesh.num_triangles}三角形):")
+        logger.info(f"\n{complexity.upper()}メッシュ ({mesh.num_triangles}三角形):")
         
         # 複数の手位置でテスト
         hand_positions = [
@@ -107,19 +107,19 @@ def test_search_performance():
             elapsed = (time.perf_counter() - start_time) * 1000
             
             times.append(elapsed)
-            print(f"  手 {i+1}: {elapsed:.3f}ms, 見つかった三角形: {len(result.triangle_indices)}")
+            logger.info(f"  手 {i+1}: {elapsed:.3f}ms, 見つかった三角形: {len(result.triangle_indices)}")
         
         avg_time = np.mean(times)
         max_time = np.max(times)
         
-        print(f"  平均時間: {avg_time:.3f}ms")
-        print(f"  最大時間: {max_time:.3f}ms")
-        print(f"  目標達成: {'✓' if max_time < 2.0 else '✗'} (目標: 2ms以内)")
+        logger.info(f"  平均時間: {avg_time:.3f}ms")
+        logger.info(f"  最大時間: {max_time:.3f}ms")
+        logger.info(f"  目標達成: {'✓' if max_time < 2.0 else '✗'} (目標: 2ms以内)")
 
 
 def test_collision_performance():
     """衝突判定のパフォーマンステスト"""
-    print("\n=== 衝突判定パフォーマンステスト ===")
+    logger.info("\n=== 衝突判定パフォーマンステスト ===")
     
     mesh = create_test_mesh("medium")
     spatial_index = SpatialIndex(mesh, index_type=IndexType.BVH)
@@ -156,20 +156,20 @@ def test_collision_performance():
         if collision_info.has_collision:
             collisions += 1
         
-        print(f"  球 {i+1}: {elapsed:.3f}ms, 衝突: {'あり' if collision_info.has_collision else 'なし'}")
+        logger.info(f"  球 {i+1}: {elapsed:.3f}ms, 衝突: {'あり' if collision_info.has_collision else 'なし'}")
     
     avg_time = np.mean(times)
     max_time = np.max(times)
     
-    print(f"\n  平均時間: {avg_time:.3f}ms")
-    print(f"  最大時間: {max_time:.3f}ms")
-    print(f"  衝突検出数: {collisions}/{len(sphere_positions)}")
-    print(f"  目標達成: {'✓' if max_time < 2.0 else '✗'} (目標: 2ms以内)")
+    logger.info(f"\n  平均時間: {avg_time:.3f}ms")
+    logger.info(f"  最大時間: {max_time:.3f}ms")
+    logger.info(f"  衝突検出数: {collisions}/{len(sphere_positions)}")
+    logger.info(f"  目標達成: {'✓' if max_time < 2.0 else '✗'} (目標: 2ms以内)")
 
 
 def test_event_performance():
     """イベント生成のパフォーマンステスト"""
-    print("\n=== イベント生成パフォーマンステスト ===")
+    logger.info("\n=== イベント生成パフォーマンステスト ===")
     
     event_queue = CollisionEventQueue()
     
@@ -213,20 +213,20 @@ def test_event_performance():
         if event:
             events_created += 1
         
-        print(f"  イベント {i+1}: {elapsed:.3f}ms")
+        logger.info(f"  イベント {i+1}: {elapsed:.3f}ms")
     
     avg_time = np.mean(times)
     max_time = np.max(times)
     
-    print(f"\n  平均時間: {avg_time:.3f}ms")
-    print(f"  最大時間: {max_time:.3f}ms")
-    print(f"  作成イベント数: {events_created}/{len(test_collisions)}")
-    print(f"  目標達成: {'✓' if max_time < 1.0 else '✗'} (目標: 1ms以内)")
+    logger.info(f"\n  平均時間: {avg_time:.3f}ms")
+    logger.info(f"  最大時間: {max_time:.3f}ms")
+    logger.info(f"  作成イベント数: {events_created}/{len(test_collisions)}")
+    logger.info(f"  目標達成: {'✓' if max_time < 1.0 else '✗'} (目標: 1ms以内)")
 
 
 def test_full_pipeline_performance():
     """フル・パイプラインのパフォーマンステスト"""
-    print("\n=== フル・パイプライン・パフォーマンステスト ===")
+    logger.info("\n=== フル・パイプライン・パフォーマンステスト ===")
     
     # メッシュと各コンポーネントを初期化
     mesh = create_test_mesh("medium")
@@ -248,7 +248,7 @@ def test_full_pipeline_performance():
     total_times = []
     total_events = 0
     
-    print(f"\n  {len(hands)}個の手を処理:")
+    logger.info(f"\n  {len(hands)}個の手を処理:")
     
     for frame in range(3):  # 3フレーム処理
         frame_start = time.perf_counter()
@@ -275,35 +275,35 @@ def test_full_pipeline_performance():
             if event:
                 frame_events += 1
             
-            print(f"    {hand.hand_id}: {pipeline_time:.3f}ms")
+            logger.info(f"    {hand.hand_id}: {pipeline_time:.3f}ms")
         
         frame_time = (time.perf_counter() - frame_start) * 1000
         total_times.append(frame_time)
         total_events += frame_events
         
-        print(f"  フレーム {frame+1}: {frame_time:.3f}ms, イベント: {frame_events}")
+        logger.info(f"  フレーム {frame+1}: {frame_time:.3f}ms, イベント: {frame_events}")
     
     avg_frame_time = np.mean(total_times)
     max_frame_time = np.max(total_times)
     
-    print(f"\n  平均フレーム時間: {avg_frame_time:.3f}ms")
-    print(f"  最大フレーム時間: {max_frame_time:.3f}ms")
-    print(f"  総イベント数: {total_events}")
-    print(f"  目標達成: {'✓' if max_frame_time < 5.0 else '✗'} (目標: 5ms以内)")
+    logger.info(f"\n  平均フレーム時間: {avg_frame_time:.3f}ms")
+    logger.info(f"  最大フレーム時間: {max_frame_time:.3f}ms")
+    logger.info(f"  総イベント数: {total_events}")
+    logger.info(f"  目標達成: {'✓' if max_frame_time < 5.0 else '✗'} (目標: 5ms以内)")
     
     # パフォーマンス統計の表示
-    print(f"\n  コンポーネント統計:")
+    logger.info(f"\n  コンポーネント統計:")
     search_stats = searcher.get_performance_stats()
     collision_stats = collision_tester.get_performance_stats()
     
-    print(f"    検索: 平均 {search_stats.get('average_search_time_ms', 0):.3f}ms")
-    print(f"    衝突: 平均 {collision_stats.get('average_test_time_ms', 0):.3f}ms")
+    logger.info(f"    検索: 平均 {search_stats.get('average_search_time_ms', 0):.3f}ms")
+    logger.info(f"    衝突: 平均 {collision_stats.get('average_test_time_ms', 0):.3f}ms")
 
 
 def main():
     """メインテスト実行関数"""
-    print("衝突検出フェーズ パフォーマンステスト開始")
-    print("=" * 50)
+    logger.info("衝突検出フェーズ パフォーマンステスト開始")
+    logger.info("=" * 50)
     
     try:
         test_search_performance()
@@ -311,12 +311,12 @@ def main():
         test_event_performance()
         test_full_pipeline_performance()
         
-        print("\n" + "=" * 50)
-        print("パフォーマンステスト完了")
+        logger.info("\n" + "=" * 50)
+        logger.info("パフォーマンステスト完了")
         return True
         
     except Exception as e:
-        print(f"\nテスト中にエラーが発生: {e}")
+        logger.info(f"\nテスト中にエラーが発生: {e}")
         import traceback
         traceback.print_exc()
         return False

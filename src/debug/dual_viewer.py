@@ -19,6 +19,7 @@ sys.path.append(os.path.join(os.path.dirname(__file__), '..', '..'))
 from src.input.stream import OrbbecCamera, FrameData, CameraIntrinsics
 from src.input.pointcloud import PointCloudConverter
 from src.input.depth_filter import DepthFilter, FilterType
+from src.types import OBFormat
 
 # 手検出フェーズ
 from src.detection.hands2d import MediaPipeHandsWrapper, HandednessType, filter_hands_by_confidence
@@ -338,14 +339,11 @@ class DualViewer:
                 
                 # フォーマットに応じた変換
                 if hasattr(frame_data.color_frame, 'get_format'):
+                    color_format = frame_data.color_frame.get_format()
                     try:
                         from pyorbbecsdk import OBFormat
                     except ImportError:
-                        # テスト用モック
-                        class OBFormat:
-                            RGB = "RGB"
-                            BGR = "BGR"
-                            MJPG = "MJPG"
+                        pass  # Use the imported OBFormat from src.types
                     
                     if color_format == OBFormat.RGB:
                         color_image = color_data.reshape((self.camera.depth_intrinsics.height, self.camera.depth_intrinsics.width, 3))
@@ -555,10 +553,7 @@ class DualViewer:
             try:
                 from pyorbbecsdk import OBFormat
             except ImportError:
-                class OBFormat:
-                    RGB = "RGB"
-                    BGR = "BGR"
-                    MJPG = "MJPG"
+                pass  # Use the imported OBFormat from src.types
             
             if color_format == OBFormat.RGB:
                 rgb_image = color_data.reshape((self.camera.depth_intrinsics.height, self.camera.depth_intrinsics.width, 3))

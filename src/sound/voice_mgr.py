@@ -18,6 +18,10 @@ import numpy as np
 from .mapping import AudioParameters, InstrumentType
 from .synth import AudioSynthesizer
 
+# ロギング設定
+from src import get_logger
+logger = get_logger(__name__)
+
 
 class VoiceState(Enum):
     """ボイス状態の列挙"""
@@ -151,7 +155,7 @@ class VoiceManager:
         # スレッド安全性
         self._lock = threading.Lock()
         
-        print(f"VoiceManager initialized: max_polyphony={max_polyphony}, strategy={steal_strategy.value}")
+        logger.info(f"VoiceManager initialized: max_polyphony={max_polyphony}, strategy={steal_strategy.value}")
     
     def allocate_voice(
         self,
@@ -226,9 +230,8 @@ class VoiceManager:
                 return voice_id
                 
             except Exception as e:
-                import traceback
-                print(f"Error allocating voice: {e}")
-                print(f"Traceback: {traceback.format_exc()}")
+                logger.error(f"Error allocating voice: {e}")
+                logger.error(f"Traceback: {traceback.format_exc()}")
                 return None
     
     def deallocate_voice(self, voice_id: str, fade_out: bool = True):
@@ -260,7 +263,7 @@ class VoiceManager:
                         self.instrument_voices[instrument].remove(voice_id)
             
             except Exception as e:
-                print(f"Error deallocating voice {voice_id}: {e}")
+                logger.error(f"Error deallocating voice {voice_id}: {e}")
     
     def update_voice_parameters(
         self,
@@ -324,21 +327,22 @@ class VoiceManager:
                     try:
                         if voice_info.estimated_remaining_time <= 0.1:  # 100ms余裕を持たせる
                             finished_voices.append(voice_id)
-                    except Exception:
+                    except (AttributeError, TypeError, ValueError) as e:
                         # 時間計算でエラーが出た場合も削除対象とする
+                        logger.warning(f"Voice time calculation error for {voice_id}: {e}")
                         finished_voices.append(voice_id)
             except Exception as e:
-                print(f"[VOICE-CLEANUP] Error during voice scan: {e}")
+                logger.error(f"[VOICE-CLEANUP] Error during voice scan: {e}")
                 return
         
         # 2. ロック外で安全にクリーンアップ
         if finished_voices:
-            print(f"[VOICE-CLEANUP] Cleaning up {len(finished_voices)} finished voices")
+            logger.info(f"[VOICE-CLEANUP] Cleaning up {len(finished_voices)} finished voices")
             for voice_id in finished_voices:
                 try:
                     self.deallocate_voice(voice_id, fade_out=False)
                 except Exception as e:
-                    print(f"[VOICE-CLEANUP] Error cleaning voice {voice_id}: {e}")
+                    logger.error(f"[VOICE-CLEANUP] Error cleaning voice {voice_id}: {e}")
     
     def _steal_voice(self, new_audio_params: AudioParameters, new_priority: int) -> Optional[str]:
         """
@@ -553,7 +557,7 @@ class VoiceManager:
             for instrument in self.instrument_voices:
                 self.instrument_voices[instrument].clear()
             
-            print(f"Stopped all {len(voice_ids_to_stop)} voices.")
+            logger.info(f"Stopped all {len(voice_ids_to_stop)} voices.")
 
 
 # 便利関数
