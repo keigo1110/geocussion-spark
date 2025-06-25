@@ -81,9 +81,9 @@ class TestCollisionSearch(unittest.TestCase):
         self.assertIsInstance(result, SearchResult)
         # 検索結果があることを確認（半径を大きくしたので見つかるはず）
         if len(result.triangle_indices) == 0:
-            print(f"No triangles found at position {position} with radius 0.5")
-            print(f"Mesh has {self.mesh.num_triangles} triangles")
-            print(f"Triangle vertices: {self.mesh.vertices}")
+            logger.info(f"No triangles found at position {position} with radius 0.5")
+            logger.info(f"Mesh has {self.mesh.num_triangles} triangles")
+            logger.info(f"Triangle vertices: {self.mesh.vertices}")
         
         self.assertLess(result.search_time_ms, 10.0)
 
@@ -225,7 +225,7 @@ class TestCollisionEventQueue(unittest.TestCase):
 
 def run_collision_tests():
     """衝突検出テスト実行"""
-    print("=== 衝突検出テスト実行 ===")
+    logger.info("=== 衝突検出テスト実行 ===")
     
     loader = unittest.TestLoader()
     suite = unittest.TestSuite()
@@ -238,10 +238,10 @@ def run_collision_tests():
     runner = unittest.TextTestRunner(verbosity=2)
     result = runner.run(suite)
     
-    print(f"\n=== テスト結果要約 ===")
-    print(f"実行テスト: {result.testsRun}")
-    print(f"失敗: {len(result.failures)}")
-    print(f"エラー: {len(result.errors)}")
+    logger.info(f"\n=== テスト結果要約 ===")
+    logger.info(f"実行テスト: {result.testsRun}")
+    logger.info(f"失敗: {len(result.failures)}")
+    logger.info(f"エラー: {len(result.errors)}")
     
     return result.wasSuccessful()
 
