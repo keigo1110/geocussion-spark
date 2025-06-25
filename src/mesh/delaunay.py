@@ -341,65 +341,17 @@ class DelaunayTriangulator:
         return True
     
     def _filter_low_quality_triangles(self, mesh: TriangleMesh) -> TriangleMesh:
-        """低品質な三角形を除去"""
-        if mesh.num_triangles == 0:
-            return mesh
-        
-        # 三角形品質を計算
-        qualities = self._calculate_triangle_qualities(mesh)
-        
-        # 閾値以上の品質の三角形のみを保持
-        good_triangles_mask = qualities >= self.quality_threshold
-        good_triangles = mesh.triangles[good_triangles_mask]
-        
-        if len(good_triangles) == 0:
-            # 全て除去された場合は元のメッシュを返す
-            return mesh
-        
-        # 使用される頂点のみを保持
-        used_vertices = np.unique(good_triangles.flatten())
-        new_vertices = mesh.vertices[used_vertices]
-        
-        # 三角形インデックスを再マッピング
-        vertex_map = {old_idx: new_idx for new_idx, old_idx in enumerate(used_vertices)}
-        new_triangles = np.array([
-            [vertex_map[tri[0]], vertex_map[tri[1]], vertex_map[tri[2]]]
-            for tri in good_triangles
-        ])
-        
-        return TriangleMesh(
-            vertices=new_vertices,
-            triangles=new_triangles
-        )
+        """低品質な三角形を除去（ベクトル化版）"""
+        # 最適化されたベクトル化処理を使用
+        from .vectorized import get_mesh_processor
+        processor = get_mesh_processor()
+        return processor.filter_triangles_by_quality(mesh, self.quality_threshold)
     
     def _calculate_triangle_qualities(self, mesh: TriangleMesh) -> np.ndarray:
-        """三角形の品質を計算（0-1、1が最高品質）"""
-        qualities = []
-        
-        for triangle in mesh.triangles:
-            v0, v1, v2 = mesh.vertices[triangle]
-            
-            # エッジ長
-            edge_lengths = [
-                np.linalg.norm(v1 - v0),
-                np.linalg.norm(v2 - v1),
-                np.linalg.norm(v0 - v2)
-            ]
-            
-            # 面積
-            edge1 = v1 - v0
-            edge2 = v2 - v0
-            cross = np.cross(edge1[:2], edge2[:2])
-            area = abs(cross) / 2.0
-            
-            # 品質指標（面積 / 最長エッジ^2）
-            max_edge = max(edge_lengths)
-            quality = (4 * np.sqrt(3) * area) / (sum(e*e for e in edge_lengths))
-            quality = max(0.0, min(1.0, quality))  # 0-1にクランプ
-            
-            qualities.append(quality)
-        
-        return np.array(qualities)
+        """三角形の品質を計算（ベクトル化版）"""
+        # 最適化されたベクトル化処理を使用
+        from .vectorized import vectorized_triangle_qualities
+        return vectorized_triangle_qualities(mesh)
     
     def _calculate_mesh_quality(self, mesh: TriangleMesh) -> float:
         """メッシュ全体の品質を計算"""

@@ -231,18 +231,30 @@ class CollisionSearcher:
         return self.default_radius
     
     def _calculate_distances(self, point: np.ndarray, triangle_indices: List[int]) -> List[float]:
-        """点と各三角形の正確な最短距離を計算"""
+        """点と各三角形の正確な最短距離を計算（最適化版）"""
         distances = []
         if not triangle_indices:
             return distances
         
+        # 最適化された距離計算を使用
+        from .distance import get_distance_calculator
+        calculator = get_distance_calculator()
+        
         mesh_vertices = self.spatial_index.mesh.vertices
         mesh_triangles = self.spatial_index.mesh.triangles
         
-        for tri_idx in triangle_indices:
-            triangle_vertices = mesh_vertices[mesh_triangles[tri_idx]]
-            dist = point_triangle_distance(point, triangle_vertices)
-            distances.append(dist)
+        # バッチ計算が可能な場合はそれを使用
+        if len(triangle_indices) > 3:  # バッチ化の閾値
+            triangle_vertices_batch = mesh_vertices[mesh_triangles[triangle_indices]]  # (M, 3, 3)
+            points_batch = np.array([point])  # (1, 3)
+            distance_matrix = calculator.calculate_batch_distances(points_batch, triangle_vertices_batch)
+            distances = distance_matrix[0].tolist()
+        else:
+            # 少数の場合は従来通り個別計算
+            for tri_idx in triangle_indices:
+                triangle_vertices = mesh_vertices[mesh_triangles[tri_idx]]
+                dist = calculator.calculate_point_triangle_distance(point, triangle_vertices)
+                distances.append(dist)
             
         return distances
     

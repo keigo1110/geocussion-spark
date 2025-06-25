@@ -469,7 +469,7 @@ def calculate_contact_point(
 
 def point_triangle_distance(point: np.ndarray, triangle_vertices: np.ndarray) -> float:
     """
-    点と三角形の最短距離を計算
+    点と三角形の最短距離を計算（最適化版への移行）
     
     Args:
         point: 3D点の座標
@@ -478,14 +478,10 @@ def point_triangle_distance(point: np.ndarray, triangle_vertices: np.ndarray) ->
     Returns:
         最短距離
     """
-    # _closest_point_on_triangleはインスタンスメソッドなので、
-    # ダミーのインスタンスを作成して呼び出す
-    # TODO: _closest_point_on_triangleを静的メソッドにリファクタリングする
-    s_tri = SphereTriangleCollision(
-        TriangleMesh(vertices=np.zeros((0, 3)), triangles=np.zeros((0, 3)))
-    )
-    _, distance, _, _ = s_tri._closest_point_on_triangle(point, triangle_vertices)
-    return distance
+    # 最適化された距離計算を使用
+    from .distance import get_distance_calculator
+    calculator = get_distance_calculator()
+    return calculator.calculate_point_triangle_distance(point, triangle_vertices)
 
 
 def batch_collision_test(
