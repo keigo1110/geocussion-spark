@@ -13,7 +13,7 @@ import weakref
 import gc
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Callable, Any, Set, TypeVar, Generic
+from typing import Dict, List, Optional, Callable, Any, Set, TypeVar, Generic, Generator
 from contextlib import contextmanager
 from enum import Enum, auto
 
@@ -58,7 +58,7 @@ class ResourceInfo:
         """最終アクセスからの経過時間"""
         return time.perf_counter() - self.last_accessed
     
-    def touch(self):
+    def touch(self) -> None:
         """最終アクセス時刻を更新"""
         self.last_accessed = time.perf_counter()
 
@@ -92,22 +92,22 @@ class ManagedResource(ABC):
         """リソースタイプを取得"""
         pass
     
-    def register_with_manager(self, manager: 'ResourceManager'):
+    def register_with_manager(self, manager: 'ResourceManager') -> None:
         """リソースマネージャーに登録"""
         self._resource_manager = manager
         self._is_registered = True
     
-    def __enter__(self):
+    def __enter__(self) -> 'ManagedResource':
         """コンテキストマネージャー開始"""
         if not self.initialize():
             raise RuntimeError(f"Failed to initialize resource: {self.resource_id}")
         return self
     
-    def __exit__(self, exc_type, exc_val, exc_tb):
+    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
         """コンテキストマネージャー終了"""
         self.cleanup()
     
-    def __del__(self):
+    def __del__(self) -> None:
         """デストラクタ"""
         try:
             if self._is_registered and self._resource_manager:
@@ -344,7 +344,7 @@ class ResourceManager:
         
         return cleaned_count
     
-    def shutdown_all(self):
+    def shutdown_all(self) -> None:
         """全リソースを強制シャットダウン"""
         logger.info("Shutting down all resources...")
         
@@ -378,9 +378,9 @@ class ResourceManager:
         
         logger.info("All resources shutdown complete")
     
-    def _start_cleanup_thread(self):
+    def _start_cleanup_thread(self) -> None:
         """自動クリーンアップスレッドを開始"""
-        def cleanup_worker():
+        def cleanup_worker() -> None:
             while not self._stop_cleanup.wait(self.cleanup_interval_seconds):
                 try:
                     self.cleanup_idle_resources()
@@ -396,7 +396,7 @@ class ResourceManager:
     def get_stats(self) -> Dict[str, Any]:
         """統計情報を取得"""
         with self._lock:
-            stats = self.stats.copy()
+            stats: Dict[str, Any] = self.stats.copy()
             stats.update({
                 'active_resources': {
                     resource_id: {
@@ -413,7 +413,7 @@ class ResourceManager:
         return stats
     
     @contextmanager
-    def managed_resource(self, resource: ManagedResource, **kwargs):
+    def managed_resource(self, resource: ManagedResource, **kwargs: Any) -> Generator[ManagedResource, None, None]:
         """コンテキストマネージャーでリソース管理"""
         try:
             if self.register_resource(resource, **kwargs):
@@ -440,7 +440,7 @@ def get_resource_manager() -> ResourceManager:
                 _global_resource_manager = ResourceManager()
     return _global_resource_manager
 
-def shutdown_resource_manager():
+def shutdown_resource_manager() -> None:
     """グローバルリソースマネージャーをシャットダウン"""
     global _global_resource_manager
     if _global_resource_manager is not None:
@@ -448,7 +448,7 @@ def shutdown_resource_manager():
         _global_resource_manager = None
 
 @contextmanager
-def managed_resource(resource: ManagedResource, **kwargs):
+def managed_resource(resource: ManagedResource, **kwargs: Any) -> Generator[ManagedResource, None, None]:
     """グローバルマネージャーでリソース管理"""
     manager = get_resource_manager()
     with manager.managed_resource(resource, **kwargs) as managed:

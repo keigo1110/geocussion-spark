@@ -86,7 +86,7 @@ def get_logger(name: str) -> logging.Logger:
 # デフォルト設定の初期化
 _default_logger_initialized = False
 
-def ensure_default_logging():
+def ensure_default_logging() -> None:
     """デフォルトロギングが初期化されていることを確認"""
     global _default_logger_initialized
     if not _default_logger_initialized:

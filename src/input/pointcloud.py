@@ -6,18 +6,15 @@ numpy 最適化とゼロコピー転送対応
 """
 
 import time
-from typing import Optional, Tuple, Union
+from typing import Optional, Tuple, Union, Any
 import numpy as np
 import cv2
 
 try:
     from pyorbbecsdk import OBFormat
 except ImportError:
-    # テスト用のモック定義
-    class OBFormat:
-        RGB = "RGB"
-        BGR = "BGR"
-        MJPG = "MJPG"
+    # テスト用のモック定義（types.pyのOBFormatと統合）
+    from .types import OBFormat
 
 from .stream import CameraIntrinsics, FrameData
 
@@ -55,8 +52,8 @@ class PointCloudConverter:
     
     def depth_to_pointcloud(
         self,
-        depth_frame,
-        color_frame=None,
+        depth_frame: Any,
+        color_frame: Optional[Any] = None,
         depth_scale: Optional[float] = None,
         min_depth: float = 0.1,
         max_depth: float = 10.0
@@ -77,7 +74,7 @@ class PointCloudConverter:
         start_time = time.perf_counter()
         
         # 深度データ取得
-        depth_data = np.frombuffer(depth_frame.get_data(), dtype=np.uint16)
+        depth_data: np.ndarray = np.frombuffer(depth_frame.get_data(), dtype=np.uint16)
         depth_image = depth_data.reshape(
             (self.depth_intrinsics.height, self.depth_intrinsics.width)
         )
@@ -112,7 +109,7 @@ class PointCloudConverter:
         
         return points, colors
     
-    def _extract_colors(self, color_frame, valid_mask: np.ndarray) -> Optional[np.ndarray]:
+    def _extract_colors(self, color_frame: Any, valid_mask: np.ndarray) -> Optional[np.ndarray]:
         """
         カラーフレームからカラー情報を抽出
         
@@ -124,21 +121,20 @@ class PointCloudConverter:
             カラー配列 (N, 3) または None
         """
         try:
-            color_data = np.frombuffer(color_frame.get_data(), dtype=np.uint8)
+            color_data: np.ndarray = np.frombuffer(color_frame.get_data(), dtype=np.uint8)
             color_format = color_frame.get_format()
             
             # フォーマットに応じた処理
+            color_image = None
             if color_format == OBFormat.RGB:
                 color_image = color_data.reshape((self.depth_intrinsics.height, self.depth_intrinsics.width, 3))
             elif color_format == OBFormat.BGR:
                 color_image = color_data.reshape((self.depth_intrinsics.height, self.depth_intrinsics.width, 3))
                 color_image = cv2.cvtColor(color_image, cv2.COLOR_BGR2RGB)
             elif color_format == OBFormat.MJPG:
-                color_image = cv2.imdecode(color_data, cv2.IMREAD_COLOR)
-                if color_image is not None:
-                    color_image = cv2.cvtColor(color_image, cv2.COLOR_BGR2RGB)
-            else:
-                return None
+                decoded_image = cv2.imdecode(color_data, cv2.IMREAD_COLOR)
+                if decoded_image is not None:
+                    color_image = cv2.cvtColor(decoded_image, cv2.COLOR_BGR2RGB)
             
             if color_image is None:
                 return None
@@ -151,7 +147,7 @@ class PointCloudConverter:
                 )
             
             # 有効点のカラーを抽出（正規化）
-            colors = color_image[valid_mask].astype(np.float32) / 255.0
+            colors: np.ndarray = color_image[valid_mask].astype(np.float32) / 255.0
             return colors
             
         except Exception as e:
@@ -235,7 +231,7 @@ def create_converter_from_frame_data(frame_data: FrameData, depth_intrinsics: Ca
 
 
 # 互換性のための関数（既存コードとの互換性保持）
-def depth_to_pointcloud(depth_frame, camera_intrinsic, color_frame=None):
+def depth_to_pointcloud(depth_frame: Any, camera_intrinsic: Any, color_frame: Optional[Any] = None) -> Tuple[np.ndarray, Optional[np.ndarray]]:
     """
     レガシー互換関数
     既存のpoint_cloud_realtime_viewer.pyとの互換性のため

@@ -74,10 +74,19 @@ issues:
 
   - id: code-003
     title: 型ヒントの欠落・不統一
+    status: ✅ 完了 (2025-06-25)
     location: 入力 / サウンド系モジュールなど
     description: 一部関数で戻り値・引数の型が未定義。mypy で型安全性を担保できない。
     impact: 低〜中
     recommendation: PEP 484 準拠の型注釈を追加し、CI で mypy を実行。
+    completion_notes: |
+      ✅ mypy.ini設定ファイル作成（段階的型検査対応）
+      ✅ src/resource_manager.py: 全メソッドの型注釈完成（touch, register_with_manager, __enter__, __exit__, __del__, shutdown_all, _start_cleanup_thread, managed_resource）
+      ✅ src/__init__.py: ensure_default_logging関数の型注釈完成
+      ✅ src/input/pointcloud.py: 完全型注釈対応（depth_frame: Any, color_frame: Optional[Any], 戻り値型指定）
+      ✅ requirements.txt: mypy>=1.8.0, types-PyYAML, types-setuptools追加
+      ✅ Generator[ManagedResource, None, None]型注釈でcontextmanager対応
+      ✅ 既存機能への影響なし確認済み（python3 demo_collision_detection.py --test）
 
   - id: code-004
     title: CollisionEventQueue の設計不備
@@ -181,15 +190,35 @@ next_actions:
   - 低: さらなる型注釈とパフォーマンスチューニング。
 
 progress_summary:
-  completed: 6
+  completed: 7
   partial_completed: 1
   total_issues: 12
-  completion_rate: "50.0% (full) + 8.3% (partial) = 58.3%"
-  last_updated: "2025-06-25 22:16"
-  next_priority: "code-003 (型ヒント不統一) - 中優先度コード品質改善"
+  completion_rate: "58.3% (full) + 8.3% (partial) = 66.6%"
+  last_updated: "2025-06-25 22:27"
+  next_priority: "arch-002 (デモファイル重複) または perf-002 (numpy配列効率化) - 中優先度構造改善"
 
 # 最新更新記録  
 latest_changes:
+  - step: 10
+    description: "型ヒント不統一の解決とmypy型安全性基盤の構築 (code-003)"
+    files_modified:
+      - "mypy.ini"
+      - "requirements.txt"
+      - "src/resource_manager.py"
+      - "src/__init__.py"
+      - "src/input/pointcloud.py"
+      - "inst/20250625-ref.yaml"
+    completion_status: "completed"
+    issues_resolved:
+      - "code-003"
+    validation: "Tested with python3 demo_collision_detection.py --test, mypy type checking"
+    type_safety_improvements:
+      - "mypy設定ファイル（段階的型検査・外部ライブラリ対応）"
+      - "統一リソース管理システムの完全型注釈"
+      - "ロギングシステムの型安全性向上"  
+      - "点群変換モジュールの型注釈完成"
+      - "contextmanager Generator型注釈対応"
+      - "IDE開発効率向上・バグ早期発見基盤構築"
   - step: 9
     description: "Clean Architecture implementation for Viewer class bloat (arch-001)"
     files_modified:

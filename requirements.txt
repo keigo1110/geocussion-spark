@@ -30,6 +30,11 @@ matplotlib>=3.8.0,<4.0.0
 pytest>=7.0.0,<8.0.0
 pytest-cov>=4.0.0,<5.0.0
 
+# Type Checking
+mypy>=1.8.0,<2.0.0
+types-PyYAML>=6.0.0
+types-setuptools>=69.0.0
+
 # Optional GUI Dependencies (for pyo)
 # wxPython>=4.2.0  # Uncomment if GUI features are needed
 
