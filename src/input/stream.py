@@ -9,6 +9,13 @@ from typing import Optional, Tuple, Dict, Any
 from dataclasses import dataclass
 import numpy as np
 
+# 他フェーズとの連携  
+from .types import FrameData, CameraIntrinsics
+
+# ロギング設定
+from src import get_logger
+logger = get_logger(__name__)
+
 try:
     from pyorbbecsdk import *
 except ImportError:
@@ -90,20 +97,20 @@ class OrbbecCamera:
             return True
             
         except Exception as e:
-            print(f"Camera initialization error: {e}")
+            logger.error(f"Camera initialization error: {e}")
             return False
     
     def _setup_depth_stream(self) -> bool:
         """深度ストリームを設定"""
         depth_profile_list = self.pipeline.get_stream_profile_list(OBSensorType.DEPTH_SENSOR)
         if depth_profile_list is None:
-            print("No depth sensor found!")
+            logger.error("No depth sensor found!")
             return False
         
         depth_profile = depth_profile_list.get_default_video_stream_profile()
         self.config.enable_stream(depth_profile)
         
-        print(f"Depth: {depth_profile.get_width()}x{depth_profile.get_height()}@{depth_profile.get_fps()}fps")
+        logger.info(f"Depth: {depth_profile.get_width()}x{depth_profile.get_height()}@{depth_profile.get_fps()}fps")
         
         # 深度カメラ内部パラメータ取得
         try:
@@ -116,13 +123,12 @@ class OrbbecCamera:
                 width=depth_profile.get_width(),
                 height=depth_profile.get_height()
             )
-            print(f"Depth intrinsics: fx={depth_intrinsic.fx}, fy={depth_intrinsic.fy}, "
+            logger.info(f"Depth intrinsics: fx={depth_intrinsic.fx}, fy={depth_intrinsic.fy}, "
                   f"cx={depth_intrinsic.cx}, cy={depth_intrinsic.cy}")
         except (AttributeError, TypeError, ValueError) as e:
             # デフォルト値使用
-            import logging
-            logging.warning(f"Failed to get depth intrinsics, using defaults: {e}")
-            print("Using default depth intrinsics")
+            logger.warning(f"Failed to get depth intrinsics, using defaults: {e}")
+            logger.info("Using default depth intrinsics")
             self.depth_intrinsics = CameraIntrinsics(
                 fx=depth_profile.get_width(),
                 fy=depth_profile.get_width(),
@@ -155,15 +161,13 @@ class OrbbecCamera:
                         height=color_profile.get_height()
                     )
                 except (AttributeError, TypeError, ValueError) as e:
-                    import logging
-                    logging.warning(f"Failed to get color intrinsics: {e}")
+                    logger.warning(f"Failed to get color intrinsics: {e}")
                     self.color_intrinsics = None
                 
-                print(f"Color: {color_profile.get_width()}x{color_profile.get_height()}@{color_profile.get_fps()}fps")
+                logger.info(f"Color: {color_profile.get_width()}x{color_profile.get_height()}@{color_profile.get_fps()}fps")
         except (AttributeError, RuntimeError) as e:
-            import logging
-            logging.info(f"Color sensor setup failed (expected if no color sensor): {e}")
-            print("No color sensor available")
+            logger.info(f"Color sensor setup failed (expected if no color sensor): {e}")
+            logger.info("No color sensor available")
             self.has_color = False
     
     def start(self) -> bool:
@@ -174,16 +178,16 @@ class OrbbecCamera:
             成功した場合True
         """
         if not self.pipeline or not self.config:
-            print("Camera not initialized")
+            logger.error("Camera not initialized")
             return False
             
         try:
             self.pipeline.start(self.config)
             self.is_started = True
-            print("Pipeline started!")
+            logger.info("Pipeline started!")
             return True
         except Exception as e:
-            print(f"Failed to start pipeline: {e}")
+            logger.error(f"Failed to start pipeline: {e}")
             return False
     
     def stop(self) -> None:
@@ -191,7 +195,7 @@ class OrbbecCamera:
         if self.pipeline and self.is_started:
             self.pipeline.stop()
             self.is_started = False
-            print("Pipeline stopped")
+            logger.info("Pipeline stopped")
     
     def get_frame(self, timeout_ms: int = 100) -> Optional[FrameData]:
         """
@@ -222,7 +226,7 @@ class OrbbecCamera:
             return frame_data
             
         except Exception as e:
-            print(f"Frame acquisition error: {e}")
+            logger.error(f"Frame acquisition error: {e}")
             return None
     
     def get_stats(self) -> Dict[str, Any]:

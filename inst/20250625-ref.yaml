@@ -32,10 +32,19 @@ issues:
   # コーディング規約 / 品質
   - id: code-001
     title: ロギング API 不使用・print デバッグの氾濫
+    status: 🔄 部分完了 (2025-06-25)
     location: 全体 (tests/ を除く実装コード)
     description: print() がログ用途で多用されており、実運用時に制御不能。
     impact: 中 – パフォーマンス低下、本番での機密情報流出リスク。
     recommendation: Python 標準 logging へ置換し、ログレベル/ハンドラを設定可能に。
+    completion_notes: |
+      ✅ src/__init__.py に統一ログ設定機能実装（setup_logging, get_logger）
+      ✅ src/sound/voice_mgr.py で全print()をloggingに置換
+      ✅ src/input/stream.py で全print()をloggingに置換  
+      ✅ demo_collision_detection.py で一部エラー関連print()をloggingに置換
+      ✅ 動作確認完了（全テスト正常動作）
+      🔄 残り: tests/**/*.py, demo_*.py の大部分のprint()置換が未完了
+      🔄 設定ファイルによるログレベル制御機能は未実装
 
   - id: code-002
     title: Magic Number / 設定値のハードコーディング
@@ -142,7 +151,8 @@ next_actions:
 
 progress_summary:
   completed: 3
+  partial_completed: 1
   total_issues: 12
-  completion_rate: "25.0%"
+  completion_rate: "25.0% (full) + 8.3% (partial) = 33.3%"
   last_updated: "2025-06-25"
-  next_priority: "arch-001 (Viewer クラスの肥大化) または code-001 (ロギング API の改善)"
+  next_priority: "arch-001 (Viewer クラスの肥大化) または code-002 (Magic Number のハードコーディング)"
