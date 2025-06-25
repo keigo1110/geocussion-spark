@@ -130,35 +130,71 @@ class OrbbecCamera(ManagedResource):
         # 希望する解像度が指定されている場合は、それに近いプロファイルを探す
         depth_profile = None
         if self.depth_width is not None and self.depth_height is not None:
+            logger.info(f"🔍 Searching for depth profile: {self.depth_width}x{self.depth_height}")
+            
             # 指定解像度に近いプロファイルを検索
             best_profile = None
             min_diff = float('inf')
+            available_profiles = []
             
             profile_count = depth_profile_list.get_count()
+            logger.info(f"🔍 Available depth profiles: {profile_count}")
+            
             for i in range(profile_count):
                 profile = depth_profile_list.get_profile(i)
                 if hasattr(profile, 'get_width') and hasattr(profile, 'get_height'):
                     width = profile.get_width()
                     height = profile.get_height()
+                    available_profiles.append(f"{width}x{height}")
+                    
                     # 解像度の差を計算
                     diff = abs(width - self.depth_width) + abs(height - self.depth_height)
+                    logger.debug(f"  Profile {i}: {width}x{height}, diff={diff}")
+                    
                     if diff < min_diff:
                         min_diff = diff
                         best_profile = profile
+            
+            logger.info(f"🔍 Available profiles: {', '.join(available_profiles)}")
                         
             if best_profile is not None:
                 depth_profile = best_profile
-                logger.info(f"Selected depth profile: {depth_profile.get_width()}x{depth_profile.get_height()} "
-                          f"(requested: {self.depth_width}x{self.depth_height})")
+                actual_width = depth_profile.get_width()
+                actual_height = depth_profile.get_height()
+                logger.info(f"✅ Selected depth profile: {actual_width}x{actual_height} "
+                          f"(requested: {self.depth_width}x{self.depth_height}, diff={min_diff})")
+                
+                # 解像度が大きく異なる場合は警告
+                if min_diff > 100:  # 100ピクセル以上の差
+                    logger.warning(f"⚠️  RESOLUTION MISMATCH: Requested {self.depth_width}x{self.depth_height} "
+                                 f"but using {actual_width}x{actual_height}")
+                    logger.warning(f"⚠️  This may impact performance significantly!")
+            else:
+                logger.warning(f"❌ No depth profile found for {self.depth_width}x{self.depth_height}")
         
         # 指定がない場合または見つからない場合はデフォルトを使用
         if depth_profile is None:
             depth_profile = depth_profile_list.get_default_video_stream_profile()
             logger.info(f"Using default depth profile: {depth_profile.get_width()}x{depth_profile.get_height()}")
+            
+            # デフォルト使用時の警告（低解像度モード指定時）
+            if self.depth_width is not None and self.depth_height is not None:
+                logger.error(f"🚨 CRITICAL: Could not apply low resolution {self.depth_width}x{self.depth_height}!")
+                logger.error(f"🚨 Performance will be significantly impacted!")
         
         self.config.enable_stream(depth_profile)
         
-        logger.info(f"Depth: {depth_profile.get_width()}x{depth_profile.get_height()}@{depth_profile.get_fps()}fps")
+        final_width = depth_profile.get_width()
+        final_height = depth_profile.get_height()
+        logger.info(f"Depth: {final_width}x{final_height}@{depth_profile.get_fps()}fps")
+        
+        # 最終確認ログ
+        if self.depth_width is not None and self.depth_height is not None:
+            if final_width == self.depth_width and final_height == self.depth_height:
+                logger.info(f"✅ Resolution optimization successful: {final_width}x{final_height}")
+            else:
+                logger.error(f"❌ Resolution optimization FAILED: wanted {self.depth_width}x{self.depth_height}, "
+                           f"got {final_width}x{final_height}")
         
         # 深度カメラ内部パラメータ取得
         try:

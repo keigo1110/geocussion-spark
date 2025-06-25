@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from ..detection.tracker import TrackedHand
 from .sphere_tri import point_triangle_distance
+from .distance import point_triangle_distance_vectorized  # Numba最適化された距離計算
 from ..types import SearchStrategy, SearchResult
 from ..config import get_config
 from .optimization import optimize_array_operations, memory_efficient_context
@@ -396,7 +397,6 @@ class CollisionSearcher:
     
     def _calculate_distance_to_triangle(self, point: np.ndarray, triangle_vertices: np.ndarray) -> float:
         """点と三角形の距離を計算"""
-        from ..collision.distance import point_triangle_distance_vectorized
         return point_triangle_distance_vectorized(point, triangle_vertices)
 
 

@@ -30,7 +30,10 @@ class PointCloudConverter:
         depth_intrinsics: CameraIntrinsics,
         depth_scale: float = 1000.0,
         enable_voxel_downsampling: bool = True,
-        voxel_size: float = 0.005  # 5mm voxel size for good balance
+        voxel_size: float = 0.005,  # 5mm voxel size for good balance
+        enable_resolution_downsampling: bool = False,
+        target_width: int = 424,
+        target_height: int = 240
     ):
         """
         初期化
@@ -40,11 +43,36 @@ class PointCloudConverter:
             depth_scale: 深度スケール (mm → m変換)
             enable_voxel_downsampling: ボクセルダウンサンプリングを有効にするか
             voxel_size: ボクセルサイズ (m) - 小さいほど高精度、大きいほど高速
+            enable_resolution_downsampling: 解像度ダウンサンプリングを有効にするか
+            target_width: 目標解像度（幅）
+            target_height: 目標解像度（高さ）
         """
         self.depth_intrinsics = depth_intrinsics
         self.depth_scale = depth_scale
         self.enable_voxel_downsampling = enable_voxel_downsampling
         self.voxel_size = voxel_size
+        
+        # 解像度ダウンサンプリング設定
+        self.enable_resolution_downsampling = enable_resolution_downsampling
+        self.target_width = target_width
+        self.target_height = target_height
+        
+        # 解像度ダウンサンプリング比率計算
+        if enable_resolution_downsampling:
+            self.width_ratio = target_width / depth_intrinsics.width
+            self.height_ratio = target_height / depth_intrinsics.height
+            
+            # ダウンサンプリング後の内部パラメータ
+            self.downsampled_intrinsics = CameraIntrinsics(
+                fx=depth_intrinsics.fx * self.width_ratio,
+                fy=depth_intrinsics.fy * self.height_ratio,
+                cx=depth_intrinsics.cx * self.width_ratio,
+                cy=depth_intrinsics.cy * self.height_ratio,
+                width=target_width,
+                height=target_height
+            )
+        else:
+            self.downsampled_intrinsics = depth_intrinsics
         
         # メッシュグリッドを事前計算（パフォーマンス最適化）
         self._precompute_meshgrid()
@@ -60,7 +88,9 @@ class PointCloudConverter:
             'last_input_points': 0,
             'last_output_points': 0,
             'last_downsampling_ratio': 0.0,
-            'total_downsampling_time_ms': 0.0
+            'total_downsampling_time_ms': 0.0,
+            'resolution_downsampling_enabled': enable_resolution_downsampling,
+            'resolution_downsampling_ratio': f"{target_width}x{target_height}" if enable_resolution_downsampling else "disabled"
         }
         
     def _precompute_meshgrid(self) -> None:
@@ -119,6 +149,19 @@ class PointCloudConverter:
             (self.depth_intrinsics.height, self.depth_intrinsics.width)
         )
         
+        # 解像度ダウンサンプリング適用
+        if self.enable_resolution_downsampling:
+            # 深度画像をリサイズ
+            depth_image = cv2.resize(
+                depth_image, 
+                (self.target_width, self.target_height), 
+                interpolation=cv2.INTER_NEAREST  # 深度値保持のためNearest使用
+            )
+            # ダウンサンプリング後の内部パラメータを使用
+            effective_intrinsics = self.downsampled_intrinsics
+        else:
+            effective_intrinsics = self.depth_intrinsics
+        
         # 深度スケール適用
         scale = depth_scale if depth_scale is not None else self.depth_scale
         z = depth_image.astype(np.float32) / scale
@@ -126,9 +169,22 @@ class PointCloudConverter:
         # 深度範囲フィルタ
         valid_depth = (z > min_depth) & (z < max_depth)
         
+        # 3D座標計算用のメッシュグリッド（ダウンサンプリング対応）
+        if self.enable_resolution_downsampling:
+            height, width = self.target_height, self.target_width
+            u, v = np.meshgrid(np.arange(width), np.arange(height))
+            
+            # ダウンサンプリング後の座標計算係数
+            x_coeff = (u - effective_intrinsics.cx) / effective_intrinsics.fx
+            y_coeff = -(v - effective_intrinsics.cy) / effective_intrinsics.fy  # Y軸反転
+        else:
+            # 元の係数を使用
+            x_coeff = self.x_coeff
+            y_coeff = self.y_coeff
+        
         # 3D座標計算（vectorized operations）
-        x = self.x_coeff * z
-        y = self.y_coeff * z
+        x = x_coeff * z
+        y = y_coeff * z
         
         # 有効点のマスク
         valid = valid_depth
@@ -366,8 +422,44 @@ class PointCloudConverter:
     def toggle_voxel_downsampling(self):
         """ボクセルダウンサンプリングのON/OFF切り替え"""
         self.enable_voxel_downsampling = not self.enable_voxel_downsampling
-        status = "enabled" if self.enable_voxel_downsampling else "disabled"
-        print(f"Voxel downsampling {status}")
+        print(f"Voxel downsampling: {'enabled' if self.enable_voxel_downsampling else 'disabled'}")
+    
+    def toggle_resolution_downsampling(self):
+        """解像度ダウンサンプリングのON/OFF切り替え"""
+        self.enable_resolution_downsampling = not self.enable_resolution_downsampling
+        print(f"Resolution downsampling: {'enabled' if self.enable_resolution_downsampling else 'disabled'} "
+              f"(target: {self.target_width}x{self.target_height})")
+        
+        # 統計情報を更新
+        self.performance_stats['resolution_downsampling_enabled'] = self.enable_resolution_downsampling
+        
+    def set_resolution_downsampling(self, enabled: bool, target_width: int = 424, target_height: int = 240):
+        """解像度ダウンサンプリング設定を変更"""
+        self.enable_resolution_downsampling = enabled
+        self.target_width = target_width
+        self.target_height = target_height
+        
+        if enabled:
+            # 解像度比率を再計算
+            self.width_ratio = target_width / self.depth_intrinsics.width
+            self.height_ratio = target_height / self.depth_intrinsics.height
+            
+            # ダウンサンプリング後の内部パラメータを更新
+            self.downsampled_intrinsics = CameraIntrinsics(
+                fx=self.depth_intrinsics.fx * self.width_ratio,
+                fy=self.depth_intrinsics.fy * self.height_ratio,
+                cx=self.depth_intrinsics.cx * self.width_ratio,
+                cy=self.depth_intrinsics.cy * self.height_ratio,
+                width=target_width,
+                height=target_height
+            )
+        
+        # 統計情報を更新
+        self.performance_stats['resolution_downsampling_enabled'] = enabled
+        self.performance_stats['resolution_downsampling_ratio'] = f"{target_width}x{target_height}" if enabled else "disabled"
+        
+        print(f"Resolution downsampling: {'enabled' if enabled else 'disabled'} "
+              f"(target: {target_width}x{target_height})")
     
     def get_performance_stats(self) -> dict:
         """パフォーマンス統計を取得"""

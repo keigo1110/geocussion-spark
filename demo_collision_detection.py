@@ -99,6 +99,27 @@ try:
 except ImportError:
     print("Warning: Pyo audio engine is not available. Audio synthesis will be disabled.")
 
+# Numba JIT最適化状況を表示
+try:
+    sys.path.insert(0, str(project_root / "src"))
+    from src.numba_config import initialize_numba, get_numba_status, warmup_basic_functions
+    
+    # Numba初期化（詳細ログ付き）
+    print("🔧 Starting Numba initialization...")
+    success = initialize_numba(verbose=True, force_retry=True)
+    if success:
+        status = get_numba_status()
+        print(f"🚀 Numba JIT acceleration enabled (v{status['version']})")
+        print("🔥 Warming up JIT functions...")
+        warmup_basic_functions()
+        print("🔥 JIT functions warmed up - maximum performance ready")
+    else:
+        print("⚠️ Numba JIT acceleration disabled (falling back to NumPy)")
+        
+except Exception as e:
+    print(f"⚠️ Numba configuration error: {e}")
+    print("⚠️ Using NumPy fallback for all computations")
+
 # 必要なクラスのimport（クラス定義前に配置）
 from typing import Optional, List
 from src.detection.tracker import TrackedHand
@@ -1515,6 +1536,31 @@ def main():
         if args.mesh_interval == 15:  # デフォルト値の場合
             args.mesh_interval = 20  # さらに間隔を空ける
         print(f"🔧 低解像度最適化: メッシュ更新間隔={args.mesh_interval}フレーム")
+    else:
+        # 高解像度強制時の緊急FPS最適化
+        if depth_width and depth_height and (depth_width >= 848 or depth_height >= 480):
+            print(f"🚨 高解像度モード検出: {depth_width}x{depth_height}")
+            print(f"⚡ 緊急FPS最適化を適用中...")
+            
+            # メッシュ更新間隔を大幅延長
+            if args.mesh_interval <= 20:
+                args.mesh_interval = 40  # 2倍に延長
+                print(f"🔧 緊急最適化: メッシュ更新間隔={args.mesh_interval}フレーム (40f間隔)")
+            
+            # 最大スキップフレームも延長
+            if args.max_mesh_skip <= 60:
+                args.max_mesh_skip = 120  # 2倍に延長
+                print(f"🔧 緊急最適化: 最大メッシュスキップ={args.max_mesh_skip}フレーム")
+            
+            # 解像度ダウンサンプリングを有効化
+            config.input.enable_resolution_downsampling = True
+            config.input.resolution_target_width = 424
+            config.input.resolution_target_height = 240
+            print(f"🔧 緊急最適化: 解像度ダウンサンプリング有効 ({depth_width}x{depth_height} → 424x240)")
+                
+            print(f"⚡ 高解像度での予想FPS: 8-15 FPS (最適化適用済み)")
+        elif depth_width and depth_height:
+            print(f"🔧 中解像度最適化: メッシュ更新間隔={args.mesh_interval}フレーム")
     
     # CollisionDetectionViewer実行
     try:

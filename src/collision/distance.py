@@ -9,20 +9,8 @@ Numba JIT コンパイル対応による超高速化
 import time
 from typing import List, Tuple, Optional
 import numpy as np
-try:
-    from numba import jit, njit
-    NUMBA_AVAILABLE = True
-except ImportError:
-    NUMBA_AVAILABLE = False
-    # Numba未利用時のダミーデコレータ
-    def jit(*args, **kwargs):
-        def decorator(func):
-            return func
-        return decorator
-    def njit(*args, **kwargs):
-        def decorator(func):
-            return func
-        return decorator
+# 統一されたNumba設定をインポート
+from ..numba_config import get_numba, get_optimized_jit_config, create_optimized_jit
 
 from ..mesh.delaunay import TriangleMesh
 from ..types import CollisionType
@@ -30,117 +18,218 @@ from .. import get_logger
 
 logger = get_logger(__name__)
 
+# Numbaデコレータを遅延取得
+def _get_jit_decorators():
+    """JIT デコレータを遅延取得"""
+    jit_func, njit_func, available = get_numba()
+    return njit_func, available
 
-@njit(cache=True, fastmath=True)
-def _point_triangle_distance_jit(
-    point: np.ndarray,
-    v0: np.ndarray,
-    v1: np.ndarray,
-    v2: np.ndarray
-) -> float:
-    """
-    JIT最適化された点-三角形距離計算（nopython mode）
+# キャッシュ無効化設定でJIT関数を定義
+def _create_jit_distance_function():
+    """JIT最適化された距離計算関数を作成"""
+    njit_func, available = _get_jit_decorators()
     
-    Args:
-        point: 検査点 (3,)
-        v0, v1, v2: 三角形の頂点 (3,)
+    if not available:
+        return None
+    
+    config = get_optimized_jit_config()
+    
+    @njit_func(**config)
+    def _point_triangle_distance_jit(
+        point: np.ndarray,
+        v0: np.ndarray,
+        v1: np.ndarray,
+        v2: np.ndarray
+    ) -> float:
+        """
+        JIT最適化された点-三角形距離計算（nopython mode）
         
-    Returns:
-        最短距離
-    """
-    # エッジベクトル
-    edge1 = v1 - v0
-    edge2 = v2 - v0
-    
-    # 点から v0 への相対位置
-    w = point - v0
-    
-    # 重心座標系での投影計算
-    a = np.dot(edge1, edge1)
-    b = np.dot(edge1, edge2)
-    c = np.dot(edge2, edge2)
-    d = np.dot(w, edge1)
-    e = np.dot(w, edge2)
-    
-    # 重心座標計算
-    denom = a * c - b * b
-    if abs(denom) < 1e-12:
-        # 退化三角形の場合：edge上の最近点を計算
-        t_raw = np.dot(w, edge1) / max(a, 1e-12)
-        t = max(0.0, min(1.0, t_raw))  # manual clipping
-        closest = v0 + t * edge1
+        Args:
+            point: 検査点 (3,)
+            v0, v1, v2: 三角形の頂点 (3,)
+            
+        Returns:
+            最短距離
+        """
+        # エッジベクトル
+        edge1 = v1 - v0
+        edge2 = v2 - v0
+        
+        # 点から v0 への相対位置
+        w = point - v0
+        
+        # 重心座標系での投影計算
+        a = np.dot(edge1, edge1)
+        b = np.dot(edge1, edge2)
+        c = np.dot(edge2, edge2)
+        d = np.dot(w, edge1)
+        e = np.dot(w, edge2)
+        
+        # 重心座標計算
+        denom = a * c - b * b
+        if abs(denom) < 1e-12:
+            # 退化三角形の場合：edge上の最近点を計算
+            t_raw = np.dot(w, edge1) / max(a, 1e-12)
+            t = max(0.0, min(1.0, t_raw))  # manual clipping
+            closest = v0 + t * edge1
+            return np.sqrt(np.sum((point - closest) ** 2))
+        
+        s = (b * e - c * d) / denom
+        t = (b * d - a * e) / denom
+        
+        # 重心座標による最近点決定
+        if s >= 0.0 and t >= 0.0 and s + t <= 1.0:
+            # 三角形内部
+            closest = v0 + s * edge1 + t * edge2
+        else:
+            # 境界上の最近点を計算
+            # エッジ v0-v1 上
+            t1_raw = d / max(a, 1e-12)
+            t1 = max(0.0, min(1.0, t1_raw))  # manual clipping
+            p1 = v0 + t1 * edge1
+            dist1_sq = np.sum((point - p1) ** 2)
+            
+            # エッジ v0-v2 上
+            t2_raw = e / max(c, 1e-12)
+            t2 = max(0.0, min(1.0, t2_raw))  # manual clipping
+            p2 = v0 + t2 * edge2
+            dist2_sq = np.sum((point - p2) ** 2)
+            
+            # エッジ v1-v2 上
+            edge3 = v2 - v1
+            w3 = point - v1
+            t3_raw = np.dot(w3, edge3) / max(np.dot(edge3, edge3), 1e-12)
+            t3 = max(0.0, min(1.0, t3_raw))  # manual clipping
+            p3 = v1 + t3 * edge3
+            dist3_sq = np.sum((point - p3) ** 2)
+            
+            # 最小距離の点を選択
+            if dist1_sq <= dist2_sq and dist1_sq <= dist3_sq:
+                closest = p1
+            elif dist2_sq <= dist3_sq:
+                closest = p2
+            else:
+                closest = p3
+        
         return np.sqrt(np.sum((point - closest) ** 2))
     
-    s = (b * e - c * d) / denom
-    t = (b * d - a * e) / denom
+    return _point_triangle_distance_jit
+
+# グローバルなJIT関数インスタンス（遅延初期化）
+_jit_distance_func = None
+
+def _get_jit_distance_function():
+    """JIT距離計算関数を取得（遅延初期化）"""
+    global _jit_distance_func
     
-    # 重心座標による最近点決定
-    if s >= 0.0 and t >= 0.0 and s + t <= 1.0:
-        # 三角形内部
-        closest = v0 + s * edge1 + t * edge2
-    else:
-        # 境界上の最近点を計算
-        # エッジ v0-v1 上
-        t1_raw = d / max(a, 1e-12)
-        t1 = max(0.0, min(1.0, t1_raw))  # manual clipping
-        p1 = v0 + t1 * edge1
-        dist1_sq = np.sum((point - p1) ** 2)
-        
-        # エッジ v0-v2 上
-        t2_raw = e / max(c, 1e-12)
-        t2 = max(0.0, min(1.0, t2_raw))  # manual clipping
-        p2 = v0 + t2 * edge2
-        dist2_sq = np.sum((point - p2) ** 2)
-        
-        # エッジ v1-v2 上
-        edge3 = v2 - v1
-        w3 = point - v1
-        t3_raw = np.dot(w3, edge3) / max(np.dot(edge3, edge3), 1e-12)
-        t3 = max(0.0, min(1.0, t3_raw))  # manual clipping
-        p3 = v1 + t3 * edge3
-        dist3_sq = np.sum((point - p3) ** 2)
-        
-        # 最小距離の点を選択
-        if dist1_sq <= dist2_sq and dist1_sq <= dist3_sq:
-            closest = p1
-        elif dist2_sq <= dist3_sq:
-            closest = p2
-        else:
-            closest = p3
+    if _jit_distance_func is None:
+        _jit_distance_func = _create_jit_distance_function()
     
-    return np.sqrt(np.sum((point - closest) ** 2))
+    return _jit_distance_func
 
 
-@njit(cache=True, fastmath=True, parallel=True)
-def _batch_distances_jit(
-    points: np.ndarray,
-    triangles: np.ndarray
-) -> np.ndarray:
-    """
-    JIT最適化されたバッチ距離計算（parallel mode）
+def _create_jit_batch_function():
+    """JIT最適化されたバッチ処理関数を作成"""
+    njit_func, available = _get_jit_decorators()
     
-    Args:
-        points: 点群 (N, 3)
-        triangles: 三角形頂点群 (M, 3, 3)
+    if not available:
+        return None
+    
+    # 並列処理設定
+    config = get_optimized_jit_config()
+    config['parallel'] = True
+    
+    @njit_func(**config)
+    def _batch_distances_jit(
+        points: np.ndarray,
+        triangles: np.ndarray,
+        distance_func: np.ndarray  # dummy parameter to work around closure issues
+    ) -> np.ndarray:
+        """
+        JIT最適化されたバッチ距離計算（parallel mode）
         
-    Returns:
-        距離行列 (N, M)
-    """
-    N = points.shape[0]
-    M = triangles.shape[0]
-    distances = np.zeros((N, M), dtype=np.float32)
+        Args:
+            points: 点群 (N, 3)
+            triangles: 三角形頂点群 (M, 3, 3)
+            distance_func: 未使用（クロージャ回避）
+            
+        Returns:
+            距離行列 (N, M)
+        """
+        N = points.shape[0]
+        M = triangles.shape[0]
+        distances = np.zeros((N, M), dtype=np.float32)
+        
+        # 並列化されたループ（直接実装）
+        for i in range(N):
+            for j in range(M):
+                # 距離計算をインライン展開
+                point = points[i]
+                v0 = triangles[j, 0]
+                v1 = triangles[j, 1] 
+                v2 = triangles[j, 2]
+                
+                # エッジベクトル
+                edge1 = v1 - v0
+                edge2 = v2 - v0
+                w = point - v0
+                
+                # 重心座標系での投影計算
+                a = np.dot(edge1, edge1)
+                b = np.dot(edge1, edge2)
+                c = np.dot(edge2, edge2)
+                d = np.dot(w, edge1)
+                e = np.dot(w, edge2)
+                
+                # 重心座標計算
+                denom = a * c - b * b
+                if abs(denom) < 1e-12:
+                    t_raw = np.dot(w, edge1) / max(a, 1e-12)
+                    t = max(0.0, min(1.0, t_raw))
+                    closest = v0 + t * edge1
+                    distances[i, j] = np.sqrt(np.sum((point - closest) ** 2))
+                else:
+                    s = (b * e - c * d) / denom
+                    t_val = (b * d - a * e) / denom
+                    
+                    if s >= 0.0 and t_val >= 0.0 and s + t_val <= 1.0:
+                        # 三角形内部
+                        closest = v0 + s * edge1 + t_val * edge2
+                        distances[i, j] = np.sqrt(np.sum((point - closest) ** 2))
+                    else:
+                        # 境界計算（簡略版）
+                        t1 = max(0.0, min(1.0, d / max(a, 1e-12)))
+                        p1 = v0 + t1 * edge1
+                        dist1_sq = np.sum((point - p1) ** 2)
+                        
+                        t2 = max(0.0, min(1.0, e / max(c, 1e-12)))
+                        p2 = v0 + t2 * edge2
+                        dist2_sq = np.sum((point - p2) ** 2)
+                        
+                        edge3 = v2 - v1
+                        w3 = point - v1
+                        t3 = max(0.0, min(1.0, np.dot(w3, edge3) / max(np.dot(edge3, edge3), 1e-12)))
+                        p3 = v1 + t3 * edge3
+                        dist3_sq = np.sum((point - p3) ** 2)
+                        
+                        min_dist_sq = min(dist1_sq, min(dist2_sq, dist3_sq))
+                        distances[i, j] = np.sqrt(min_dist_sq)
+        
+        return distances
     
-    # 並列化されたループ
-    for i in range(N):
-        for j in range(M):
-            distances[i, j] = _point_triangle_distance_jit(
-                points[i],
-                triangles[j, 0],
-                triangles[j, 1],
-                triangles[j, 2]
-            )
+    return _batch_distances_jit
+
+# グローバルなバッチ関数インスタンス
+_jit_batch_func = None
+
+def _get_jit_batch_function():
+    """JITバッチ処理関数を取得（遅延初期化）"""
+    global _jit_batch_func
     
-    return distances
+    if _jit_batch_func is None:
+        _jit_batch_func = _create_jit_batch_function()
+    
+    return _jit_batch_func
 
 
 def point_triangle_distance_vectorized(
@@ -161,17 +250,24 @@ def point_triangle_distance_vectorized(
     point = np.asarray(point, dtype=np.float64)
     triangle_vertices = np.asarray(triangle_vertices, dtype=np.float64)
     
-    if NUMBA_AVAILABLE:
-        # JIT最適化版を使用
-        return _point_triangle_distance_jit(
-            point,
-            triangle_vertices[0],
-            triangle_vertices[1],
-            triangle_vertices[2]
-        )
+    # JIT関数を遅延取得
+    jit_func = _get_jit_distance_function()
+    
+    if jit_func is not None:
+        try:
+            # JIT最適化版を使用
+            return jit_func(
+                point,
+                triangle_vertices[0],
+                triangle_vertices[1],
+                triangle_vertices[2]
+            )
+        except Exception as e:
+            # JIT実行エラー時のフォールバック
+            logger.warning(f"Numba JIT execution failed: {e}, falling back to NumPy")
+            return _point_triangle_distance_fallback(point, triangle_vertices)
     else:
         # フォールバック版（従来の実装）
-        logger.warning("Numba not available, using fallback implementation")
         return _point_triangle_distance_fallback(point, triangle_vertices)
 
 
@@ -223,61 +319,152 @@ def _point_triangle_distance_fallback(point: np.ndarray, triangle_vertices: np.n
     return np.linalg.norm(point - closest)
 
 
-@njit(cache=True, fastmath=True, parallel=True)
-def _batch_point_multiple_triangles_jit(
-    point: np.ndarray,
-    triangles: np.ndarray
-) -> np.ndarray:
-    """
-    JIT最適化: 単一点と複数三角形の距離を並列計算
+def _create_batch_point_triangles_function():
+    """バッチ点-複数三角形JIT関数を作成"""
+    njit_func, available = _get_jit_decorators()
     
-    Args:
-        point: 検査点 (3,)
-        triangles: 三角形頂点群 (M, 3, 3)
+    if not available:
+        return None
+    
+    config = get_optimized_jit_config()
+    config['parallel'] = True
+    
+    @njit_func(**config)
+    def _batch_point_multiple_triangles_jit(
+        point: np.ndarray,
+        triangles: np.ndarray
+    ) -> np.ndarray:
+        """
+        JIT最適化: 単一点と複数三角形の距離を並列計算
         
-    Returns:
-        距離配列 (M,)
-    """
-    M = triangles.shape[0]
-    distances = np.zeros(M, dtype=np.float64)
+        Args:
+            point: 検査点 (3,)
+            triangles: 三角形頂点群 (M, 3, 3)
+            
+        Returns:
+            距離配列 (M,)
+        """
+        M = triangles.shape[0]
+        distances = np.zeros(M, dtype=np.float64)
+        
+        # 並列化されたループ（距離計算をインライン展開）
+        for j in range(M):
+            # 直接距離計算（クロージャ問題回避）
+            v0 = triangles[j, 0]
+            v1 = triangles[j, 1]
+            v2 = triangles[j, 2]
+            
+            # エッジベクトル
+            edge1 = v1 - v0
+            edge2 = v2 - v0
+            w = point - v0
+            
+            # 重心座標系での投影計算
+            a = np.dot(edge1, edge1)
+            b = np.dot(edge1, edge2)
+            c = np.dot(edge2, edge2)
+            d = np.dot(w, edge1)
+            e = np.dot(w, edge2)
+            
+            # 重心座標計算
+            denom = a * c - b * b
+            if abs(denom) < 1e-12:
+                t_raw = np.dot(w, edge1) / max(a, 1e-12)
+                t = max(0.0, min(1.0, t_raw))
+                closest = v0 + t * edge1
+                distances[j] = np.sqrt(np.sum((point - closest) ** 2))
+            else:
+                s = (b * e - c * d) / denom
+                t_val = (b * d - a * e) / denom
+                
+                if s >= 0.0 and t_val >= 0.0 and s + t_val <= 1.0:
+                    # 三角形内部
+                    closest = v0 + s * edge1 + t_val * edge2
+                    distances[j] = np.sqrt(np.sum((point - closest) ** 2))
+                else:
+                    # 境界計算（簡略版）
+                    t1 = max(0.0, min(1.0, d / max(a, 1e-12)))
+                    p1 = v0 + t1 * edge1
+                    dist1_sq = np.sum((point - p1) ** 2)
+                    
+                    t2 = max(0.0, min(1.0, e / max(c, 1e-12)))
+                    p2 = v0 + t2 * edge2
+                    dist2_sq = np.sum((point - p2) ** 2)
+                    
+                    edge3 = v2 - v1
+                    w3 = point - v1
+                    t3 = max(0.0, min(1.0, np.dot(w3, edge3) / max(np.dot(edge3, edge3), 1e-12)))
+                    p3 = v1 + t3 * edge3
+                    dist3_sq = np.sum((point - p3) ** 2)
+                    
+                    min_dist_sq = min(dist1_sq, min(dist2_sq, dist3_sq))
+                    distances[j] = np.sqrt(min_dist_sq)
+        
+        return distances
     
-    # 並列化されたループ
-    for j in range(M):
-        distances[j] = _point_triangle_distance_jit(
-            point,
-            triangles[j, 0],
-            triangles[j, 1],
-            triangles[j, 2]
-        )
+    return _batch_point_multiple_triangles_jit
+
+# グローバルなバッチ点三角形関数インスタンス
+_jit_batch_point_func = None
+
+def _get_jit_batch_point_function():
+    """JITバッチ点三角形関数を取得（遅延初期化）"""
+    global _jit_batch_point_func
     
-    return distances
+    if _jit_batch_point_func is None:
+        _jit_batch_point_func = _create_batch_point_triangles_function()
+    
+    return _jit_batch_point_func
 
 
-@njit(cache=True, fastmath=True)
-def _compute_collision_penalty_jit(
-    distances: np.ndarray,
-    radius: float,
-    penalty_factor: float = 100.0
-) -> np.ndarray:
-    """
-    JIT最適化: 衝突ペナルティ計算
+def _create_penalty_function():
+    """JIT最適化されたペナルティ計算関数を作成"""
+    njit_func, available = _get_jit_decorators()
     
-    Args:
-        distances: 距離配列 (N,)
-        radius: 衝突半径
-        penalty_factor: ペナルティ係数
+    if not available:
+        return None
+    
+    config = get_optimized_jit_config()
+    
+    @njit_func(**config)
+    def _compute_collision_penalty_jit(
+        distances: np.ndarray,
+        radius: float,
+        penalty_factor: float = 100.0
+    ) -> np.ndarray:
+        """
+        JIT最適化: 衝突ペナルティ計算
         
-    Returns:
-        ペナルティ配列 (N,)
-    """
-    penalties = np.zeros_like(distances)
+        Args:
+            distances: 距離配列 (N,)
+            radius: 衝突半径
+            penalty_factor: ペナルティ係数
+            
+        Returns:
+            ペナルティ配列 (N,)
+        """
+        penalties = np.zeros_like(distances)
+        
+        for i in range(len(distances)):
+            if distances[i] < radius:
+                penetration = radius - distances[i]
+                penalties[i] = penalty_factor * penetration * penetration
+        
+        return penalties
     
-    for i in range(len(distances)):
-        if distances[i] < radius:
-            penetration = radius - distances[i]
-            penalties[i] = penalty_factor * penetration * penetration
+    return _compute_collision_penalty_jit
+
+# グローバルなペナルティ関数インスタンス
+_jit_penalty_func = None
+
+def _get_jit_penalty_function():
+    """JITペナルティ関数を取得（遅延初期化）"""
+    global _jit_penalty_func
     
-    return penalties
+    if _jit_penalty_func is None:
+        _jit_penalty_func = _create_penalty_function()
+    
+    return _jit_penalty_func
 
 
 def batch_point_triangle_distances(
@@ -301,9 +488,14 @@ def batch_point_triangle_distances(
     # JITコンパイル効果の閾値調整
     jit_threshold = 50  # より低い閾値で積極的にJIT使用
     
-    if NUMBA_AVAILABLE and points.shape[0] * triangle_vertices.shape[0] > jit_threshold:
+    # JIT関数を遅延取得
+    batch_func = _get_jit_batch_function()
+    batch_point_func = _get_jit_batch_point_function()
+    
+    if batch_func is not None and points.shape[0] * triangle_vertices.shape[0] > jit_threshold:
         # 大規模計算の場合はJIT並列化版を使用
-        return _batch_distances_jit(points, triangle_vertices)
+        dummy_array = np.array([0.0])  # dummy parameter
+        return batch_func(points, triangle_vertices, dummy_array)
     else:
         # 小規模またはフォールバック
         N = points.shape[0]
@@ -311,8 +503,8 @@ def batch_point_triangle_distances(
         distances = np.zeros((N, M), dtype=np.float32)
         
         # 単一点 vs 複数三角形の場合に高速化版を使用
-        if N == 1 and NUMBA_AVAILABLE and M > 5:
-            distances[0] = _batch_point_multiple_triangles_jit(
+        if N == 1 and batch_point_func is not None and M > 5:
+            distances[0] = batch_point_func(
                 points[0], triangle_vertices
             ).astype(np.float32)
         else:
@@ -456,4 +648,7 @@ def get_distance_calculator() -> OptimizedDistanceCalculator:
     global _global_distance_calculator
     if _global_distance_calculator is None:
         _global_distance_calculator = OptimizedDistanceCalculator()
-    return _global_distance_calculator 
+    return _global_distance_calculator
+
+
+# 統一設定でウォームアップ済み

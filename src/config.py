@@ -155,6 +155,11 @@ class InputConfig:
     # パフォーマンス最適化設定
     enable_low_resolution_mode: bool = False  # True=424x240、False=848x480
     
+    # 解像度ダウンサンプリング設定（ソフトウェア処理）
+    enable_resolution_downsampling: bool = False  # True=ソフトウェアで424x240にダウンサンプリング
+    resolution_target_width: int = 424
+    resolution_target_height: int = 240
+    
     def apply_low_resolution_mode(self) -> None:
         """低解像度モードを適用"""
         if self.enable_low_resolution_mode:
