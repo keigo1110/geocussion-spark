@@ -12,6 +12,7 @@ from typing import List, Dict, Optional, Callable
 from enum import Enum, IntEnum
 from collections import deque
 import numpy as np
+import threading
 
 # 他フェーズとの連携
 from .sphere_tri import CollisionInfo, ContactPoint, CollisionType
@@ -234,15 +235,47 @@ class CollisionEventQueue:
         return self.stats.copy()
 
 
-# 便利関数
+# シングルトンキューマネージャー
+class _CollisionEventQueueSingleton:
+    """シングルトンキューインスタンス管理"""
+    _instance: Optional[CollisionEventQueue] = None
+    _lock = threading.Lock()
+    
+    @classmethod
+    def get_instance(cls) -> CollisionEventQueue:
+        """グローバルキューインスタンスを取得"""
+        if cls._instance is None:
+            with cls._lock:
+                if cls._instance is None:
+                    cls._instance = CollisionEventQueue()
+        return cls._instance
+    
+    @classmethod
+    def reset_instance(cls) -> None:
+        """インスタンスをリセット（テスト用）"""
+        with cls._lock:
+            cls._instance = None
+
+
+def get_global_collision_queue() -> CollisionEventQueue:
+    """グローバル衝突イベントキューを取得"""
+    return _CollisionEventQueueSingleton.get_instance()
+
+
+def reset_global_collision_queue() -> None:
+    """グローバル衝突イベントキューをリセット（テスト用）"""
+    _CollisionEventQueueSingleton.reset_instance()
+
+
+# 便利関数（改善版）
 def create_collision_event(
     collision_info: CollisionInfo,
     hand_id: str,
     hand_position: np.ndarray,
     hand_velocity: Optional[np.ndarray] = None
 ) -> Optional[CollisionEvent]:
-    """衝突イベントを作成（簡単なインターフェース）"""
-    queue = CollisionEventQueue()
+    """衝突イベントを作成（グローバルキュー使用）"""
+    queue = get_global_collision_queue()
     return queue.create_event(collision_info, hand_id, hand_position, hand_velocity)
 
 
@@ -252,8 +285,8 @@ def process_collision_events(
     hand_positions: List[np.ndarray],
     hand_velocities: Optional[List[np.ndarray]] = None
 ) -> List[CollisionEvent]:
-    """複数の衝突情報を一括処理"""
-    queue = CollisionEventQueue()
+    """複数の衝突情報を一括処理（グローバルキュー使用）"""
+    queue = get_global_collision_queue()
     events = []
     
     for i, (collision_info, hand_id, hand_pos) in enumerate(zip(collision_infos, hand_ids, hand_positions)):
@@ -262,4 +295,16 @@ def process_collision_events(
         if event:
             events.append(event)
     
-    return events 
+    return events
+
+
+def get_collision_events(max_events: Optional[int] = None) -> List[CollisionEvent]:
+    """グローバルキューからイベントを取得"""
+    queue = get_global_collision_queue()
+    return queue.get_events(max_events)
+
+
+def get_collision_stats() -> dict:
+    """グローバルキューの統計を取得"""
+    queue = get_global_collision_queue()
+    return queue.get_stats() 

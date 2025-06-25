@@ -53,10 +53,18 @@ issues:
 
   - id: code-004
     title: CollisionEventQueue の設計不備
+    status: ✅ 完了 (2025-06-25)
     location: src/collision/events.py
     description: create_collision_event() が都度ローカル Queue を生成しており、イベントが他コンポーネントへ伝播しない。
     impact: 高 – 衝突イベントがフレーム間で共有されず、音響フェーズの実装が複雑化。
     recommendation: Queue をシングルトン化または DI コンテナで共有。イベントバス設計を検討。
+    completion_notes: |
+      ✅ _CollisionEventQueueSingleton クラス実装（thread-safe）
+      ✅ get_global_collision_queue() / reset_global_collision_queue() 関数追加
+      ✅ create_collision_event() / process_collision_events() をグローバルキュー使用に変更
+      ✅ get_collision_events() / get_collision_stats() 便利関数追加
+      ✅ TestCollisionEventQueue でシングルトン動作と共有キュー機能を検証
+      ✅ 全テスト正常動作確認
 
   - id: code-005
     title: グローバル定数 / モジュール間循環参照
@@ -66,6 +74,7 @@ issues:
 
   - id: code-006
     title: コードの重複 (DRY 原則違反)
+    status: ✅ 完了 (2025-06-25)
     location:
       - demo_collision_detection.py
       - src/debug/dual_viewer.py
@@ -75,9 +84,15 @@ issues:
     impact: 中 – コードの肥大化、保守性の低下。
     recommendation: |
       共通の型定義は `src/input/types.py` のような共有モジュールに集約し、各所からインポートして利用する。
+    completion_notes: |
+      ✅ src/input/types.py に OBFormat を集約
+      ✅ src/debug/dual_viewer.py から重複削除
+      ✅ demo_collision_detection.py から重複削除
+      ✅ 動作確認完了 (python3 demo_collision_detection.py --test)
 
   - id: code-007
     title: 不適切な例外処理
+    status: ✅ 完了 (2025-06-25)
     location:
       - src/debug/dual_viewer.py::_update_hand_markers
       - demo_collision_detection.py::main
@@ -90,6 +105,11 @@ issues:
       - 例外は可能な限り具体的にキャッチする (e.g., `except ValueError:`).
       - エラーを無視せず、logging モジュールで適切なレベル (ERROR, CRITICAL) で記録する.
       - 復帰不能なエラーの場合は、アプリケーションを正常に終了させるか、上位の呼び出し元に例外を再送出する。
+    completion_notes: |
+      ✅ src/sound/voice_mgr.py で Exception を具体的例外に変更 + logging追加
+      ✅ src/input/stream.py で 3箇所の例外処理改善 + logging追加
+      ✅ print() から logging モジュールへ変更
+      ✅ 動作確認完了
 
   # テスト / CI
   - id: test-001
@@ -119,3 +139,10 @@ next_actions:
   - 優先度高: arch-001, code-004 を解決し、システム全体に API 境界を定義する。
   - 中: logging, 設定ファイル化, テスト基盤整備。
   - 低: さらなる型注釈とパフォーマンスチューニング。
+
+progress_summary:
+  completed: 3
+  total_issues: 12
+  completion_rate: "25.0%"
+  last_updated: "2025-06-25"
+  next_priority: "arch-001 (Viewer クラスの肥大化) または code-001 (ロギング API の改善)"
