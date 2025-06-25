@@ -8,6 +8,7 @@ import time
 import pytest
 import numpy as np
 from typing import List
+from unittest.mock import patch
 
 from src.mesh.delaunay import TriangleMesh, DelaunayTriangulator
 from src.mesh.vectorized import (
@@ -15,8 +16,9 @@ from src.mesh.vectorized import (
     vectorized_is_valid_triangles,
     get_mesh_processor
 )
-from src.collision.distance import get_distance_calculator
+from src.collision.distance import get_distance_calculator, point_triangle_distance_vectorized, batch_point_triangle_distances, OptimizedDistanceCalculator
 from src.collision.sphere_tri import point_triangle_distance
+from tests.conftest import TestAssertions, PerformanceMeasurement
 
 
 @pytest.fixture
@@ -350,6 +352,345 @@ class TestBenchmarkTargets:
         
         # 目標達成チェック（緩い条件）
         assert triangles_per_second >= 50000, f"性能目標未達: {triangles_per_second:.0f} < 50,000"
+
+
+class TestJITDistanceCalculationPerformance:
+    """JIT最適化距離計算パフォーマンステスト"""
+    
+    def test_jit_vs_fallback_distance_calculation(self):
+        """JIT vs フォールバック距離計算の性能比較"""
+        # テストデータ準備
+        point = np.array([1.0, 1.0, 1.0])
+        triangle = np.array([
+            [0.0, 0.0, 0.0],
+            [2.0, 0.0, 0.0],
+            [1.0, 2.0, 0.0]
+        ])
+        
+        iterations = 1000
+        
+        # JIT版（ウォームアップ付き）
+        # ウォームアップ実行
+        for _ in range(10):
+            point_triangle_distance_vectorized(point, triangle)
+        
+        start_time = time.perf_counter()
+        for _ in range(iterations):
+            dist_jit = point_triangle_distance_vectorized(point, triangle)
+        jit_time = (time.perf_counter() - start_time) * 1000
+        
+        # フォールバック版をシミュレート
+        with patch('src.collision.distance.NUMBA_AVAILABLE', False):
+            start_time = time.perf_counter()
+            for _ in range(iterations):
+                dist_fallback = point_triangle_distance_vectorized(point, triangle)
+            fallback_time = (time.perf_counter() - start_time) * 1000
+        
+        # 性能比較
+        jit_speedup = fallback_time / jit_time
+        
+        print(f"\nJIT距離計算性能比較:")
+        print(f"JIT版: {jit_time:.1f}ms ({iterations}回)")
+        print(f"フォールバック版: {fallback_time:.1f}ms ({iterations}回)")
+        print(f"JIT高速化比: {jit_speedup:.1f}x")
+        print(f"1回あたり (JIT): {jit_time/iterations:.3f}ms")
+        print(f"1回あたり (フォールバック): {fallback_time/iterations:.3f}ms")
+        
+        # 期待値: JITで2x以上の高速化
+        assert jit_speedup >= 2.0, f"Expected at least 2x JIT speedup, got {jit_speedup:.1f}x"
+        
+        # 結果の正確性チェック
+        assert abs(dist_jit - dist_fallback) < 1e-10, "JIT and fallback results should match"
+    
+    def test_jit_batch_distance_scaling(self, medium_mesh):
+        """JITバッチ距離計算のスケーリング性能"""
+        triangle = np.array([
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0], 
+            [0.5, 1.0, 0.0]
+        ])
+        
+        test_cases = [
+            (100, "100点"),
+            (1000, "1000点"),
+            (5000, "5000点")
+        ]
+        
+        print(f"\nJITバッチ距離計算スケーリング:")
+        
+        scaling_times = []
+        
+        for num_points, label in test_cases:
+            points = np.random.rand(num_points, 3) * 2.0
+            
+            # ウォームアップ
+            batch_point_triangle_distances(points[:10], triangle.reshape(1, 3, 3))
+            
+            start_time = time.perf_counter()
+            distances = batch_point_triangle_distances(points, triangle.reshape(1, 3, 3))
+            elapsed_ms = (time.perf_counter() - start_time) * 1000
+            
+            per_point_time = elapsed_ms / num_points
+            scaling_times.append(per_point_time)
+            
+            print(f"{label}: {elapsed_ms:.1f}ms ({per_point_time:.4f}ms/点)")
+            
+            # 結果検証
+            assert len(distances) == num_points
+            assert np.all(distances >= 0)
+            
+            # JIT効果による性能目標: 0.01ms/点以下
+            assert per_point_time <= 0.01, f"Per-point time too high: {per_point_time:.4f}ms"
+        
+        # スケーリング特性確認：線形に近いスケーリング
+        scaling_factor = scaling_times[-1] / scaling_times[0]
+        print(f"スケーリング特性: {scaling_factor:.1f}x (小→大規模)")
+        
+        # JIT最適化により良好なスケーリングを期待
+        assert scaling_factor <= 3.0, f"Poor scaling: {scaling_factor:.1f}x"
+    
+    def test_jit_parallel_batch_distance_performance(self, large_mesh):
+        """JIT並列バッチ距離計算の性能"""
+        # 複数三角形との距離計算
+        num_triangles = min(100, large_mesh.num_triangles)
+        triangle_indices = np.random.choice(large_mesh.num_triangles, size=num_triangles, replace=False)
+        triangles = large_mesh.vertices[large_mesh.triangles[triangle_indices]]
+        
+        num_points = 1000
+        points = np.random.rand(num_points, 3) * 5.0
+        
+        # ウォームアップ
+        batch_point_triangle_distances(points[:10], triangles[:5])
+        
+        # 並列バッチ処理性能測定
+        start_time = time.perf_counter()
+        distance_matrix = batch_point_triangle_distances(points, triangles)
+        elapsed_ms = (time.perf_counter() - start_time) * 1000
+        
+        total_calculations = num_points * num_triangles
+        per_calculation_time = elapsed_ms / total_calculations
+        
+        print(f"\nJIT並列バッチ距離計算:")
+        print(f"点数: {num_points}, 三角形数: {num_triangles}")
+        print(f"総計算数: {total_calculations}")
+        print(f"実行時間: {elapsed_ms:.1f}ms")
+        print(f"1計算あたり: {per_calculation_time:.4f}ms")
+        
+        # 結果検証
+        assert distance_matrix.shape == (num_points, num_triangles)
+        assert np.all(distance_matrix >= 0)
+        
+        # JIT並列効果による性能目標: 0.001ms/計算以下
+        assert per_calculation_time <= 0.001, f"Per-calculation time too high: {per_calculation_time:.4f}ms"
+
+
+class TestJITMeshVectorizationPerformance:
+    """JITメッシュベクトル化パフォーマンステスト"""
+    
+    def test_jit_triangle_quality_performance(self, large_mesh):
+        """JIT三角形品質計算の性能"""
+        
+        # JIT版（ウォームアップ付き）
+        # ウォームアップ
+        small_mesh = TriangleMesh(
+            vertices=large_mesh.vertices[:100],
+            triangles=large_mesh.triangles[:50]
+        )
+        vectorized_triangle_qualities(small_mesh)
+        
+        start_time = time.perf_counter()
+        qualities_jit = vectorized_triangle_qualities(large_mesh)
+        jit_time = (time.perf_counter() - start_time) * 1000
+        
+        # フォールバック版
+        with patch('src.mesh.vectorized.NUMBA_AVAILABLE', False):
+            start_time = time.perf_counter()
+            qualities_fallback = vectorized_triangle_qualities(large_mesh)
+            fallback_time = (time.perf_counter() - start_time) * 1000
+        
+        # 性能比較
+        jit_speedup = fallback_time / jit_time
+        per_triangle_jit = jit_time / max(large_mesh.num_triangles, 1)
+        per_triangle_fallback = fallback_time / max(large_mesh.num_triangles, 1)
+        
+        print(f"\nJIT三角形品質計算性能:")
+        print(f"メッシュ: {large_mesh.num_triangles}三角形")
+        print(f"JIT版: {jit_time:.1f}ms ({per_triangle_jit:.4f}ms/三角形)")
+        print(f"フォールバック版: {fallback_time:.1f}ms ({per_triangle_fallback:.4f}ms/三角形)")
+        print(f"JIT高速化比: {jit_speedup:.1f}x")
+        
+        # 期待値: JITで1.5x以上の高速化
+        assert jit_speedup >= 1.5, f"Expected at least 1.5x JIT speedup, got {jit_speedup:.1f}x"
+        
+        # 結果検証
+        assert len(qualities_jit) == large_mesh.num_triangles
+        assert len(qualities_fallback) == large_mesh.num_triangles
+        np.testing.assert_allclose(qualities_jit, qualities_fallback, rtol=1e-10, atol=1e-12)
+        
+        # JIT効果による性能目標: 0.001ms/三角形以下
+        assert per_triangle_jit <= 0.001, f"JIT per-triangle time too high: {per_triangle_jit:.4f}ms"
+    
+    def test_jit_triangle_validation_performance(self, large_mesh):
+        """JIT三角形有効性検証の性能"""
+        triangle_vertices = large_mesh.vertices[large_mesh.triangles]
+        
+        # ウォームアップ
+        vectorized_is_valid_triangles(triangle_vertices[:50])
+        
+        # JIT版
+        start_time = time.perf_counter()
+        valid_mask_jit = vectorized_is_valid_triangles(triangle_vertices)
+        jit_time = (time.perf_counter() - start_time) * 1000
+        
+        # フォールバック版
+        with patch('src.mesh.vectorized.NUMBA_AVAILABLE', False):
+            start_time = time.perf_counter()
+            valid_mask_fallback = vectorized_is_valid_triangles(triangle_vertices)
+            fallback_time = (time.perf_counter() - start_time) * 1000
+        
+        # 性能比較
+        jit_speedup = fallback_time / jit_time
+        
+        print(f"\nJIT三角形有効性検証性能:")
+        print(f"三角形数: {large_mesh.num_triangles}")
+        print(f"JIT版: {jit_time:.1f}ms")
+        print(f"フォールバック版: {fallback_time:.1f}ms")
+        print(f"JIT高速化比: {jit_speedup:.1f}x")
+        print(f"有効三角形 (JIT): {np.sum(valid_mask_jit)}/{len(valid_mask_jit)}")
+        print(f"有効三角形 (フォールバック): {np.sum(valid_mask_fallback)}/{len(valid_mask_fallback)}")
+        
+        # 結果検証
+        assert len(valid_mask_jit) == large_mesh.num_triangles
+        assert len(valid_mask_fallback) == large_mesh.num_triangles
+        np.testing.assert_array_equal(valid_mask_jit, valid_mask_fallback)
+        
+        # JIT効果による性能目標確認
+        per_triangle_time = jit_time / large_mesh.num_triangles
+        assert per_triangle_time <= 0.0005, f"JIT per-triangle validation time too high: {per_triangle_time:.4f}ms"
+    
+    def test_jit_mesh_processor_comprehensive_performance(self, large_mesh):
+        """JITメッシュプロセッサの包括的性能"""
+        processor = get_mesh_processor()
+        
+        operations = [
+            ("品質フィルタリング", lambda: processor.filter_triangles_by_quality(large_mesh, 0.3)),
+            ("有効性検証", lambda: processor.validate_mesh_triangles(large_mesh)),
+            ("統計計算", lambda: processor.compute_mesh_statistics(large_mesh))
+        ]
+        
+        print(f"\nJITメッシュプロセッサ包括性能 ({large_mesh.num_triangles}三角形):")
+        
+        total_time = 0
+        
+        for operation_name, operation_func in operations:
+            # ウォームアップ
+            try:
+                operation_func()
+            except:
+                pass  # ウォームアップでエラーは無視
+            
+            start_time = time.perf_counter()
+            result = operation_func()
+            elapsed_ms = (time.perf_counter() - start_time) * 1000
+            total_time += elapsed_ms
+            
+            print(f"{operation_name}: {elapsed_ms:.1f}ms")
+            
+            # 結果の妥当性チェック
+            assert result is not None
+        
+        print(f"総処理時間: {total_time:.1f}ms")
+        
+        # JIT効果による全体性能目標
+        per_triangle_total = total_time / large_mesh.num_triangles
+        assert per_triangle_total <= 0.005, f"Total per-triangle time too high: {per_triangle_total:.4f}ms"
+
+
+class TestJITPerformanceTargets:
+    """JIT性能目標達成度テスト"""
+    
+    def test_jit_distance_calculation_target_exceeded(self):
+        """JIT距離計算の向上された性能目標"""
+        point = np.array([1.0, 1.0, 1.0])
+        triangle = np.array([
+            [0.0, 0.0, 0.0],
+            [2.0, 0.0, 0.0],
+            [1.0, 2.0, 0.0]
+        ])
+        
+        calculator = get_distance_calculator()
+        
+        # ウォームアップ
+        for _ in range(10):
+            calculator.calculate_point_triangle_distance(point, triangle)
+        
+        # 性能測定
+        iterations = 2000  # JIT効果により目標を上げる
+        start_time = time.perf_counter()
+        
+        for _ in range(iterations):
+            dist = calculator.calculate_point_triangle_distance(point, triangle)
+        
+        elapsed_time = time.perf_counter() - start_time
+        calculations_per_second = iterations / elapsed_time
+        
+        print(f"\nJIT距離計算性能目標達成度:")
+        print(f"実測: {calculations_per_second:.0f}回/秒")
+        print(f"目標: 2000回/秒 (JIT向上目標)")
+        
+        # JIT効果による向上された目標達成チェック
+        assert calculations_per_second >= 2000, f"JIT性能目標未達: {calculations_per_second:.0f} < 2000"
+    
+    def test_jit_comprehensive_performance_benchmark(self, large_mesh):
+        """JIT包括性能ベンチマーク"""
+        # 実際のワークフローをJIT最適化でテスト
+        query_points = np.random.rand(50, 3) * 5.0
+        
+        print(f"\nJIT包括性能ベンチマーク:")
+        print(f"メッシュ: {large_mesh.num_triangles}三角形")
+        print(f"検索点: {len(query_points)}点")
+        
+        # ウォームアップ
+        small_mesh = TriangleMesh(
+            vertices=large_mesh.vertices[:100],
+            triangles=large_mesh.triangles[:50]
+        )
+        vectorized_triangle_qualities(small_mesh)
+        
+        # JIT最適化版のワークフロー
+        start_time = time.perf_counter()
+        
+        # 1. メッシュ品質計算（JIT最適化）
+        qualities = vectorized_triangle_qualities(large_mesh)
+        
+        # 2. 距離計算（JIT最適化）
+        calculator = get_distance_calculator()
+        total_distances = 0
+        
+        for point in query_points:
+            # 近傍三角形を選択（上位20個）
+            num_nearby = min(20, large_mesh.num_triangles)
+            triangle_indices = np.random.choice(large_mesh.num_triangles, size=num_nearby, replace=False)
+            
+            for tri_idx in triangle_indices:
+                triangle_vertices = large_mesh.vertices[large_mesh.triangles[tri_idx]]
+                dist = calculator.calculate_point_triangle_distance(point, triangle_vertices)
+                total_distances += 1
+        
+        jit_optimized_time = (time.perf_counter() - start_time) * 1000
+        
+        print(f"JIT最適化版: {jit_optimized_time:.1f}ms")
+        print(f"距離計算数: {total_distances}")
+        print(f"1距離計算あたり: {jit_optimized_time/total_distances:.4f}ms")
+        
+        # JIT効果による向上された性能目標
+        per_distance_time = jit_optimized_time / total_distances
+        assert per_distance_time <= 0.05, f"JIT per-distance time too high: {per_distance_time:.4f}ms"
+        
+        # 全体性能目標
+        total_operations = len(query_points) + large_mesh.num_triangles + total_distances
+        per_operation_time = jit_optimized_time / total_operations
+        assert per_operation_time <= 0.01, f"JIT per-operation time too high: {per_operation_time:.4f}ms"
 
 
 if __name__ == "__main__":

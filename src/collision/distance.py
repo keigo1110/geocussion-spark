@@ -3,11 +3,27 @@
 
 点-三角形距離計算の完全ベクトル化実装
 perf-004: 点-三角形距離計算の逐次処理を解決
+Numba JIT コンパイル対応による超高速化
 """
 
 import time
 from typing import List, Tuple, Optional
 import numpy as np
+try:
+    from numba import jit, njit
+    NUMBA_AVAILABLE = True
+except ImportError:
+    NUMBA_AVAILABLE = False
+    # Numba未利用時のダミーデコレータ
+    def jit(*args, **kwargs):
+        def decorator(func):
+            return func
+        return decorator
+    def njit(*args, **kwargs):
+        def decorator(func):
+            return func
+        return decorator
+
 from ..mesh.delaunay import TriangleMesh
 from ..types import CollisionType
 from .. import get_logger
@@ -15,83 +31,114 @@ from .. import get_logger
 logger = get_logger(__name__)
 
 
-def batch_point_triangle_distances(
+@njit(cache=True, fastmath=True)
+def _point_triangle_distance_jit(
+    point: np.ndarray,
+    v0: np.ndarray,
+    v1: np.ndarray,
+    v2: np.ndarray
+) -> float:
+    """
+    JIT最適化された点-三角形距離計算（nopython mode）
+    
+    Args:
+        point: 検査点 (3,)
+        v0, v1, v2: 三角形の頂点 (3,)
+        
+    Returns:
+        最短距離
+    """
+    # エッジベクトル
+    edge1 = v1 - v0
+    edge2 = v2 - v0
+    
+    # 点から v0 への相対位置
+    w = point - v0
+    
+    # 重心座標系での投影計算
+    a = np.dot(edge1, edge1)
+    b = np.dot(edge1, edge2)
+    c = np.dot(edge2, edge2)
+    d = np.dot(w, edge1)
+    e = np.dot(w, edge2)
+    
+    # 重心座標計算
+    denom = a * c - b * b
+    if abs(denom) < 1e-12:
+        # 退化三角形の場合：edge上の最近点を計算
+        t_raw = np.dot(w, edge1) / max(a, 1e-12)
+        t = max(0.0, min(1.0, t_raw))  # manual clipping
+        closest = v0 + t * edge1
+        return np.sqrt(np.sum((point - closest) ** 2))
+    
+    s = (b * e - c * d) / denom
+    t = (b * d - a * e) / denom
+    
+    # 重心座標による最近点決定
+    if s >= 0.0 and t >= 0.0 and s + t <= 1.0:
+        # 三角形内部
+        closest = v0 + s * edge1 + t * edge2
+    else:
+        # 境界上の最近点を計算
+        # エッジ v0-v1 上
+        t1_raw = d / max(a, 1e-12)
+        t1 = max(0.0, min(1.0, t1_raw))  # manual clipping
+        p1 = v0 + t1 * edge1
+        dist1_sq = np.sum((point - p1) ** 2)
+        
+        # エッジ v0-v2 上
+        t2_raw = e / max(c, 1e-12)
+        t2 = max(0.0, min(1.0, t2_raw))  # manual clipping
+        p2 = v0 + t2 * edge2
+        dist2_sq = np.sum((point - p2) ** 2)
+        
+        # エッジ v1-v2 上
+        edge3 = v2 - v1
+        w3 = point - v1
+        t3_raw = np.dot(w3, edge3) / max(np.dot(edge3, edge3), 1e-12)
+        t3 = max(0.0, min(1.0, t3_raw))  # manual clipping
+        p3 = v1 + t3 * edge3
+        dist3_sq = np.sum((point - p3) ** 2)
+        
+        # 最小距離の点を選択
+        if dist1_sq <= dist2_sq and dist1_sq <= dist3_sq:
+            closest = p1
+        elif dist2_sq <= dist3_sq:
+            closest = p2
+        else:
+            closest = p3
+    
+    return np.sqrt(np.sum((point - closest) ** 2))
+
+
+@njit(cache=True, fastmath=True, parallel=True)
+def _batch_distances_jit(
     points: np.ndarray,
-    triangle_vertices: np.ndarray
+    triangles: np.ndarray
 ) -> np.ndarray:
     """
-    複数の点と複数の三角形の距離を一括計算（完全ベクトル化）
+    JIT最適化されたバッチ距離計算（parallel mode）
     
     Args:
         points: 点群 (N, 3)
-        triangle_vertices: 三角形頂点 (M, 3, 3) - M個の三角形、各3頂点
+        triangles: 三角形頂点群 (M, 3, 3)
         
     Returns:
-        距離行列 (N, M) - points[i] と triangles[j] の距離
+        距離行列 (N, M)
     """
     N = points.shape[0]
-    M = triangle_vertices.shape[0]
-    
-    # 結果配列を事前割り当て
+    M = triangles.shape[0]
     distances = np.zeros((N, M), dtype=np.float32)
     
-    # 三角形のエッジベクトルを事前計算 (M, 2, 3)
-    v0 = triangle_vertices[:, 0]  # (M, 3)
-    v1 = triangle_vertices[:, 1]  # (M, 3)
-    v2 = triangle_vertices[:, 2]  # (M, 3)
-    
-    edge1 = v1 - v0  # (M, 3)
-    edge2 = v2 - v0  # (M, 3)
-    
-    # 法線ベクトルを事前計算 (M, 3)
-    normals = np.cross(edge1, edge2)
-    normal_lengths = np.linalg.norm(normals, axis=1, keepdims=True)
-    
-    # ゼロ除算回避
-    normal_lengths = np.maximum(normal_lengths, 1e-12)
-    unit_normals = normals / normal_lengths
-    
-    # 各点について一括計算
+    # 並列化されたループ
     for i in range(N):
-        point = points[i]  # (3,)
-        
-        # 点から三角形v0への相対位置 (M, 3)
-        w = point[np.newaxis, :] - v0  # (M, 3)
-        
-        # 重心座標系での投影計算 (ベクトル化)
-        a = np.sum(edge1 * edge1, axis=1)  # (M,)
-        b = np.sum(edge1 * edge2, axis=1)  # (M,)
-        c = np.sum(edge2 * edge2, axis=1)  # (M,)
-        d = np.sum(w * edge1, axis=1)      # (M,)
-        e = np.sum(w * edge2, axis=1)      # (M,)
-        
-        # 重心座標計算
-        denom = a * c - b * b
-        denom = np.maximum(denom, 1e-12)  # ゼロ除算回避
-        
-        s = (b * e - c * d) / denom
-        t = (b * d - a * e) / denom
-        
-        # 条件分岐をベクトル化
-        # ケース1: 三角形内部 (s >= 0, t >= 0, s + t <= 1)
-        inside_mask = (s >= 0) & (t >= 0) & (s + t <= 1)
-        
-        # ケース2: エッジ・頂点上
-        s_clamped = np.clip(s, 0, 1)
-        t_clamped = np.clip(t, 0, 1)
-        sum_clamped = np.clip(s_clamped + t_clamped, 0, 1)
-        
-        # s + t > 1の場合の再正規化
-        overflow_mask = (s_clamped + t_clamped) > 1
-        normalization_factor = np.where(overflow_mask, sum_clamped / (s_clamped + t_clamped + 1e-12), 1.0)
-        s_final = s_clamped * normalization_factor
-        t_final = t_clamped * normalization_factor
-        
-        # 最近接点計算 (M, 3)
-        closest_points = v0 + s_final[:, np.newaxis] * edge1 + t_final[:, np.newaxis] * edge2
-        
-        # 距離計算
-        distances[i, :] = np.linalg.norm(point[np.newaxis, :] - closest_points, axis=1)
+        for j in range(M):
+            distances[i, j] = _point_triangle_distance_jit(
+                points[i],
+                triangles[j, 0],
+                triangles[j, 1],
+                triangles[j, 2]
+            )
     
     return distances
 
@@ -101,23 +148,41 @@ def point_triangle_distance_vectorized(
     triangle_vertices: np.ndarray
 ) -> float:
     """
-    単一点と単一三角形の距離（ベクトル化版）
+    高速化された点-三角形距離計算（JIT対応）
     
     Args:
-        point: 3D点 (3,)
+        point: 検査点 (3,)
         triangle_vertices: 三角形頂点 (3, 3)
         
     Returns:
         最短距離
     """
-    v0, v1, v2 = triangle_vertices
+    # NumPy配列の型確認・変換
+    point = np.asarray(point, dtype=np.float64)
+    triangle_vertices = np.asarray(triangle_vertices, dtype=np.float64)
     
-    # エッジベクトル
+    if NUMBA_AVAILABLE:
+        # JIT最適化版を使用
+        return _point_triangle_distance_jit(
+            point,
+            triangle_vertices[0],
+            triangle_vertices[1],
+            triangle_vertices[2]
+        )
+    else:
+        # フォールバック版（従来の実装）
+        logger.warning("Numba not available, using fallback implementation")
+        return _point_triangle_distance_fallback(point, triangle_vertices)
+
+
+def _point_triangle_distance_fallback(point: np.ndarray, triangle_vertices: np.ndarray) -> float:
+    """Numba無効時のフォールバック実装"""
+    # ... existing code ...
+    v0, v1, v2 = triangle_vertices
     edge1 = v1 - v0
     edge2 = v2 - v0
     w = point - v0
     
-    # 重心座標計算
     a = np.dot(edge1, edge1)
     b = np.dot(edge1, edge2)
     c = np.dot(edge2, edge2)
@@ -126,48 +191,72 @@ def point_triangle_distance_vectorized(
     
     denom = a * c - b * b
     if abs(denom) < 1e-12:
-        # 退化三角形の場合は最も近い頂点への距離を返す
-        dists = [
-            np.linalg.norm(point - v0),
-            np.linalg.norm(point - v1),
-            np.linalg.norm(point - v2)
-        ]
-        return min(dists)
+        t = np.clip(np.dot(w, edge1) / max(a, 1e-12), 0.0, 1.0)
+        closest = v0 + t * edge1
+        return np.linalg.norm(point - closest)
     
     s = (b * e - c * d) / denom
     t = (b * d - a * e) / denom
     
-    # 重心座標による場合分け
-    if s >= 0 and t >= 0 and s + t <= 1:
-        # 三角形内部
-        closest_point = v0 + s * edge1 + t * edge2
+    if s >= 0.0 and t >= 0.0 and s + t <= 1.0:
+        closest = v0 + s * edge1 + t * edge2
     else:
-        # エッジまたは頂点上の最近接点を探す
-        candidates = []
-        
-        # エッジv0-v1上の最近接点
-        t1 = np.clip(np.dot(w, edge1) / max(np.dot(edge1, edge1), 1e-12), 0, 1)
+        # 境界計算
+        t1 = np.clip(d / max(a, 1e-12), 0.0, 1.0)
         p1 = v0 + t1 * edge1
-        candidates.append(p1)
         
-        # エッジv0-v2上の最近接点
-        t2 = np.clip(np.dot(w, edge2) / max(np.dot(edge2, edge2), 1e-12), 0, 1)
+        t2 = np.clip(e / max(c, 1e-12), 0.0, 1.0)
         p2 = v0 + t2 * edge2
-        candidates.append(p2)
         
-        # エッジv1-v2上の最近接点
         edge3 = v2 - v1
         w3 = point - v1
-        t3 = np.clip(np.dot(w3, edge3) / max(np.dot(edge3, edge3), 1e-12), 0, 1)
+        t3 = np.clip(np.dot(w3, edge3) / max(np.dot(edge3, edge3), 1e-12), 0.0, 1.0)
         p3 = v1 + t3 * edge3
-        candidates.append(p3)
         
-        # 最短距離の候補を選択
-        distances = [np.linalg.norm(point - p) for p in candidates]
-        min_idx = np.argmin(distances)
-        closest_point = candidates[min_idx]
+        distances = [
+            np.linalg.norm(point - p1),
+            np.linalg.norm(point - p2),
+            np.linalg.norm(point - p3)
+        ]
+        return min(distances)
     
-    return np.linalg.norm(point - closest_point)
+    return np.linalg.norm(point - closest)
+
+
+def batch_point_triangle_distances(
+    points: np.ndarray,
+    triangle_vertices: np.ndarray
+) -> np.ndarray:
+    """
+    複数の点と複数の三角形の距離を一括計算（JIT最適化）
+    
+    Args:
+        points: 点群 (N, 3)
+        triangle_vertices: 三角形頂点 (M, 3, 3) - M個の三角形、各3頂点
+        
+    Returns:
+        距離行列 (N, M) - points[i] と triangles[j] の距離
+    """
+    # NumPy配列の型確認・変換
+    points = np.asarray(points, dtype=np.float64)
+    triangle_vertices = np.asarray(triangle_vertices, dtype=np.float64)
+    
+    if NUMBA_AVAILABLE and points.shape[0] * triangle_vertices.shape[0] > 100:
+        # 大規模計算の場合はJIT並列化版を使用
+        return _batch_distances_jit(points, triangle_vertices)
+    else:
+        # 小規模またはフォールバック
+        N = points.shape[0]
+        M = triangle_vertices.shape[0]
+        distances = np.zeros((N, M), dtype=np.float32)
+        
+        for i in range(N):
+            for j in range(M):
+                distances[i, j] = point_triangle_distance_vectorized(
+                    points[i], triangle_vertices[j]
+                )
+        
+        return distances
 
 
 def batch_search_distances_optimized(

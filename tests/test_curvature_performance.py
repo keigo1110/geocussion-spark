@@ -316,6 +316,239 @@ class TestCurvaturePerformance:
         print(f"  総計算回数: {stats.get('total_calculations', 0)}")
         print(f"  平均時間:   {stats.get('average_time_ms', 0):.1f}ms")
 
+    def test_jit_vs_vectorized_performance_comparison(self, medium_mesh):
+        """JIT最適化 vs ベクトル化版の性能比較"""
+        
+        # JIT最適化版
+        calculator_jit = VectorizedCurvatureCalculator(use_jit=True, enable_caching=False)
+        
+        # JITウォームアップ（初回コンパイル）
+        warmup_mesh = TriangleMesh(
+            vertices=medium_mesh.vertices[:100],
+            triangles=medium_mesh.triangles[:50]
+        )
+        calculator_jit.compute_curvatures(warmup_mesh)
+        
+        # JIT版性能測定
+        start_time = time.perf_counter()
+        result_jit = calculator_jit.compute_curvatures(medium_mesh)
+        jit_time = (time.perf_counter() - start_time) * 1000
+        
+        # ベクトル化版（JIT無効）
+        calculator_vectorized = VectorizedCurvatureCalculator(use_jit=False, enable_caching=False)
+        
+        start_time = time.perf_counter()
+        result_vectorized = calculator_vectorized.compute_curvatures(medium_mesh)
+        vectorized_time = (time.perf_counter() - start_time) * 1000
+        
+        # パフォーマンス比較
+        jit_speedup = vectorized_time / jit_time
+        
+        print(f"\nJIT vs ベクトル化 性能比較 (メッシュ: {medium_mesh.num_vertices}頂点):")
+        print(f"  JIT最適化版:      {jit_time:.1f}ms")
+        print(f"  ベクトル化版:      {vectorized_time:.1f}ms")
+        print(f"  JIT高速化比:      {jit_speedup:.1f}x")
+        
+        # 期待値: JITで1.5x以上の高速化
+        assert jit_speedup >= 1.5, f"Expected at least 1.5x JIT speedup, got {jit_speedup:.1f}x"
+        
+        # 結果の整合性確認
+        np.testing.assert_allclose(
+            result_jit.vertex_curvatures, 
+            result_vectorized.vertex_curvatures, 
+            rtol=1e-10, atol=1e-12
+        )
+        
+        # JIT統計確認
+        jit_stats = calculator_jit.get_performance_stats()
+        assert jit_stats['jit_calculations'] > 0, "JIT calculations should have been used"
+        
+        vectorized_stats = calculator_vectorized.get_performance_stats()
+        assert vectorized_stats['fallback_calculations'] > 0, "Fallback calculations should have been used"
+    
+    def test_jit_compilation_overhead(self, small_mesh):
+        """JITコンパイル時間のオーバーヘッド測定"""
+        
+        # 初回実行（コンパイル時間込み）
+        calculator = VectorizedCurvatureCalculator(use_jit=True, enable_caching=False)
+        
+        start_time = time.perf_counter()
+        first_result = calculator.compute_curvatures(small_mesh)
+        first_time = (time.perf_counter() - start_time) * 1000
+        
+        # 2回目実行（コンパイル済み）
+        start_time = time.perf_counter()
+        second_result = calculator.compute_curvatures(small_mesh)
+        second_time = (time.perf_counter() - start_time) * 1000
+        
+        # コンパイル効果
+        compilation_overhead = first_time - second_time
+        compilation_speedup = first_time / second_time
+        
+        print(f"\nJITコンパイル効果:")
+        print(f"  初回実行時間:     {first_time:.1f}ms (コンパイル込み)")
+        print(f"  2回目実行時間:    {second_time:.1f}ms (コンパイル済み)")
+        print(f"  コンパイル時間:   {compilation_overhead:.1f}ms")
+        print(f"  コンパイル後高速化: {compilation_speedup:.1f}x")
+        
+        # 結果一致確認
+        np.testing.assert_array_equal(first_result.vertex_curvatures, second_result.vertex_curvatures)
+        
+        # コンパイル後は高速化されることを確認
+        assert compilation_speedup >= 1.2, f"Expected speedup after compilation, got {compilation_speedup:.1f}x"
+    
+    def test_jit_parallel_performance(self, large_mesh):
+        """JIT並列処理の性能確認"""
+        
+        # 並列JIT版
+        calculator_parallel = VectorizedCurvatureCalculator(use_jit=True, enable_caching=False)
+        
+        # ウォームアップ
+        warmup_mesh = TriangleMesh(
+            vertices=large_mesh.vertices[:500],
+            triangles=large_mesh.triangles[:200]
+        )
+        calculator_parallel.compute_curvatures(warmup_mesh)
+        
+        # 並列処理性能測定
+        start_time = time.perf_counter()
+        result_parallel = calculator_parallel.compute_curvatures(large_mesh)
+        parallel_time = (time.perf_counter() - start_time) * 1000
+        
+        # 頂点あたりの処理時間
+        per_vertex_time = parallel_time / large_mesh.num_vertices
+        
+        print(f"\nJIT並列処理性能 (メッシュ: {large_mesh.num_vertices}頂点):")
+        print(f"  総処理時間:       {parallel_time:.1f}ms")
+        print(f"  頂点あたり:       {per_vertex_time:.4f}ms/vertex")
+        
+        # 性能目標: 頂点あたり0.005ms以下（JIT効果による目標向上）
+        assert per_vertex_time <= 0.005, f"JIT per-vertex time too high: {per_vertex_time:.4f}ms/vertex"
+        
+        # 結果の妥当性確認
+        assert result_parallel.vertex_curvatures.shape[0] == large_mesh.num_vertices
+        assert not np.any(np.isnan(result_parallel.vertex_curvatures))
+        assert not np.any(np.isinf(result_parallel.vertex_curvatures))
+    
+    def test_jit_memory_efficiency(self, medium_mesh):
+        """JIT版のメモリ効率確認"""
+        import psutil
+        import os
+        
+        process = psutil.Process(os.getpid())
+        
+        # 初期メモリ使用量
+        initial_memory = process.memory_info().rss / 1024 / 1024  # MB
+        
+        calculator = VectorizedCurvatureCalculator(use_jit=True, enable_caching=False)
+        
+        # 複数回実行してメモリリークをチェック
+        memory_measurements = []
+        
+        for i in range(10):
+            result = calculator.compute_curvatures(medium_mesh)
+            current_memory = process.memory_info().rss / 1024 / 1024
+            memory_measurements.append(current_memory)
+        
+        final_memory = memory_measurements[-1]
+        max_memory = max(memory_measurements)
+        memory_increase = final_memory - initial_memory
+        
+        print(f"\nJIT版メモリ効率:")
+        print(f"  初期メモリ:       {initial_memory:.1f}MB")
+        print(f"  最終メモリ:       {final_memory:.1f}MB")
+        print(f"  最大メモリ:       {max_memory:.1f}MB")
+        print(f"  メモリ増加:       {memory_increase:.1f}MB")
+        
+        # メモリ増加は50MB以下であることを確認
+        assert memory_increase <= 50.0, f"Too much memory increase: {memory_increase:.1f}MB"
+    
+    def test_jit_fallback_behavior(self, small_mesh):
+        """JIT無効時のフォールバック動作確認"""
+        
+        # Numba無効環境をシミュレート
+        with patch('src.mesh.curvature_vectorized.NUMBA_AVAILABLE', False):
+            calculator = VectorizedCurvatureCalculator(use_jit=True, enable_caching=False)
+            
+            start_time = time.perf_counter()
+            result_fallback = calculator.compute_curvatures(small_mesh)
+            fallback_time = (time.perf_counter() - start_time) * 1000
+            
+            # フォールバック統計確認
+            stats = calculator.get_performance_stats()
+            assert stats['fallback_calculations'] > 0, "Should use fallback when Numba unavailable"
+            assert stats['jit_calculations'] == 0, "Should not use JIT when unavailable"
+        
+        # JIT有効版と比較
+        calculator_jit = VectorizedCurvatureCalculator(use_jit=True, enable_caching=False)
+        start_time = time.perf_counter()
+        result_jit = calculator_jit.compute_curvatures(small_mesh)
+        jit_time = (time.perf_counter() - start_time) * 1000
+        
+        print(f"\nJITフォールバック動作:")
+        print(f"  JIT有効:          {jit_time:.1f}ms")
+        print(f"  フォールバック:   {fallback_time:.1f}ms")
+        
+        # 結果は一致する必要がある
+        np.testing.assert_allclose(
+            result_jit.vertex_curvatures, 
+            result_fallback.vertex_curvatures, 
+            rtol=1e-10, atol=1e-12
+        )
+    
+    def test_jit_batch_processing_optimization(self, large_mesh):
+        """JITバッチ処理最適化効果"""
+        
+        calculator = VectorizedCurvatureCalculator(use_jit=True, enable_caching=False)
+        
+        # 大規模バッチ処理
+        batch_meshes = []
+        for i in range(5):
+            # 大規模メッシュから部分メッシュを作成
+            vertex_subset = np.random.choice(large_mesh.num_vertices, size=1000, replace=False)
+            triangle_subset = []
+            
+            for triangle in large_mesh.triangles:
+                if all(v in vertex_subset for v in triangle):
+                    # 新しいインデックスにマッピング
+                    mapped_triangle = [np.where(vertex_subset == v)[0][0] for v in triangle]
+                    triangle_subset.append(mapped_triangle)
+            
+            if len(triangle_subset) > 100:  # 十分な三角形がある場合のみ
+                batch_mesh = TriangleMesh(
+                    vertices=large_mesh.vertices[vertex_subset],
+                    triangles=np.array(triangle_subset[:500])  # 最大500三角形
+                )
+                batch_meshes.append(batch_mesh)
+        
+        # バッチ処理時間測定
+        start_time = time.perf_counter()
+        
+        batch_results = []
+        for mesh in batch_meshes:
+            result = calculator.compute_curvatures(mesh)
+            batch_results.append(result)
+        
+        batch_time = (time.perf_counter() - start_time) * 1000
+        
+        # 統計
+        total_vertices = sum(mesh.num_vertices for mesh in batch_meshes)
+        per_vertex_batch_time = batch_time / total_vertices
+        
+        print(f"\nJITバッチ処理最適化:")
+        print(f"  バッチ数:         {len(batch_meshes)}")
+        print(f"  総頂点数:         {total_vertices}")
+        print(f"  総処理時間:       {batch_time:.1f}ms")
+        print(f"  頂点あたり:       {per_vertex_batch_time:.4f}ms/vertex")
+        
+        # バッチ処理での頂点あたり時間が目標以下
+        assert per_vertex_batch_time <= 0.003, f"Batch per-vertex time too high: {per_vertex_batch_time:.4f}ms"
+        
+        # 全結果が妥当
+        for result in batch_results:
+            assert not np.any(np.isnan(result.vertex_curvatures))
+            assert not np.any(np.isinf(result.vertex_curvatures))
+
 
 @pytest.mark.performance
 class TestResourceManagerPerformance:
