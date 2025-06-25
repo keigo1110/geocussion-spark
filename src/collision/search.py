@@ -19,6 +19,7 @@ from ..detection.tracker import TrackedHand
 from .sphere_tri import point_triangle_distance
 from .types import SearchStrategy, SearchResult
 from ..config import get_config
+from .optimization import optimize_array_operations, memory_efficient_context
 
 
 class CollisionSearcher:
@@ -76,6 +77,7 @@ class CollisionSearcher:
             'nodes_visited_total': 0
         }
     
+    @optimize_array_operations
     def search_near_hand(self, hand: TrackedHand, override_radius: Optional[float] = None) -> SearchResult:
         """
         手の位置周辺の三角形を検索
@@ -134,6 +136,7 @@ class CollisionSearcher:
             num_nodes_visited=total_nodes_visited
         )
     
+    @optimize_array_operations
     def batch_search_hands(self, hands: List[TrackedHand]) -> List[SearchResult]:
         """
         複数の手を一括検索
@@ -147,13 +150,15 @@ class CollisionSearcher:
         start_time = time.perf_counter()
         results = []
         
-        for hand in hands:
-            if hand.position is not None:
-                result = self.search_near_hand(hand)
-                results.append(result)
-            else:
-                # 無効な手の場合は空の結果
-                results.append(SearchResult([], [], 0.0, np.zeros(3), 0.0, 0))
+        # メモリ効率的なコンテキストで処理
+        with memory_efficient_context() as ctx:
+            for hand in hands:
+                if hand.position is not None:
+                    result = self.search_near_hand(hand)
+                    results.append(result)
+                else:
+                    # 無効な手の場合は空の結果
+                    results.append(SearchResult([], [], 0.0, np.zeros(3), 0.0, 0))
         
         # パフォーマンス統計更新
         batch_time = (time.perf_counter() - start_time) * 1000
@@ -185,11 +190,13 @@ class CollisionSearcher:
         
         search_time = (time.perf_counter() - start_time) * 1000
         
-        result = SearchResult(
+        # 最適化版SearchResultを使用（point.copy()を回避）
+        from .optimization import create_optimized_search_result
+        result = create_optimized_search_result(
             triangle_indices=triangle_indices,
             distances=distances,
             search_time_ms=search_time,
-            query_point=point.copy(),
+            query_point=point,  # copy()せず参照を使用
             search_radius=radius,
             num_nodes_visited=nodes_visited
         )

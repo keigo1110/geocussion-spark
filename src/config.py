@@ -98,6 +98,11 @@ class CollisionConfig:
     # パフォーマンス設定
     enable_adaptive_radius: bool = True
     adaptive_radius_history_size: int = 10
+    
+    # メモリ最適化設定
+    enable_memory_optimization: bool = True       # メモリ最適化を有効にする
+    enable_memory_tracking: bool = False          # メモリ使用量追跡（デバッグ用）
+    array_pool_size: int = 100                    # 配列プールの最大サイズ
 
 
 @dataclass

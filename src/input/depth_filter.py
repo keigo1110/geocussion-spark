@@ -12,6 +12,9 @@ from enum import Enum
 import numpy as np
 import cv2
 
+# メモリ最適化
+from ..collision.optimization import optimize_array_operations, memory_efficient_context, InPlaceOperations
+
 
 class FilterType(Enum):
     """フィルタタイプ"""
@@ -67,9 +70,10 @@ class DepthFilter:
         # パフォーマンス計測
         self.processing_times: Dict[str, float] = {}
         
+    @optimize_array_operations
     def apply_filter(self, depth_image: np.ndarray) -> np.ndarray:
         """
-        深度画像にフィルタを適用
+        深度画像にフィルタを適用（メモリ最適化版）
         
         Args:
             depth_image: 入力深度画像 (H, W)
@@ -79,32 +83,40 @@ class DepthFilter:
         """
         start_time = time.perf_counter()
         
-        # 入力検証
-        if depth_image.dtype != np.uint16:
-            depth_image = depth_image.astype(np.uint16)
-        
-        # 深度範囲マスク作成
-        depth_float = depth_image.astype(np.float32) / 1000.0
-        valid_mask = (depth_float >= self.min_valid_depth) & (depth_float <= self.max_valid_depth)
-        
-        filtered_image = depth_image.copy()
-        
-        # フィルタタイプに応じた処理
-        for filter_type in self.filter_types:
-            if filter_type == FilterType.MEDIAN:
-                filtered_image = self._apply_median_filter(filtered_image, valid_mask)
-            elif filter_type == FilterType.BILATERAL:
-                filtered_image = self._apply_bilateral_filter(filtered_image, valid_mask)
-            elif filter_type == FilterType.TEMPORAL:
-                filtered_image = self._apply_temporal_filter(filtered_image, valid_mask)
-            elif filter_type == FilterType.COMBINED:
-                filtered_image = self._apply_combined_filter(filtered_image, valid_mask)
-        
-        # 無効領域をマスク
-        filtered_image[~valid_mask] = 0
-        
-        self.processing_times['total'] = (time.perf_counter() - start_time) * 1000
-        return filtered_image
+        # メモリ効率的なコンテキストで処理
+        with memory_efficient_context() as ctx:
+            pool = ctx['pool']
+            inplace_ops = ctx['inplace_ops']
+            
+            # 入力検証
+            if depth_image.dtype != np.uint16:
+                depth_image = depth_image.astype(np.uint16)
+            
+            # 深度範囲マスク作成（一時配列使用）
+            with pool.temporary_array(depth_image.shape, 'float32') as depth_float:
+                np.copyto(depth_float, depth_image.astype(np.float32) / 1000.0)
+                valid_mask = (depth_float >= self.min_valid_depth) & (depth_float <= self.max_valid_depth)
+            
+            # 結果配列をプールから取得
+            with pool.temporary_array(depth_image.shape, depth_image.dtype) as filtered_image:
+                np.copyto(filtered_image, depth_image)
+                
+                # フィルタタイプに応じた処理
+                for filter_type in self.filter_types:
+                    if filter_type == FilterType.MEDIAN:
+                        filtered_image[:] = self._apply_median_filter(filtered_image, valid_mask)
+                    elif filter_type == FilterType.BILATERAL:
+                        filtered_image[:] = self._apply_bilateral_filter(filtered_image, valid_mask)
+                    elif filter_type == FilterType.TEMPORAL:
+                        filtered_image[:] = self._apply_temporal_filter(filtered_image, valid_mask)
+                    elif filter_type == FilterType.COMBINED:
+                        filtered_image[:] = self._apply_combined_filter(filtered_image, valid_mask)
+                
+                # 無効領域をマスク（インプレース）
+                filtered_image[~valid_mask] = 0
+                
+                self.processing_times['total'] = (time.perf_counter() - start_time) * 1000
+                return filtered_image.copy()  # 最終的にコピーして返す
     
     def _apply_median_filter(self, depth_image: np.ndarray, valid_mask: np.ndarray) -> np.ndarray:
         """
@@ -174,7 +186,7 @@ class DepthFilter:
         """
         start_time = time.perf_counter()
         
-        # 履歴に追加
+        # 履歴に追加（コピーは必要最小限）
         self.depth_history.append(depth_image.copy())
         
         filtered = depth_image.copy()
