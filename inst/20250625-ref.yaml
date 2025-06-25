@@ -142,10 +142,22 @@ issues:
 
   # パフォーマンス / リソース
   - id: perf-001
-    title: open3d Geometry 追加/削除の度にビューワを再描画
-    location: src/debug/dual_viewer.py::_update_hand_markers()
-    impact: 中 – フレームレート低下。
-    recommendation: Geometry の再利用またはバッチ更新に切り替え。
+    title: メモリリークの可能性
+    status: ✅ 完了 (2025-06-25)
+    location: src/sound/synth.py, src/input/stream.py
+    description: オブジェクトの適切な解放が行われていない可能性
+    impact: 高 – 長時間実行時のメモリ枯渇、アプリケーション不安定化
+    recommendation: 統一リソース管理システムの導入とコンテキストマネージャー対応
+    completion_notes: |
+      ✅ src/resource_manager.py 統一リソース管理システム実装
+      ✅ ManagedResource抽象基底クラス定義（initialize, cleanup, get_memory_usage）
+      ✅ 自動リソースクリーンアップ機能（30秒間隔、アイドル時間監視）
+      ✅ 依存関係管理とライフサイクル制御
+      ✅ AudioSynthesizer のリソース管理対応（pyoサーバー完全クリーンアップ）
+      ✅ OrbbecCamera のリソース管理対応（パイプライン完全クリーンアップ）
+      ✅ コンテキストマネージャー対応とatexit登録
+      ✅ メモリ使用量推定機能とリソース統計
+      ✅ 動作確認完了（既存機能に影響なし）
 
   - id: perf-002
     title: numpy 配列コピーの多用
@@ -158,9 +170,9 @@ next_actions:
   - 低: さらなる型注釈とパフォーマンスチューニング。
 
 progress_summary:
-  completed: 4
+  completed: 5
   partial_completed: 1
   total_issues: 12
-  completion_rate: "33.3% (full) + 8.3% (partial) = 41.6%"
-  last_updated: "2025-06-25 21:53"
+  completion_rate: "41.7% (full) + 8.3% (partial) = 50.0%"
+  last_updated: "2025-06-25 22:01"
   next_priority: "arch-001 (Viewer クラスの肥大化) - 高優先度アーキテクチャ改善"
