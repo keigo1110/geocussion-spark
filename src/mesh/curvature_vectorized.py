@@ -264,17 +264,14 @@ class VectorizedCurvatureCalculator:
     
     def _compute_gaussian_curvatures_jit(self, mesh: TriangleMesh) -> np.ndarray:
         """JIT最適化されたガウス曲率計算"""
-        n_vertices = mesh.num_vertices
+        if self.use_jit:
+            try:
+                return _compute_gaussian_curvatures_fast_jit(mesh.vertices, mesh.triangles)
+            except Exception as e:
+                logger.warning(f"JIT Gaussian curvature calculation failed: {e}, falling back")
         
-        if n_vertices == 0:
-            return np.array([])
-        
-        gaussian_curvatures = np.zeros(n_vertices, dtype=np.float64)
-        
-        # 複雑なJIT処理は一時的に無効化してフォールバックを使用
-        gaussian_curvatures = self._compute_gaussian_curvatures_vectorized(mesh)
-        
-        return gaussian_curvatures
+        # フォールバック版
+        return self._compute_gaussian_angles_jit(mesh)
     
     def _compute_gradients_jit(
         self,
@@ -282,26 +279,22 @@ class VectorizedCurvatureCalculator:
         laplacian: csr_matrix
     ) -> Tuple[np.ndarray, np.ndarray]:
         """JIT最適化された勾配計算"""
-        n_vertices = mesh.num_vertices
-        
-        if n_vertices == 0:
-            return np.zeros((0, 3)), np.zeros(0)
-        
-        # 勾配ベクトル計算（SciPy演算）
-        gradients = np.zeros((n_vertices, 3), dtype=np.float64)
-        
-        for coord_idx in range(3):
-            coord_column = mesh.vertices[:, coord_idx]
-            gradient_component = laplacian.dot(coord_column)
-            gradients[:, coord_idx] = gradient_component
-        
-        # JIT最適化された勾配大きさ計算
         if self.use_jit:
-            gradient_magnitudes = _compute_gradient_magnitudes_jit(gradients)
-        else:
-            gradient_magnitudes = np.linalg.norm(gradients, axis=1)
+            # JIT版: Sparse行列を展開して高速計算
+            try:
+                gradients, gradient_magnitudes = _compute_gradients_jit(
+                    mesh.vertices,
+                    mesh.triangles,
+                    laplacian.data,
+                    laplacian.indices,
+                    laplacian.indptr
+                )
+                return gradients, gradient_magnitudes
+            except Exception as e:
+                logger.warning(f"JIT gradient calculation failed: {e}, falling back")
         
-        return gradients, gradient_magnitudes
+        # フォールバック版
+        return self._compute_gradients_vectorized(mesh, laplacian)
     
     def _compute_gaussian_angles_jit(self, mesh: TriangleMesh) -> np.ndarray:
         """JIT最適化されたガウス曲率角度計算（NumPy互換性向上）"""
@@ -689,4 +682,127 @@ def compute_curvatures_fast(
     """
     calculator = get_curvature_calculator()
     calculator.enable_caching = use_cache
-    return calculator.compute_curvatures(mesh, async_mode=async_mode) 
+    return calculator.compute_curvatures(mesh, async_mode=async_mode)
+
+
+@njit(cache=True, fastmath=True)
+def _compute_gradients_jit(
+    vertices: np.ndarray,
+    triangles: np.ndarray,
+    laplacian_data: np.ndarray,
+    laplacian_indices: np.ndarray,
+    laplacian_indptr: np.ndarray
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    JIT最適化: 勾配計算（Sparse行列手動展開）
+    
+    Args:
+        vertices: 頂点座標 (N, 3)
+        triangles: 三角形インデックス (M, 3)
+        laplacian_data: Sparse行列のデータ
+        laplacian_indices: Sparse行列のインデックス
+        laplacian_indptr: Sparse行列のポインタ
+        
+    Returns:
+        gradients, gradient_magnitudes
+    """
+    n_vertices = vertices.shape[0]
+    gradients = np.zeros((n_vertices, 3), dtype=np.float64)
+    
+    # Sparse行列乗算を手動で実行（JIT対応）
+    for i in range(n_vertices):
+        start_idx = laplacian_indptr[i]
+        end_idx = laplacian_indptr[i + 1]
+        
+        for coord in range(3):
+            grad_component = 0.0
+            for idx in range(start_idx, end_idx):
+                j = laplacian_indices[idx]
+                weight = laplacian_data[idx]
+                grad_component += weight * vertices[j, coord]
+            gradients[i, coord] = grad_component
+    
+    # 勾配の大きさ計算
+    gradient_magnitudes = _compute_gradient_magnitudes_jit(gradients)
+    
+    return gradients, gradient_magnitudes
+
+
+@njit(cache=True, fastmath=True, parallel=True)
+def _compute_gaussian_curvatures_fast_jit(
+    vertices: np.ndarray,
+    triangles: np.ndarray
+) -> np.ndarray:
+    """
+    JIT最適化: 高速ガウス曲率計算
+    
+    Args:
+        vertices: 頂点座標 (N, 3)
+        triangles: 三角形インデックス (M, 3)
+        
+    Returns:
+        ガウス曲率 (N,)
+    """
+    n_vertices = vertices.shape[0]
+    n_triangles = triangles.shape[0]
+    gaussian_curvatures = np.zeros(n_vertices, dtype=np.float64)
+    vertex_areas = np.zeros(n_vertices, dtype=np.float64)
+    
+    # 並列処理で各頂点を処理
+    for vertex_idx in range(n_vertices):
+        angle_sum = 0.0
+        area_sum = 0.0
+        
+        # この頂点を含む三角形を検索
+        for tri_idx in range(n_triangles):
+            triangle = triangles[tri_idx]
+            
+            # 頂点が三角形に含まれるかチェック
+            vertex_in_triangle = False
+            local_vertex_idx = -1
+            for i in range(3):
+                if triangle[i] == vertex_idx:
+                    vertex_in_triangle = True
+                    local_vertex_idx = i
+                    break
+            
+            if not vertex_in_triangle:
+                continue
+            
+            # 三角形の頂点座標取得
+            v0 = vertices[triangle[local_vertex_idx]]
+            v1 = vertices[triangle[(local_vertex_idx + 1) % 3]]
+            v2 = vertices[triangle[(local_vertex_idx + 2) % 3]]
+            
+            # 角度計算
+            edge1 = v1 - v0
+            edge2 = v2 - v0
+            
+            edge1_norm = np.sqrt(np.sum(edge1 ** 2))
+            edge2_norm = np.sqrt(np.sum(edge2 ** 2))
+            
+            if edge1_norm > 1e-12 and edge2_norm > 1e-12:
+                cos_angle = np.dot(edge1, edge2) / (edge1_norm * edge2_norm)
+                # 手動クランプ
+                if cos_angle < -1.0:
+                    cos_angle = -1.0
+                elif cos_angle > 1.0:
+                    cos_angle = 1.0
+                angle = np.arccos(cos_angle)
+                angle_sum += angle
+                
+                # 三角形面積計算（Voronoi面積近似）
+                cross_x = edge1[1] * edge2[2] - edge1[2] * edge2[1]
+                cross_y = edge1[2] * edge2[0] - edge1[0] * edge2[2]
+                cross_z = edge1[0] * edge2[1] - edge1[1] * edge2[0]
+                cross_magnitude = np.sqrt(cross_x**2 + cross_y**2 + cross_z**2)
+                triangle_area = 0.5 * cross_magnitude
+                area_sum += triangle_area / 3.0  # 頂点への面積分散
+        
+        # ガウス曲率計算
+        if area_sum > 1e-12:
+            gaussian_curvatures[vertex_idx] = (2.0 * np.pi - angle_sum) / area_sum
+        
+        vertex_areas[vertex_idx] = area_sum
+    
+    return gaussian_curvatures 

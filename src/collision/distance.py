@@ -223,6 +223,63 @@ def _point_triangle_distance_fallback(point: np.ndarray, triangle_vertices: np.n
     return np.linalg.norm(point - closest)
 
 
+@njit(cache=True, fastmath=True, parallel=True)
+def _batch_point_multiple_triangles_jit(
+    point: np.ndarray,
+    triangles: np.ndarray
+) -> np.ndarray:
+    """
+    JIT最適化: 単一点と複数三角形の距離を並列計算
+    
+    Args:
+        point: 検査点 (3,)
+        triangles: 三角形頂点群 (M, 3, 3)
+        
+    Returns:
+        距離配列 (M,)
+    """
+    M = triangles.shape[0]
+    distances = np.zeros(M, dtype=np.float64)
+    
+    # 並列化されたループ
+    for j in range(M):
+        distances[j] = _point_triangle_distance_jit(
+            point,
+            triangles[j, 0],
+            triangles[j, 1],
+            triangles[j, 2]
+        )
+    
+    return distances
+
+
+@njit(cache=True, fastmath=True)
+def _compute_collision_penalty_jit(
+    distances: np.ndarray,
+    radius: float,
+    penalty_factor: float = 100.0
+) -> np.ndarray:
+    """
+    JIT最適化: 衝突ペナルティ計算
+    
+    Args:
+        distances: 距離配列 (N,)
+        radius: 衝突半径
+        penalty_factor: ペナルティ係数
+        
+    Returns:
+        ペナルティ配列 (N,)
+    """
+    penalties = np.zeros_like(distances)
+    
+    for i in range(len(distances)):
+        if distances[i] < radius:
+            penetration = radius - distances[i]
+            penalties[i] = penalty_factor * penetration * penetration
+    
+    return penalties
+
+
 def batch_point_triangle_distances(
     points: np.ndarray,
     triangle_vertices: np.ndarray
@@ -241,7 +298,10 @@ def batch_point_triangle_distances(
     points = np.asarray(points, dtype=np.float64)
     triangle_vertices = np.asarray(triangle_vertices, dtype=np.float64)
     
-    if NUMBA_AVAILABLE and points.shape[0] * triangle_vertices.shape[0] > 100:
+    # JITコンパイル効果の閾値調整
+    jit_threshold = 50  # より低い閾値で積極的にJIT使用
+    
+    if NUMBA_AVAILABLE and points.shape[0] * triangle_vertices.shape[0] > jit_threshold:
         # 大規模計算の場合はJIT並列化版を使用
         return _batch_distances_jit(points, triangle_vertices)
     else:
@@ -250,11 +310,17 @@ def batch_point_triangle_distances(
         M = triangle_vertices.shape[0]
         distances = np.zeros((N, M), dtype=np.float32)
         
-        for i in range(N):
-            for j in range(M):
-                distances[i, j] = point_triangle_distance_vectorized(
-                    points[i], triangle_vertices[j]
-                )
+        # 単一点 vs 複数三角形の場合に高速化版を使用
+        if N == 1 and NUMBA_AVAILABLE and M > 5:
+            distances[0] = _batch_point_multiple_triangles_jit(
+                points[0], triangle_vertices
+            ).astype(np.float32)
+        else:
+            for i in range(N):
+                for j in range(M):
+                    distances[i, j] = point_triangle_distance_vectorized(
+                        points[i], triangle_vertices[j]
+                    )
         
         return distances
 

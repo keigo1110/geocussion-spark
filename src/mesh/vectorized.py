@@ -481,3 +481,128 @@ def get_mesh_processor() -> VectorizedMeshProcessor:
     if _global_mesh_processor is None:
         _global_mesh_processor = VectorizedMeshProcessor()
     return _global_mesh_processor 
+
+
+@njit(cache=True, fastmath=True, parallel=True)
+def _mesh_statistics_jit(
+    triangle_vertices: np.ndarray
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    JIT最適化: メッシュ統計の一括計算
+    
+    Args:
+        triangle_vertices: 三角形頂点 (M, 3, 3)
+        
+    Returns:
+        areas, qualities, edge_lengths
+    """
+    M = triangle_vertices.shape[0]
+    
+    v0 = triangle_vertices[:, 0]
+    v1 = triangle_vertices[:, 1]
+    v2 = triangle_vertices[:, 2]
+    
+    # 面積計算
+    areas = _triangle_areas_jit(v0, v1, v2)
+    
+    # 品質計算
+    qualities = _triangle_qualities_jit(v0, v1, v2)
+    
+    # エッジ長計算（全エッジ）
+    edge_lengths = np.zeros(M * 3, dtype=np.float64)
+    for i in range(M):
+        # エッジ1: v0 -> v1
+        edge_lengths[i * 3] = np.sqrt(np.sum((v1[i] - v0[i])**2))
+        # エッジ2: v1 -> v2
+        edge_lengths[i * 3 + 1] = np.sqrt(np.sum((v2[i] - v1[i])**2))
+        # エッジ3: v2 -> v0
+        edge_lengths[i * 3 + 2] = np.sqrt(np.sum((v0[i] - v2[i])**2))
+    
+    return areas, qualities, edge_lengths
+
+
+@njit(cache=True, fastmath=True)
+def _filter_by_quality_jit(
+    qualities: np.ndarray,
+    triangles: np.ndarray,
+    threshold: float
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    JIT最適化: 品質による三角形フィルタリング
+    
+    Args:
+        qualities: 品質配列 (M,)
+        triangles: 三角形インデックス (M, 3)
+        threshold: 品質閾値
+        
+    Returns:
+        (good_indices, good_triangles)
+    """
+    # 良い三角形のインデックスを特定
+    good_indices = []
+    for i in range(len(qualities)):
+        if qualities[i] >= threshold:
+            good_indices.append(i)
+    
+    # NumPy配列に変換
+    good_idx_array = np.array(good_indices, dtype=np.int32)
+    
+    # 対応する三角形を抽出
+    good_triangles = np.zeros((len(good_indices), 3), dtype=np.int32)
+    for i, idx in enumerate(good_indices):
+        for j in range(3):
+            good_triangles[i, j] = triangles[idx, j]
+    
+    return good_idx_array, good_triangles
+
+
+def compute_mesh_statistics_fast(mesh: TriangleMesh) -> Dict[str, Any]:
+    """
+    JIT最適化されたメッシュ統計計算
+    
+    Args:
+        mesh: 入力メッシュ
+        
+    Returns:
+        統計辞書
+    """
+    if mesh.num_triangles == 0:
+        return {
+            'num_vertices': mesh.num_vertices,
+            'num_triangles': 0,
+            'total_area': 0.0,
+            'average_area': 0.0,
+            'average_quality': 0.0,
+            'edge_length_stats': {}
+        }
+    
+    triangle_vertices = mesh.vertices[mesh.triangles]
+    
+    if NUMBA_AVAILABLE:
+        # JIT最適化版
+        areas, qualities, edge_lengths = _mesh_statistics_jit(triangle_vertices)
+    else:
+        # フォールバック版
+        areas = vectorized_triangle_areas(mesh)
+        qualities = vectorized_triangle_qualities(mesh)
+        edge_lengths = vectorized_edge_lengths(mesh)
+    
+    stats = {
+        'num_vertices': mesh.num_vertices,
+        'num_triangles': mesh.num_triangles,
+        'total_area': float(np.sum(areas)),
+        'average_area': float(np.mean(areas)),
+        'area_std': float(np.std(areas)),
+        'average_quality': float(np.mean(qualities)),
+        'quality_std': float(np.std(qualities)),
+        'min_quality': float(np.min(qualities)),
+        'max_quality': float(np.max(qualities)),
+        'edge_length_stats': {
+            'min': float(np.min(edge_lengths)),
+            'max': float(np.max(edge_lengths)),
+            'mean': float(np.mean(edge_lengths)),
+            'std': float(np.std(edge_lengths))
+        }
+    }
+    
+    return stats 

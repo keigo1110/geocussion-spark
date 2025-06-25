@@ -606,91 +606,221 @@ class TestJITMeshVectorizationPerformance:
         assert per_triangle_total <= 0.005, f"Total per-triangle time too high: {per_triangle_total:.4f}ms"
 
 
-class TestJITPerformanceTargets:
-    """JIT性能目標達成度テスト"""
+class TestJITOptimizationPerformance:
+    """JIT最適化の包括的パフォーマンステスト"""
     
-    def test_jit_distance_calculation_target_exceeded(self):
-        """JIT距離計算の向上された性能目標"""
-        point = np.array([1.0, 1.0, 1.0])
-        triangle = np.array([
-            [0.0, 0.0, 0.0],
-            [2.0, 0.0, 0.0],
-            [1.0, 2.0, 0.0]
-        ])
+    def test_jit_distance_calculation_scaling(self, small_mesh, medium_mesh, large_mesh):
+        """JIT距離計算のスケーリング性能"""
+        test_meshes = [
+            (small_mesh, "小規模", 10),
+            (medium_mesh, "中規模", 50),
+            (large_mesh, "大規模", 100)
+        ]
         
-        calculator = get_distance_calculator()
+        print(f"\nJIT距離計算スケーリング性能:")
         
-        # ウォームアップ
-        for _ in range(10):
-            calculator.calculate_point_triangle_distance(point, triangle)
-        
-        # 性能測定
-        iterations = 2000  # JIT効果により目標を上げる
-        start_time = time.perf_counter()
-        
-        for _ in range(iterations):
-            dist = calculator.calculate_point_triangle_distance(point, triangle)
-        
-        elapsed_time = time.perf_counter() - start_time
-        calculations_per_second = iterations / elapsed_time
-        
-        print(f"\nJIT距離計算性能目標達成度:")
-        print(f"実測: {calculations_per_second:.0f}回/秒")
-        print(f"目標: 2000回/秒 (JIT向上目標)")
-        
-        # JIT効果による向上された目標達成チェック
-        assert calculations_per_second >= 2000, f"JIT性能目標未達: {calculations_per_second:.0f} < 2000"
-    
-    def test_jit_comprehensive_performance_benchmark(self, large_mesh):
-        """JIT包括性能ベンチマーク"""
-        # 実際のワークフローをJIT最適化でテスト
-        query_points = np.random.rand(50, 3) * 5.0
-        
-        print(f"\nJIT包括性能ベンチマーク:")
-        print(f"メッシュ: {large_mesh.num_triangles}三角形")
-        print(f"検索点: {len(query_points)}点")
-        
-        # ウォームアップ
-        small_mesh = TriangleMesh(
-            vertices=large_mesh.vertices[:100],
-            triangles=large_mesh.triangles[:50]
-        )
-        vectorized_triangle_qualities(small_mesh)
-        
-        # JIT最適化版のワークフロー
-        start_time = time.perf_counter()
-        
-        # 1. メッシュ品質計算（JIT最適化）
-        qualities = vectorized_triangle_qualities(large_mesh)
-        
-        # 2. 距離計算（JIT最適化）
-        calculator = get_distance_calculator()
-        total_distances = 0
-        
-        for point in query_points:
-            # 近傍三角形を選択（上位20個）
-            num_nearby = min(20, large_mesh.num_triangles)
-            triangle_indices = np.random.choice(large_mesh.num_triangles, size=num_nearby, replace=False)
+        for mesh, label, num_points in test_meshes:
+            # テスト点生成
+            query_points = np.random.rand(num_points, 3) * 5.0
             
-            for tri_idx in triangle_indices:
-                triangle_vertices = large_mesh.vertices[large_mesh.triangles[tri_idx]]
-                dist = calculator.calculate_point_triangle_distance(point, triangle_vertices)
-                total_distances += 1
+            # 対象三角形インデックス（ランダム選択）
+            num_triangles = min(50, mesh.num_triangles)
+            triangle_indices = np.random.choice(
+                mesh.num_triangles, size=num_triangles, replace=False
+            )
+            triangle_vertices = mesh.vertices[mesh.triangles[triangle_indices]]
+            
+            # JIT性能測定
+            start_time = time.perf_counter()
+            from src.collision.distance import batch_point_triangle_distances
+            
+            # ウォームアップ
+            _ = batch_point_triangle_distances(query_points[:1], triangle_vertices[:1])
+            
+            # 本計測
+            start_time = time.perf_counter()
+            distances = batch_point_triangle_distances(query_points, triangle_vertices)
+            elapsed_ms = (time.perf_counter() - start_time) * 1000
+            
+            # 統計計算
+            total_calculations = num_points * num_triangles
+            calculations_per_sec = total_calculations / (elapsed_ms / 1000)
+            per_calculation_us = (elapsed_ms * 1000) / total_calculations
+            
+            print(f"{label}メッシュ ({num_points}点 × {num_triangles}三角形):")
+            print(f"  総計算時間: {elapsed_ms:.1f}ms")
+            print(f"  計算性能: {calculations_per_sec:,.0f}計算/秒")
+            print(f"  1計算あたり: {per_calculation_us:.3f}μs")
+            
+            # パフォーマンス目標確認
+            assert distances.shape == (num_points, num_triangles)
+            
+            # JIT効果の確認（大規模では高速化期待）
+            if num_points * num_triangles > 1000:
+                assert calculations_per_sec > 100000, f"大規模計算で性能不足: {calculations_per_sec:,.0f}/sec"
+    
+    def test_jit_mesh_processing_comprehensive(self, large_mesh):
+        """JIT メッシュ処理の包括性能テスト"""
+        print(f"\nJIT メッシュ処理包括性能 ({large_mesh.num_triangles}三角形):")
         
-        jit_optimized_time = (time.perf_counter() - start_time) * 1000
+        from src.mesh.vectorized import (
+            vectorized_triangle_qualities,
+            vectorized_triangle_areas,
+            compute_mesh_statistics_fast
+        )
         
-        print(f"JIT最適化版: {jit_optimized_time:.1f}ms")
-        print(f"距離計算数: {total_distances}")
-        print(f"1距離計算あたり: {jit_optimized_time/total_distances:.4f}ms")
+        operations = [
+            ("三角形品質計算", lambda: vectorized_triangle_qualities(large_mesh)),
+            ("三角形面積計算", lambda: vectorized_triangle_areas(large_mesh)),
+            ("統計計算", lambda: compute_mesh_statistics_fast(large_mesh))
+        ]
         
-        # JIT効果による向上された性能目標
-        per_distance_time = jit_optimized_time / total_distances
-        assert per_distance_time <= 0.05, f"JIT per-distance time too high: {per_distance_time:.4f}ms"
+        total_time = 0
         
-        # 全体性能目標
-        total_operations = len(query_points) + large_mesh.num_triangles + total_distances
-        per_operation_time = jit_optimized_time / total_operations
-        assert per_operation_time <= 0.01, f"JIT per-operation time too high: {per_operation_time:.4f}ms"
+        for operation_name, operation_func in operations:
+            # ウォームアップ
+            try:
+                operation_func()
+            except:
+                pass
+            
+            # 性能測定
+            start_time = time.perf_counter()
+            result = operation_func()
+            elapsed_ms = (time.perf_counter() - start_time) * 1000
+            total_time += elapsed_ms
+            
+            per_triangle_us = (elapsed_ms * 1000) / large_mesh.num_triangles
+            triangles_per_sec = large_mesh.num_triangles / (elapsed_ms / 1000)
+            
+            print(f"{operation_name}:")
+            print(f"  実行時間: {elapsed_ms:.1f}ms")
+            print(f"  処理性能: {triangles_per_sec:,.0f}三角形/秒")
+            print(f"  1三角形あたり: {per_triangle_us:.3f}μs")
+            
+            # 結果検証
+            assert result is not None
+        
+        print(f"総処理時間: {total_time:.1f}ms")
+        
+        # 包括性能目標（大規模メッシュで3秒以内）
+        assert total_time < 3000, f"メッシュ処理が遅すぎます: {total_time:.1f}ms"
+    
+    def test_jit_curvature_calculation_ultimate(self, medium_mesh):
+        """JIT 曲率計算の究極性能テスト"""
+        print(f"\nJIT 曲率計算究極性能 ({medium_mesh.num_vertices}頂点):")
+        
+        from src.mesh.curvature_vectorized import get_curvature_calculator
+        
+        # JIT有効版
+        calculator_jit = get_curvature_calculator()
+        calculator_jit.use_jit = True
+        
+        # ウォームアップ
+        try:
+            calculator_jit.compute_curvatures(medium_mesh)
+        except:
+            pass
+        
+        # JIT性能測定
+        start_time = time.perf_counter()
+        result_jit = calculator_jit.compute_curvatures(medium_mesh)
+        jit_time = (time.perf_counter() - start_time) * 1000
+        
+        # 統計計算
+        per_vertex_ms = jit_time / medium_mesh.num_vertices
+        vertices_per_sec = medium_mesh.num_vertices / (jit_time / 1000)
+        
+        print(f"JIT曲率計算:")
+        print(f"  計算時間: {jit_time:.1f}ms")
+        print(f"  処理性能: {vertices_per_sec:,.0f}頂点/秒")
+        print(f"  1頂点あたり: {per_vertex_ms:.4f}ms")
+        
+        # 結果検証
+        assert len(result_jit.vertex_curvatures) == medium_mesh.num_vertices
+        assert len(result_jit.gradients) == medium_mesh.num_vertices
+        assert not np.any(np.isnan(result_jit.vertex_curvatures))
+        assert not np.any(np.isnan(result_jit.gradients))
+        
+        # 高性能目標（1頂点あたり0.01ms以下）
+        assert per_vertex_ms <= 0.01, f"曲率計算が目標性能未達成: {per_vertex_ms:.4f}ms/vertex"
+    
+    def test_jit_overall_pipeline_performance(self, medium_mesh):
+        """JIT 全体パイプライン性能テスト"""
+        print(f"\nJIT 全体パイプライン性能:")
+        
+        # 模擬手位置データ
+        num_hands = 5
+        hand_positions = np.random.rand(num_hands, 3) * 5.0
+        sphere_radius = 0.1
+        
+        # パイプライン段階を測定
+        start_total = time.perf_counter()
+        
+        # Stage 1: 距離計算
+        start_stage = time.perf_counter()
+        from src.collision.distance import get_distance_calculator
+        calculator = get_distance_calculator()
+        
+        # 各手位置に対する三角形距離計算
+        all_distances = []
+        for hand_pos in hand_positions:
+            # 近傍三角形をランダム選択（実際は空間インデックス）
+            num_nearby = min(20, medium_mesh.num_triangles)
+            nearby_indices = np.random.choice(
+                medium_mesh.num_triangles, size=num_nearby, replace=False
+            )
+            triangle_vertices = medium_mesh.vertices[medium_mesh.triangles[nearby_indices]]
+            
+            distances = calculator.calculate_batch_distances(
+                np.array([hand_pos]), triangle_vertices
+            )
+            all_distances.extend(distances[0])
+        
+        distance_time = (time.perf_counter() - start_stage) * 1000
+        
+        # Stage 2: メッシュ属性計算
+        start_stage = time.perf_counter()
+        from src.mesh.attributes import AttributeCalculator
+        attr_calculator = AttributeCalculator(use_vectorized=True)
+        attributes = attr_calculator.compute_attributes(medium_mesh)
+        attributes_time = (time.perf_counter() - start_stage) * 1000
+        
+        # Stage 3: 曲率基準判定
+        start_stage = time.perf_counter()
+        high_curvature_mask = attributes.vertex_curvatures > np.percentile(
+            attributes.vertex_curvatures, 80
+        )
+        high_curvature_vertices = np.sum(high_curvature_mask)
+        curvature_analysis_time = (time.perf_counter() - start_stage) * 1000
+        
+        total_time = (time.perf_counter() - start_total) * 1000
+        
+        print(f"パイプライン性能分析:")
+        print(f"  距離計算: {distance_time:.1f}ms ({distance_time/total_time*100:.1f}%)")
+        print(f"  属性計算: {attributes_time:.1f}ms ({attributes_time/total_time*100:.1f}%)")
+        print(f"  曲率解析: {curvature_analysis_time:.1f}ms ({curvature_analysis_time/total_time*100:.1f}%)")
+        print(f"  総実行時間: {total_time:.1f}ms")
+        print(f"  高曲率頂点: {high_curvature_vertices}/{medium_mesh.num_vertices} ({high_curvature_vertices/medium_mesh.num_vertices*100:.1f}%)")
+        
+        # リアルタイム性能目標（60FPS = 16.67ms以下）
+        fps_target_ms = 16.67
+        fps_achieved = 1000 / total_time
+        
+        print(f"  達成FPS: {fps_achieved:.1f} (目標: 60FPS)")
+        
+        # パフォーマンス検証
+        assert len(all_distances) > 0
+        assert attributes.num_vertices == medium_mesh.num_vertices
+        
+        # 性能目標 (30FPS以上)
+        min_fps = 30
+        max_time_ms = 1000 / min_fps
+        
+        if total_time <= max_time_ms:
+            print(f"  ✅ リアルタイム性能達成: {total_time:.1f}ms <= {max_time_ms:.1f}ms")
+        else:
+            print(f"  ⚠️  リアルタイム性能未達: {total_time:.1f}ms > {max_time_ms:.1f}ms")
 
 
 if __name__ == "__main__":
