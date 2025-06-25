@@ -32,7 +32,7 @@ logger = logging.getLogger(__name__)
 # OrbbecSDKの動的インポート
 HAS_ORBBEC_SDK = False
 try:
-    from pyorbbecsdk import Pipeline, FrameSet, Config, OBSensorType, OBError
+    from pyorbbecsdk import Pipeline, FrameSet, Config, OBSensorType, OBError, OBFormat
     HAS_ORBBEC_SDK = True
     print("OrbbecSDK is available")
 except ImportError:
@@ -57,6 +57,11 @@ except ImportError:
     
     class OBError(Exception):
         pass
+    
+    class OBFormat:
+        RGB = "rgb"
+        BGR = "bgr"
+        MJPG = "mjpg"
 
 # MediaPipeの動的インポート
 HAS_MEDIAPIPE = False
@@ -187,8 +192,15 @@ class FullPipelineViewer(DualViewer):
         self.mesh_update_interval = kwargs.pop('mesh_update_interval', 10)  # 10フレームごと
         self.max_mesh_skip_frames = kwargs.pop('max_mesh_skip_frames', 60)  # 最大60フレームスキップ
         
+        # ボクセルダウンサンプリングパラメータ（親クラスに渡さない）
+        self.voxel_downsampling_enabled = kwargs.pop('enable_voxel_downsampling', True)
+        self.voxel_size = kwargs.pop('voxel_size', 0.005)  # 5mm デフォルト
+        
         # 親クラス初期化
         super().__init__(**kwargs)
+        
+        # ヘルプテキスト初期化
+        self.help_text = "=== Basic Controls ===\nQ/ESC: Exit\nF: Toggle filter\nH: Toggle hand detection\nT: Toggle tracking\nR: Reset filter\nY: Reset tracker"
         
         # 地形メッシュ生成コンポーネント
         self.projector = PointCloudProjector(
@@ -283,7 +295,19 @@ class FullPipelineViewer(DualViewer):
     
     def update_help_text(self):
         """ヘルプテキストを更新（衝突検出機能を追加）"""
-        super().update_help_text()
+        self.help_text = "=== Basic Controls ===\n"
+        self.help_text += "Q/ESC: Exit\n"
+        self.help_text += "F: Toggle filter\n"
+        self.help_text += "H: Toggle hand detection\n"
+        self.help_text += "T: Toggle tracking\n"
+        self.help_text += "R: Reset filter\n"
+        self.help_text += "Y: Reset tracker\n"
+        
+        # ボクセルダウンサンプリング制御を追加
+        self.help_text += "\n=== Point Cloud Optimization ===\n"
+        self.help_text += "X: Toggle voxel downsampling\n"
+        self.help_text += "Z/Shift+Z: Voxel size -/+ (1mm-10cm)\n"
+        self.help_text += "B: Print voxel performance stats\n"
         
         # 衝突検出関連のキーバインドを追加
         self.help_text += "\n=== 衝突検出制御 ===\n"
@@ -305,12 +329,57 @@ class FullPipelineViewer(DualViewer):
     
     def handle_key_event(self, key):
         """キーイベント処理（衝突検出機能を追加）"""
-        # 親クラスのキーイベント処理
-        if super().handle_key_event(key):
+        # 基本的なキーイベント処理
+        if key == ord('q') or key == 27:  # Q or ESC
+            return False
+        elif key == ord('f'):  # Toggle filter
+            self.enable_filter = not self.enable_filter
+            print(f"Depth filter: {'Enabled' if self.enable_filter else 'Disabled'}")
+            return True
+        elif key == ord('h'):  # Toggle hand detection
+            self.enable_hand_detection = not self.enable_hand_detection
+            print(f"Hand detection: {'Enabled' if self.enable_hand_detection else 'Disabled'}")
+            return True
+        elif key == ord('t'):  # Toggle tracking
+            self.enable_tracking = not self.enable_tracking
+            print(f"Hand tracking: {'Enabled' if self.enable_tracking else 'Disabled'}")
+            return True
+        elif key == ord('r') and self.depth_filter is not None:  # Reset filter
+            self.depth_filter.reset_temporal_history()
+            print("Filter history reset")
+            return True
+        elif key == ord('y') and self.tracker is not None:  # Reset tracker
+            self.tracker.reset()
+            print("Hand tracker reset")
+            return True
+        
+        # ボクセルダウンサンプリング制御
+        elif key == ord('x') or key == ord('X'):  # Toggle voxel downsampling
+            if self.pointcloud_converter:
+                self.pointcloud_converter.toggle_voxel_downsampling()
+            return True
+            
+        elif key == ord('z'):  # Decrease voxel size (higher quality)
+            if self.pointcloud_converter:
+                current_size = self.pointcloud_converter.voxel_size
+                new_size = max(0.001, current_size - 0.001)  # Decrease by 1mm
+                self.pointcloud_converter.set_voxel_size(new_size)
+            return True
+            
+        elif key == ord('Z'):  # Increase voxel size (higher performance)
+            if self.pointcloud_converter:
+                current_size = self.pointcloud_converter.voxel_size
+                new_size = min(0.05, current_size + 0.001)  # Increase by 1mm
+                self.pointcloud_converter.set_voxel_size(new_size)
+            return True
+            
+        elif key == ord('b') or key == ord('B'):  # Print voxel performance stats
+            if self.pointcloud_converter:
+                self.pointcloud_converter.print_performance_stats()
             return True
         
         # 衝突検出関連のキーイベント
-        if key == ord('m') or key == ord('M'):
+        elif key == ord('m') or key == ord('M'):
             self.enable_mesh_generation = not self.enable_mesh_generation
             status = "有効" if self.enable_mesh_generation else "無効"
             print(f"メッシュ生成: {status}")
@@ -466,17 +535,19 @@ class FullPipelineViewer(DualViewer):
                 
                 if not res.triangle_indices: continue
                 
-                info = self.collision_tester.test_sphere_collision(hand_pos_np, self.sphere_radius, res)
-                print(f"[DEBUG] _detect_collisions: Hand {i} collision test result: {info.has_collision}")
-                
-                if info.has_collision:
-                    velocity = np.array(hand.velocity) if hasattr(hand, 'velocity') and hand.velocity is not None else np.zeros(3)
-                    event = self.event_queue.create_event(info, hand.id, hand_pos_np, velocity)
-                    if event:
-                        events.append(event)
-                        for cp in info.contact_points:
-                           self.current_collision_points.append(cp.position)
-                        print(f"[DEBUG] _detect_collisions: Hand {i} generated collision event with {len(info.contact_points)} contact points")
+                # None check for collision_tester
+                if self.collision_tester is not None:
+                    info = self.collision_tester.test_sphere_collision(hand_pos_np, self.sphere_radius, res)
+                    print(f"[DEBUG] _detect_collisions: Hand {i} collision test result: {info.has_collision}")
+                    
+                    if info.has_collision:
+                        velocity = np.array(hand.velocity) if hasattr(hand, 'velocity') and hand.velocity is not None else np.zeros(3)
+                        event = self.event_queue.create_event(info, hand.id, hand_pos_np, velocity)
+                        if event:
+                            events.append(event)
+                            for cp in info.contact_points:
+                               self.current_collision_points.append(cp.position)
+                            print(f"[DEBUG] _detect_collisions: Hand {i} generated collision event with {len(info.contact_points)} contact points")
             except Exception as e:
                 logger.error(f"[DEBUG] _detect_collisions: Error processing hand {i}: {e}")
         
@@ -647,6 +718,19 @@ class FullPipelineViewer(DualViewer):
         print(f"総衝突イベント数: {self.perf_stats['collision_events_count']}")
         print(f"総音響ノート数: {self.perf_stats['audio_notes_played']}")
         
+        # ボクセルダウンサンプリング統計
+        if self.pointcloud_converter:
+            voxel_stats = self.pointcloud_converter.get_performance_stats()
+            print(f"\n--- Point Cloud Optimization ---")
+            print(f"ボクセルダウンサンプリング: {'有効' if voxel_stats.get('voxel_downsampling_enabled', False) else '無効'}")
+            if voxel_stats.get('voxel_downsampling_enabled', False):
+                print(f"  - ボクセルサイズ: {voxel_stats.get('current_voxel_size_mm', 0):.1f}mm")
+                print(f"  - 最新入力点数: {voxel_stats.get('last_input_points', 0):,}")
+                print(f"  - 最新出力点数: {voxel_stats.get('last_output_points', 0):,}")
+                print(f"  - ダウンサンプリング率: {voxel_stats.get('last_downsampling_ratio', 0)*100:.1f}%")
+                avg_time = voxel_stats.get('average_time_ms', 0)
+                print(f"  - 平均処理時間: {avg_time:.2f}ms")
+        
         if self.current_mesh:
             print(f"現在のメッシュ: {self.current_mesh.num_triangles}三角形")
         
@@ -678,16 +762,25 @@ class FullPipelineViewer(DualViewer):
         if not self._components_initialized and hasattr(self, 'camera') and self.camera is not None:
             try:
                 print("Setting up 3D hand detection components...")
-                # 信頼度閾値を下げてテスト
-                self.projector_3d = Hand3DProjector(
-                    self.camera.depth_intrinsics,
-                    min_confidence_3d=0.1  # 10%に下げてテスト
-                )
-                self.tracker = Hand3DTracker()
-                self._components_initialized = True
-                print("3D hand detection components initialized with lowered confidence threshold")
+                # カメラの初期化確認
+                if self.camera.depth_intrinsics is not None:
+                    # 信頼度閾値を下げてテスト
+                    self.projector_3d = Hand3DProjector(
+                        self.camera.depth_intrinsics,
+                        min_confidence_3d=0.1  # 10%に下げてテスト
+                    )
+                    self.tracker = Hand3DTracker()
+                    self._components_initialized = True
+                    print("3D hand detection components initialized with lowered confidence threshold")
+                else:
+                    print("Camera depth intrinsics not available")
             except Exception as e:
                 print(f"3D component initialization error: {e}")
+        
+        # カメラがない場合は終了
+        if self.camera is None:
+            print("Camera not available")
+            return False
         
         # フレーム取得
         frame_data = self.camera.get_frame(timeout_ms=100)
@@ -696,9 +789,14 @@ class FullPipelineViewer(DualViewer):
         
         # 深度画像の抽出
         depth_data = np.frombuffer(frame_data.depth_frame.get_data(), dtype=np.uint16)
-        depth_image = depth_data.reshape(
-            (self.camera.depth_intrinsics.height, self.camera.depth_intrinsics.width)
-        )
+        # カメラの内部パラメータチェック
+        if self.camera.depth_intrinsics is not None:
+            depth_image = depth_data.reshape(
+                (self.camera.depth_intrinsics.height, self.camera.depth_intrinsics.width)
+            )
+        else:
+            print("Depth intrinsics not available")
+            return True
         
         # フィルタ適用
         filter_start_time = time.perf_counter()
@@ -769,7 +867,8 @@ class FullPipelineViewer(DualViewer):
         
         if mesh_condition_check:
             mesh_start = time.perf_counter()
-            print(f"[MESH] Frame {self.frame_count}: *** UPDATING TERRAIN MESH *** with {len(points_3d)} points")
+            points_len = len(points_3d) if points_3d is not None else 0
+            print(f"[MESH] Frame {self.frame_count}: *** UPDATING TERRAIN MESH *** with {points_len} points")
             self._update_terrain_mesh(points_3d)
             self.last_mesh_update = self.frame_count
             # 強制更新フラグをクリア
@@ -1008,9 +1107,14 @@ class FullPipelineViewer(DualViewer):
         try:
             # 深度画像をカラーマップで可視化
             depth_data = np.frombuffer(frame_data.depth_frame.get_data(), dtype=np.uint16)
-            depth_image = depth_data.reshape(
-                (self.camera.depth_intrinsics.height, self.camera.depth_intrinsics.width)
-            )
+            # カメラの内部パラメータチェック
+            if self.camera.depth_intrinsics is not None:
+                depth_image = depth_data.reshape(
+                    (self.camera.depth_intrinsics.height, self.camera.depth_intrinsics.width)
+                )
+            else:
+                print("Depth intrinsics not available for RGB display")
+                return True
             
             # 深度画像を表示用に正規化
             depth_normalized = cv2.normalize(depth_image, None, 0, 255, cv2.NORM_MINMAX, dtype=cv2.CV_8U)
@@ -1193,6 +1297,16 @@ class FullPipelineViewer(DualViewer):
             f"Events: {len(collision_events)}",
             f"Sphere R: {self.sphere_radius*100:.1f}cm"
         ]
+        
+        # ボクセルダウンサンプリング情報
+        if self.pointcloud_converter:
+            voxel_stats = self.pointcloud_converter.get_performance_stats()
+            if voxel_stats.get('voxel_downsampling_enabled', False):
+                ratio = voxel_stats.get('last_downsampling_ratio', 0)
+                voxel_size = voxel_stats.get('current_voxel_size_mm', 0)
+                info_lines.append(f"Voxel: {ratio*100:.0f}% @ {voxel_size:.1f}mm")
+            else:
+                info_lines.append("Voxel: OFF")
         
         if self.current_mesh:
             info_lines.append(f"Triangles: {self.current_mesh.num_triangles}")
