@@ -817,14 +817,19 @@ class FullPipelineViewer(DualViewer):
             if need_points_for_mesh:
                 print(f"[MESH-PREP] Frame {self.frame_count}: Generated points for mesh update: {len(points_3d) if points_3d is not None else 'None'}")
         
-        # 手検出処理（重複排除：既に_process_frameで実行済みの結果を使用）
-        hands_2d = getattr(self, 'current_hands_2d', [])
-        hands_3d = getattr(self, 'current_hands_3d', [])
-        tracked_hands = getattr(self, 'current_tracked_hands', [])
+        # 手検出処理（一元化：ここで1回のみ実行）
+        hands_2d, hands_3d, tracked_hands = [], [], []
         
-        # 重複排除：_process_frameで既に実行済み
+        # 実際に手検出を実行（DualViewerから継承したメソッドを使用）
+        if self.enable_hand_detection and self.hands_2d is not None:
+            hand_start_time = time.perf_counter()
+            hands_2d, hands_3d, tracked_hands = self._process_hand_detection(depth_image)
+            self.performance_stats['hand_detection_time'] = (time.perf_counter() - hand_start_time) * 1000
+            print(f"[HAND-OPTIMIZED] Frame {self.frame_count}: Hand detection completed in {self.performance_stats['hand_detection_time']:.1f}ms - 2D:{len(hands_2d)}, 3D:{len(hands_3d)}, Tracked:{len(tracked_hands)}")
+        else:
+            self.performance_stats['hand_detection_time'] = 0.0
         
-        # 手検出結果をクラス変数に保存（DualViewerの重複処理を避けるため）
+        # 手検出結果をクラス変数に保存（RGB表示で使い回すため）
         self.current_hands_2d = hands_2d
         self.current_hands_3d = hands_3d
         self.current_tracked_hands = tracked_hands
@@ -1120,31 +1125,17 @@ class FullPipelineViewer(DualViewer):
             depth_normalized = cv2.normalize(depth_image, None, 0, 255, cv2.NORM_MINMAX, dtype=cv2.CV_8U)
             depth_colored = cv2.applyColorMap(depth_normalized, cv2.COLORMAP_JET)
             
-            # 手検出処理（実際に手検出を実行）
-            # 手検出開始時間を記録
-            hand_start_time = time.perf_counter()
-            hands_2d, hands_3d, tracked_hands = [], [], []
+            # 手検出処理（重複排除：_process_frameで既に実行済みの結果を使用）
+            hands_2d = getattr(self, 'current_hands_2d', [])
+            hands_3d = getattr(self, 'current_hands_3d', [])
+            tracked_hands = getattr(self, 'current_tracked_hands', [])
             
-            # 実際に手検出を実行
-            if self.enable_hand_detection and self.hands_2d is not None:
-                print(f"[HAND-DEBUG] Frame {self.frame_count}: Starting hand detection...")
-                hands_2d, hands_3d, tracked_hands = self._process_hand_detection(depth_image)
-                print(f"[HAND-DEBUG] Frame {self.frame_count}: Hand detection completed - 2D:{len(hands_2d)}, 3D:{len(hands_3d)}, Tracked:{len(tracked_hands)}")
-                
-                # デバッグ: 手検出の詳細情報
-                for i, hand in enumerate(hands_2d):
-                    print(f"[HAND-DEBUG] Hand {i}: confidence={hand.confidence:.3f}, handedness={hand.handedness.value}")
-            else:
-                print(f"[HAND-DEBUG] Frame {self.frame_count}: Hand detection disabled or not initialized (enabled={self.enable_hand_detection}, hands_2d={self.hands_2d is not None})")
+            # デバッグ情報（重複実行排除済み）
+            if len(hands_2d) > 0 or len(hands_3d) > 0 or len(tracked_hands) > 0:
+                print(f"[HAND-DEBUG] Frame {self.frame_count}: Using cached hand detection results - 2D:{len(hands_2d)}, 3D:{len(hands_3d)}, Tracked:{len(tracked_hands)}")
             
-            # 3D投影とトラッキングは_process_hand_detection内で実行済み
-            # 結果を現在のフレーム用に保存
-            self.current_hands_2d = hands_2d
-            self.current_hands_3d = hands_3d
-            self.current_tracked_hands = tracked_hands
-            
-            self.performance_stats['hand_detection_time'] = (time.perf_counter() - hand_start_time) * 1000
-            print(f"[DEBUG] Frame {self.frame_count}: Detected {len(hands_2d)} hands in 2D, {len(hands_3d)} in 3D, {len(tracked_hands)} tracked")
+            # パフォーマンス統計は_process_frameで計測済みなので省略
+            self.performance_stats['hand_detection_time'] = 0.0  # 重複実行排除のため0ms
         
             # カラー画像があれば表示
             display_images = []
