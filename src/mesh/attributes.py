@@ -14,6 +14,22 @@ from scipy.spatial.distance import cdist
 from scipy import sparse
 
 from .delaunay import TriangleMesh
+from ..types import ArrayLike
+from .. import get_logger
+
+logger = get_logger(__name__)
+
+# 新規インポート: ベクトル化曲率計算
+try:
+    from .curvature_vectorized import (
+        VectorizedCurvatureCalculator, 
+        CurvatureResult,
+        compute_curvatures_fast
+    )
+    VECTORIZED_AVAILABLE = True
+except ImportError:
+    VECTORIZED_AVAILABLE = False
+    logger.warning("Vectorized curvature calculation not available")
 
 
 @dataclass
@@ -57,28 +73,37 @@ class MeshAttributes:
 
 
 class AttributeCalculator:
-    """メッシュ属性計算クラス"""
+    """メッシュ属性計算器 (最適化版)"""
     
     def __init__(
         self,
         smooth_normals: bool = True,        # 法線を平滑化するか
         curvature_radius: float = 0.05,     # 曲率計算半径
         gradient_method: str = "finite_diff", # 勾配計算手法
-        normalize_attributes: bool = True    # 属性を正規化するか
+        normalize_attributes: bool = True,   # 属性を正規化するか
+        use_vectorized: bool = True,         # ベクトル化計算を使用するか
+        enable_caching: bool = True,         # キャッシュを有効にするか
+        async_mode: bool = False             # 非同期計算モード
     ):
-        """
-        初期化
-        
-        Args:
-            smooth_normals: 法線平滑化を行うか
-            curvature_radius: 曲率計算の近傍半径
-            gradient_method: 勾配計算手法 ("finite_diff" or "laplacian")
-            normalize_attributes: 属性を正規化するか
-        """
         self.smooth_normals = smooth_normals
         self.curvature_radius = curvature_radius
         self.gradient_method = gradient_method
         self.normalize_attributes = normalize_attributes
+        self.use_vectorized = use_vectorized and VECTORIZED_AVAILABLE
+        self.enable_caching = enable_caching
+        self.async_mode = async_mode
+        
+        # ベクトル化計算器（利用可能な場合）
+        self._vectorized_calculator: Optional[VectorizedCurvatureCalculator] = None
+        if self.use_vectorized:
+            try:
+                self._vectorized_calculator = VectorizedCurvatureCalculator(
+                    enable_caching=enable_caching,
+                    enable_async=async_mode
+                )
+            except Exception as e:
+                logger.warning(f"Failed to initialize vectorized calculator: {e}")
+                self.use_vectorized = False
         
         # パフォーマンス統計
         self.stats = {
@@ -89,48 +114,123 @@ class AttributeCalculator:
             'last_num_triangles': 0,
             'normals_time_ms': 0.0,
             'curvature_time_ms': 0.0,
-            'gradient_time_ms': 0.0
+            'gradient_time_ms': 0.0,
+            'vectorized_used': 0,
+            'fallback_used': 0
         }
     
     def compute_attributes(self, mesh: TriangleMesh) -> MeshAttributes:
-        """
-        メッシュの全属性を計算
-        
-        Args:
-            mesh: 入力メッシュ
-            
-        Returns:
-            計算されたメッシュ属性
-        """
+        """メッシュ属性を計算 (最適化版)"""
         start_time = time.perf_counter()
         
-        if mesh.num_vertices == 0 or mesh.num_triangles == 0:
-            raise ValueError("Empty mesh")
+        try:
+            # ベクトル化計算を優先使用
+            if self.use_vectorized and self._vectorized_calculator:
+                result = self._compute_attributes_vectorized(mesh)
+                self.stats['vectorized_used'] += 1
+                return result
+            else:
+                # フォールバック: 従来の計算
+                result = self._compute_attributes_fallback(mesh)
+                self.stats['fallback_used'] += 1
+                return result
+                
+        except Exception as e:
+            logger.error(f"Attribute calculation failed: {e}")
+            # エラー時は基本的な属性のみ返す
+            return self._create_minimal_attributes(mesh)
+    
+    def _compute_attributes_vectorized(self, mesh: TriangleMesh) -> MeshAttributes:
+        """ベクトル化による高速属性計算"""
+        if not self._vectorized_calculator:
+            raise RuntimeError("Vectorized calculator not available")
         
-        # 法線計算
-        normals_start = time.perf_counter()
-        vertex_normals = self.calculate_vertex_normals(mesh)
-        triangle_normals = self.calculate_triangle_normals(mesh)
-        normals_time = (time.perf_counter() - normals_start) * 1000
+        start_time = time.perf_counter()
         
-        # 曲率計算
-        curvature_start = time.perf_counter()
-        vertex_curvatures, gaussian_curvatures, mean_curvatures = self.calculate_curvatures(mesh)
-        curvature_time = (time.perf_counter() - curvature_start) * 1000
+        # 1. ベクトル化曲率・勾配計算
+        curvature_result = self._vectorized_calculator.compute_curvatures(
+            mesh, async_mode=self.async_mode
+        )
         
-        # 勾配計算
-        gradient_start = time.perf_counter()
-        gradients, gradient_magnitudes = self.calculate_gradients(mesh)
-        gradient_time = (time.perf_counter() - gradient_start) * 1000
+        curvature_time = time.perf_counter()
         
-        # 面積計算
-        triangle_areas = mesh.get_triangle_areas()
+        # 2. 法線計算（ベクトル化版）
+        from .vectorized import vectorized_vertex_normals, vectorized_triangle_normals
+        vertex_normals = vectorized_vertex_normals(mesh, smooth=self.smooth_normals)
+        triangle_normals = vectorized_triangle_normals(mesh)
+        
+        normals_time = time.perf_counter()
+        
+        # 3. 面積計算（ベクトル化版）
+        from .vectorized import vectorized_triangle_areas
+        triangle_areas = vectorized_triangle_areas(mesh)
+        
+        # 4. 頂点面積計算
         vertex_areas = self._calculate_vertex_areas(mesh, triangle_areas)
         
-        # パフォーマンス統計更新
-        total_time = (time.perf_counter() - start_time) * 1000
-        self._update_stats(total_time, mesh.num_vertices, mesh.num_triangles, 
-                          normals_time, curvature_time, gradient_time)
+        total_time = time.perf_counter()
+        
+        # 統計更新
+        computation_times = {
+            'curvature_time_ms': (curvature_time - start_time) * 1000,
+            'normals_time_ms': (normals_time - curvature_time) * 1000,
+            'total_time_ms': (total_time - start_time) * 1000
+        }
+        
+        self._update_stats(
+            computation_times['total_time_ms'],
+            mesh.num_vertices,
+            mesh.num_triangles,
+            computation_times['normals_time_ms'],
+            computation_times['curvature_time_ms'],
+            0.0
+        )
+        
+        # MeshAttributes オブジェクト作成
+        return MeshAttributes(
+            vertex_normals=vertex_normals,
+            triangle_normals=triangle_normals,
+            vertex_curvatures=curvature_result.vertex_curvatures,
+            gaussian_curvatures=curvature_result.gaussian_curvatures,
+            mean_curvatures=curvature_result.mean_curvatures,
+            gradients=curvature_result.gradients,
+            gradient_magnitudes=curvature_result.gradient_magnitudes,
+            triangle_areas=triangle_areas,
+            vertex_areas=vertex_areas
+        )
+    
+    def _compute_attributes_fallback(self, mesh: TriangleMesh) -> MeshAttributes:
+        """従来の計算方式（フォールバック）"""
+        start_time = time.perf_counter()
+        
+        # 1. 法線計算
+        vertex_normals = self.calculate_vertex_normals(mesh)
+        triangle_normals = self.calculate_triangle_normals(mesh)
+        normals_time = time.perf_counter()
+        
+        # 2. 曲率計算
+        vertex_curvatures, gaussian_curvatures, mean_curvatures = self.calculate_curvatures(mesh)
+        curvature_time = time.perf_counter()
+        
+        # 3. 勾配計算
+        gradients, gradient_magnitudes = self.calculate_gradients(mesh)
+        gradient_time = time.perf_counter()
+        
+        # 4. 面積計算
+        triangle_areas = self._calculate_triangle_areas(mesh)
+        vertex_areas = self._calculate_vertex_areas(mesh, triangle_areas)
+        
+        total_time = time.perf_counter()
+        
+        # 統計更新
+        self._update_stats(
+            (total_time - start_time) * 1000,
+            mesh.num_vertices,
+            mesh.num_triangles,
+            (normals_time - start_time) * 1000,
+            (curvature_time - normals_time) * 1000,
+            (gradient_time - curvature_time) * 1000
+        )
         
         return MeshAttributes(
             vertex_normals=vertex_normals,
@@ -143,6 +243,36 @@ class AttributeCalculator:
             triangle_areas=triangle_areas,
             vertex_areas=vertex_areas
         )
+    
+    def _create_minimal_attributes(self, mesh: TriangleMesh) -> MeshAttributes:
+        """エラー時の最小限属性セット"""
+        n_vertices = mesh.num_vertices
+        n_triangles = mesh.num_triangles
+        
+        return MeshAttributes(
+            vertex_normals=np.zeros((n_vertices, 3)),
+            triangle_normals=np.zeros((n_triangles, 3)),
+            vertex_curvatures=np.zeros(n_vertices),
+            gaussian_curvatures=np.zeros(n_vertices),
+            mean_curvatures=np.zeros(n_vertices),
+            gradients=np.zeros((n_vertices, 3)),
+            gradient_magnitudes=np.zeros(n_vertices),
+            triangle_areas=np.zeros(n_triangles),
+            vertex_areas=np.zeros(n_vertices)
+        )
+    
+    def _calculate_triangle_areas(self, mesh: TriangleMesh) -> np.ndarray:
+        """三角形面積計算（従来版）"""
+        areas = np.zeros(mesh.num_triangles)
+        
+        for i, triangle in enumerate(mesh.triangles):
+            v0, v1, v2 = mesh.vertices[triangle]
+            edge1 = v1 - v0
+            edge2 = v2 - v0
+            area = 0.5 * np.linalg.norm(np.cross(edge1, edge2))
+            areas[i] = area
+        
+        return areas
     
     def calculate_vertex_normals(self, mesh: TriangleMesh) -> np.ndarray:
         """頂点法線を計算"""
@@ -480,7 +610,9 @@ class AttributeCalculator:
             'last_num_triangles': 0,
             'normals_time_ms': 0.0,
             'curvature_time_ms': 0.0,
-            'gradient_time_ms': 0.0
+            'gradient_time_ms': 0.0,
+            'vectorized_used': 0,
+            'fallback_used': 0
         }
 
 

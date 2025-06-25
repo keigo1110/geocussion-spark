@@ -34,7 +34,8 @@ from src.constants import (
 @pytest.fixture(scope="session", autouse=True)
 def setup_test_logging():
     """テスト全体のロギング設定"""
-    setup_logging(level=logging.DEBUG, log_to_file=False)
+    import logging
+    logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
     logger = get_logger("test")
     logger.info("=== テストセッション開始 ===")
     yield

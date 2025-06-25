@@ -8,9 +8,12 @@
 
 from dataclasses import dataclass
 from enum import Enum
-from typing import List, Tuple, Optional, Any, Protocol, runtime_checkable
+from typing import List, Tuple, Optional, Any, Protocol, runtime_checkable, Union
 import numpy as np
 from abc import ABC, abstractmethod
+
+# 型エイリアス
+ArrayLike = Union[np.ndarray, List, Tuple]
 
 # =============================================================================
 # プロトコル定義（インターフェース）
