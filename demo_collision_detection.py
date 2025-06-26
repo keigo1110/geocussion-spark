@@ -349,10 +349,20 @@ class FullPipelineViewer(DualViewer):
             fill_holes=True
         )
         
+        # LODメッシュ生成器を作成（従来の三角分割器を置き換え）
+        from src.mesh.lod_mesh import create_lod_mesh_generator
+        self.lod_mesh_generator = create_lod_mesh_generator(
+            high_radius=0.20,      # ハンド周辺20cm以内は高解像度
+            medium_radius=0.50,    # 50cm以内は中解像度  
+            enable_gpu=True        # GPU使用（可能な場合）
+        )
+        
+        # 従来の三角分割器も保持（フォールバック用）
         self.triangulator = DelaunayTriangulator(
             adaptive_sampling=True,
             boundary_points=True,
-            quality_threshold=0.3
+            quality_threshold=0.3,
+            use_gpu=True
         )
         
         self.simplifier = MeshSimplifier(
@@ -424,7 +434,13 @@ class FullPipelineViewer(DualViewer):
         self.hands_2d = MediaPipeHandsWrapper(
             min_detection_confidence=self.min_detection_confidence,
             min_tracking_confidence=0.5,
-            max_num_hands=2
+            max_num_hands=2,
+            # ROI トラッキング設定（効率化）
+            enable_roi_tracking=True,
+            tracker_type="KCF",           # KCFトラッカーで高速化
+            skip_interval=4,              # 4フレームに1回MediaPipe実行
+            roi_confidence_threshold=0.6,
+            max_tracking_age=15
         )
         # projector_3dとtrackerの初期化は親クラスの初期化後に行う
         self.projector_3d = None
@@ -607,24 +623,48 @@ class FullPipelineViewer(DualViewer):
         return False
     
     def _update_terrain_mesh(self, points_3d):
-        """地形メッシュを更新"""
+        """地形メッシュを更新（LOD最適化版）"""
         if points_3d is None or len(points_3d) < 100:
             return
         
         try:
-            # 1. 点群投影
-            height_map = self.projector.project_points(points_3d)
+            import time
             
-            # 2. Delaunay三角分割
-            triangle_mesh = self.triangulator.triangulate_heightmap(height_map)
+            # LODメッシュ生成器を使用（高速化）
+            if hasattr(self, 'lod_mesh_generator') and self.lod_mesh_generator is not None:
+                lod_start = time.perf_counter()
+                
+                # LODベースメッシュ生成（手の位置を考慮した効率的な生成）
+                triangle_mesh = self.lod_mesh_generator.generate_mesh(
+                    points_3d, 
+                    self.current_tracked_hands,  # 手の位置でLOD制御
+                    force_update=getattr(self, 'force_mesh_update_requested', False)
+                )
+                
+                total_lod_time = (time.perf_counter() - lod_start) * 1000
+                
+                if triangle_mesh is not None:
+                    # LOD生成成功時の処理
+                    simplified_mesh = triangle_mesh
+                    
+                    # デバッグ用時間測定出力
+                    if hasattr(self, 'frame_counter') and self.frame_counter % 50 == 0:
+                        print(f"[LOD-MESH] {len(points_3d)} points -> {triangle_mesh.num_vertices} vertices, "
+                              f"{triangle_mesh.num_triangles} triangles in {total_lod_time:.1f}ms")
+                
+                else:
+                    # LOD生成失敗時は従来方式へフォールバック
+                    print("[LOD-FALLBACK] Using traditional mesh generation")
+                    triangle_mesh = self._generate_traditional_mesh(points_3d)
+                    if triangle_mesh is None:
+                        return
+                    simplified_mesh = triangle_mesh
             
-            if triangle_mesh is None or triangle_mesh.num_triangles == 0:
-                return
-            
-            # 3. メッシュ簡略化
-            simplified_mesh = self.simplifier.simplify_mesh(triangle_mesh)
-            
-            if simplified_mesh is None:
+            else:
+                # LODメッシュ生成器が無効の場合は従来方式
+                triangle_mesh = self._generate_traditional_mesh(points_3d)
+                if triangle_mesh is None:
+                    return
                 simplified_mesh = triangle_mesh
             
             # 4. 空間インデックス構築
@@ -646,6 +686,10 @@ class FullPipelineViewer(DualViewer):
             
             # 可視化更新
             self._update_mesh_visualization(simplified_mesh)
+            
+            # 強制更新フラグをリセット
+            if hasattr(self, 'force_mesh_update_requested'):
+                self.force_mesh_update_requested = False
             
             print(f"メッシュ更新完了: {simplified_mesh.num_triangles}三角形")
             
@@ -1550,6 +1594,21 @@ class FullPipelineViewer(DualViewer):
         print(f"⚙️  平均パイプライン時間: {total_pipeline_time/frame_count*1000:.1f}ms" if frame_count > 0 else "⚙️  パイプライン時間: N/A")
         print(f"🎵 衝突イベント総数: {self.perf_stats.get('collision_events_count', 0)}")
         print(f"🔊 音響ノート総数: {getattr(self, 'audio_notes_generated', 0)}")
+        
+        # ROI トラッキング統計出力
+        if hasattr(self.hands_2d, 'get_roi_tracking_stats'):
+            roi_stats = self.hands_2d.get_roi_tracking_stats()
+            print(f"\n📊 ROI トラッキング統計:")
+            print(f"   MediaPipe 実行: {roi_stats.mediapipe_executions}/{roi_stats.total_frames}")
+            print(f"   スキップ率: {roi_stats.skip_ratio*100:.1f}%")
+            print(f"   トラッキング成功率: {roi_stats.success_rate*100:.1f}%")
+            if roi_stats.mediapipe_executions > 0:
+                avg_mediapipe_time = roi_stats.total_mediapipe_time_ms / roi_stats.mediapipe_executions
+                print(f"   平均MediaPipe時間: {avg_mediapipe_time:.1f}ms")
+            if roi_stats.tracking_successes > 0:
+                avg_tracking_time = roi_stats.total_tracking_time_ms / roi_stats.tracking_successes
+                print(f"   平均トラッキング時間: {avg_tracking_time:.1f}ms")
+        
         print()
 
     def _initialize_headless_components(self):
@@ -1705,6 +1764,43 @@ class FullPipelineViewer(DualViewer):
         # 手が検出されている場合は更新間隔を長くする
         # ただし、最大スキップフレーム数を超えたら強制更新
         return frames_since_update >= getattr(self, 'max_mesh_skip_frames', 60)
+
+    def _generate_traditional_mesh(self, points_3d):
+        """従来方式でメッシュ生成（フォールバック用）"""
+        try:
+            import time
+            
+            # 1. 点群投影
+            projection_start = time.perf_counter()
+            height_map = self.projector.project_points(points_3d)
+            projection_time = (time.perf_counter() - projection_start) * 1000
+            
+            # 2. Delaunay三角分割
+            triangulation_start = time.perf_counter()
+            triangle_mesh = self.triangulator.triangulate_heightmap(height_map)
+            triangulation_time = (time.perf_counter() - triangulation_start) * 1000
+            
+            if triangle_mesh is None or triangle_mesh.num_triangles == 0:
+                return None
+            
+            # 3. メッシュ簡略化
+            simplification_start = time.perf_counter()
+            simplified_mesh = self.simplifier.simplify_mesh(triangle_mesh)
+            simplification_time = (time.perf_counter() - simplification_start) * 1000
+            
+            if simplified_mesh is None:
+                simplified_mesh = triangle_mesh
+            
+            # デバッグ用時間測定出力
+            if hasattr(self, 'frame_counter') and self.frame_counter % 50 == 0:
+                total_mesh_time = projection_time + triangulation_time + simplification_time
+                print(f"[TRADITIONAL-MESH] Projection: {projection_time:.1f}ms, Triangulation: {triangulation_time:.1f}ms, Simplification: {simplification_time:.1f}ms (Total: {total_mesh_time:.1f}ms)")
+            
+            return simplified_mesh
+            
+        except Exception as e:
+            print(f"従来方式メッシュ生成エラー: {e}")
+            return None
 
 
 def main():

@@ -335,6 +335,49 @@ future_optimizations:
         test_command: "python3 -c 'from src.debug.profiler import PerformanceProfiler; print(\"Profiler OK\")'"
         result: "実装完了・基本動作確認済み"
 
+    - title: "GPUメッシュ生成最適化（CuPy + Delaunay / Marching Cubes）"
+      priority: "CRITICAL"
+      status: "⏳ Pending"
+      description: |
+        フル Delaunay 再メッシュに最大 2.8 秒を要するボトルネックを GPU へ移植し 20〜40× の高速化を目指す。
+        1) XY 平面 Delaunay を CuPy + Thrust で実装し Open3D CUDA API に統合。
+        2) 3D 再メッシュは Voxel グリッド化 & Marching Cubes (GPU) へ置き換え。
+        3) LOD (Level-of-Detail) を導入し、ハンド近傍 20 cm 以内のみ高解像度更新。
+      implementation:
+        files: ["src/mesh/vectorized.py", "src/mesh/delaunay_gpu.py", "src/mesh/marching_gpu.py", "demo_collision_detection.py"]
+        functions: ["delaunay_2d_gpu", "marching_cubes_gpu", "generate_mesh_gpu", "_should_update_mesh_gpu"]
+        prerequisites: ["gpu-002"]
+        expected_speedup: "20-40x mesh generation"
+        target_fps_gain: "+10 FPS (GUI) / +50 FPS (headless)"
+        test_command: "python3 -m tests.mesh_test::TestMeshGPU::test_gpu_mesh_generation -v"
+    
+    - title: "HandDetection ROIトラッキング + スキップ"
+      priority: "HIGH"
+      status: "⏳ Pending"
+      description: |
+        Mediapipe CNN を毎フレーム実行せず、前フレーム矩形を KCF/MOSSE トラッカーで追跡。
+        トラッキング成功中は Mediapipe を N フレームに 1 回のみ呼び出し (デフォルト N=4)。
+        期待スキップ率 70% → 手検出負荷 40ms → 12ms。
+      implementation:
+        files: ["src/detection/hands2d.py", "src/detection/tracker.py", "demo_collision_detection.py"]
+        functions: ["HandROITracker", "_should_run_hand_detection"]
+        expected_speedup: "≈70% hand detection cost reduction"
+        target_fps_gain: "+6 FPS"
+        test_command: "python3 -m tests.detection_test::TestHandROITracker::test_roi_skip -v"
+    
+    - title: "パイプライン完全並列化（Producer/Consumer 分離）"
+      priority: "MEDIUM"
+      status: "⏳ Pending"
+      description: |
+        フィルタ → HandDetection → Mesh → Collision → Audio を asyncio / ThreadPoolExecutor で段階別ワーカーへ分割。
+        Depth フレーム 2〜3 枚のバッファリングでレイテンシ +1 frame を許容しスループットを最大化。
+      implementation:
+        files: ["src/debug/pipeline_controller.py", "demo_collision_detection.py"]
+        functions: ["FrameProducer", "FrameConsumer", "ProcessingPipelineAsync"]
+        expected_speedup: "+3-5 FPS"
+        target_fps_gain: "+4 FPS"
+        test_command: "python3 -m tests.performance_unified_test::test_async_pipeline -v"
+
   implementation_roadmap:
     phase_1_critical_fixes:
       duration: "2 hours"
@@ -861,165 +904,6 @@ cursor_terminal_orbbec_fix:
       - "環境差異による混乱の解消"
       - "ワンコマンドでの環境セットアップ"
       - "確実な動作確認手順の提供"
-
-conclusion:
-  summary: |
-    Numba JIT最適化とヘッドレスモード実装により、Geocussion-SPの性能を劇的に向上させました。
-    距離計算で256万計算/秒、曲率計算で6千万頂点/秒という
-    産業レベルの高性能を達成しています。
-    加えて、開発環境の問題（Cursor内ターミナルでのOrbbecSDK認識問題）も完全解決し、
-    統一された開発ワークフローを確立しました。 
-
-headless_mode_verification:
-  title: "ヘッドレスモード機能確認と性能測定"
-  completion_date: "2025-01-28"
-  status: "✅ Completed"
-  priority: "HIGH"
-  description: |
-    ヘッドレスモード実装の正常動作確認と詳細なパフォーマンス測定を完了。
-    GUI無効化による劇的なFPS向上を実証し、異なる構成での性能特性を測定。
-  
-  performance_testing_results:
-    standard_headless_mode:
-      configuration: "手検出有効 + メッシュ生成有効 + 音響無効"
-      duration: "8秒間"
-      total_frames: 173
-      average_fps: "21.6 FPS"
-      max_fps: "37.2 FPS"
-      min_fps: "0.5 FPS"
-      average_frame_time: "46.4ms"
-      mesh_updates: "9回"
-      collision_events: 0
-      notes: "メッシュ生成が主要ボトルネック (1.7-3.5ms/update)"
-      
-    pure_headless_mode:
-      configuration: "手検出無効 + メッシュ生成無効 + 音響無効"
-      duration: "10秒間"
-      total_frames: 600
-      average_fps: "60.0 FPS"
-      max_fps: "60.2 FPS"
-      min_fps: "57.7 FPS"
-      average_frame_time: "16.7ms"
-      processing_overhead: "15ms MockData + 1.7ms処理"
-      notes: "最大FPS性能到達 - 60FPS安定動作"
-      
-    baseline_comparison:
-      gui_mode_fps: "5-6 FPS"
-      headless_standard: "21.6 FPS (3.6-4.3x向上)"
-      headless_pure: "60.0 FPS (10-12x向上)"
-      maximum_improvement: "1200% performance gain"
-  
-  technical_implementation_quality:
-    component_initialization:
-      status: "✅ 完全修正"
-      camera_handling: "✅ モックデータ対応"
-      projector_3d: "✅ ヘッドレス用無効化"
-      hand_tracker: "✅ ヘッドレス用無効化"
-      pointcloud_converter: "✅ モック点群生成"
-      error_handling: "✅ Graceful degradation"
-      
-    gui_elimination:
-      open3d_viewer: "✅ 完全バイパス"
-      opencv_display: "✅ 完全バイパス"
-      ui_updates: "✅ 完全バイパス"
-      visualization: "✅ 完全無効化"
-      result: "GUI負荷 100%削除"
-      
-    mock_data_system:
-      depth_image: "✅ 240x424 uint16 random generation"
-      color_image: "✅ 480x640x3 uint8 random generation"
-      point_cloud: "✅ 5000点 float32 mock generation"
-      processing_simulation: "✅ 15ms realistic delay"
-      mesh_generation: "✅ Real mesh processing (3-6 triangles)"
-      
-    performance_monitoring:
-      real_time_fps: "✅ 5秒間隔統計表示"
-      frame_timing: "✅ 精密な時間測定"
-      component_profiling: "✅ 各処理段階の時間測定"
-      statistics_output: "✅ 詳細な結果サマリー"
-  
-  functional_verification:
-    core_features:
-      frame_processing: "✅ 安定した連続処理 (173-600 frames)"
-      mesh_generation: "✅ 正常動作 (4-6三角形/更新)"
-      hand_detection: "✅ MediaPipe正常動作 (エラー回避)"
-      error_recovery: "✅ 例外処理で継続実行"
-      graceful_shutdown: "✅ 正常終了とクリーンアップ"
-      
-    performance_characteristics:
-      cpu_efficiency: "✅ モック処理で効率的CPU使用"
-      memory_management: "✅ メモリリークなし"
-      thermal_stability: "✅ 長時間安定動作"
-      interrupt_handling: "✅ Ctrl+C安全終了"
-      
-    command_line_interface:
-      headless_flag: "✅ --headless オプション正常動作"
-      duration_control: "✅ --headless-duration 時間制御"
-      pure_mode: "✅ --headless-pure 最大性能モード"
-      configuration_mixing: "✅ 他オプションとの組み合わせ"
-  
-  benchmarking_analysis:
-    bottleneck_identification:
-      mesh_generation: "主要ボトルネック (20-40ms)"
-      hand_detection: "軽微な負荷 (2-5ms)"
-      mock_data_processing: "固定負荷 (15ms)"
-      frame_overhead: "最小 (<2ms)"
-      
-    optimization_opportunities:
-      identified:
-        - "メッシュ更新間隔の動的調整"
-        - "手検出結果キャッシュ"
-        - "点群サンプリング削減"
-        - "並列処理の活用"
-      priority: "メッシュ生成最適化が最重要"
-      
-    performance_ceiling:
-      theoretical_max: "66.7 FPS (15ms mock delay限界)"
-      achieved_max: "60.0 FPS (90% of theoretical)"
-      efficiency_rating: "Excellent"
-      headroom: "Minimal - 最適化完了レベル"
-    
-  deployment_readiness:
-    production_use_cases:
-      - "FPS性能測定・ベンチマーク"
-      - "サーバーサイド処理 (GUI不要環境)"
-      - "CI/CD自動テスト"
-      - "大量データ処理・バッチ実行"
-      - "ヘッドレスLinuxサーバー運用"
-      
-    reliability_metrics:
-      stability: "✅ 8-10秒連続実行安定"
-      error_tolerance: "✅ 例外処理で継続動作"
-      resource_cleanup: "✅ 確実なメモリ・音響クリーンアップ"
-      interrupt_safety: "✅ 安全な中断処理"
-      
-    documentation_completeness:
-      usage_instructions: "✅ 詳細なコマンドライン例"
-      performance_expectations: "✅ 構成別FPS予測値"
-      troubleshooting: "✅ エラー処理と回避策"
-      integration_guide: "✅ 他システムとの連携方法"
-    
-  final_assessment:
-    implementation_quality: "Production Grade"
-    performance_achievement: "Excellent (60 FPS達成)"
-    gui_elimination_success: "100% Complete"
-    error_handling_robustness: "Very High"
-    user_experience: "Simple and Effective"
-    
-    key_achievements:
-      - "GUI負荷100%削除による劇的FPS向上"
-      - "5-6 FPS → 60 FPS (10-12倍改善)"
-      - "安定した長時間動作確認"
-      - "簡単なコマンドライン操作"
-      - "完全なエラー回復機能"
-      
-    next_level_recommendations:
-      immediate:
-        - "メッシュ生成最適化によるさらなる高速化"
-        - "GPU活用による並列処理"
-      future:
-        - "分散処理対応"
-        - "リアルタイム監視ダッシュボード"
 
 conclusion:
   summary: |
