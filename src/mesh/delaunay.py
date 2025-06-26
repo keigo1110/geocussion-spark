@@ -21,7 +21,7 @@ from .projection import HeightMap
 try:
     from .delaunay_gpu import GPUDelaunayTriangulator, create_gpu_triangulator
     GPU_TRIANGULATION_AVAILABLE = True
-except ImportError:
+except (ImportError, AttributeError):
     GPU_TRIANGULATION_AVAILABLE = False
     GPUDelaunayTriangulator = None
     create_gpu_triangulator = None
@@ -117,8 +117,20 @@ class DelaunayTriangulator:
         self.gpu_triangulator = None
         if self.use_gpu and GPU_TRIANGULATION_AVAILABLE:
             try:
-                self.gpu_triangulator = create_gpu_triangulator(use_gpu=True)
+                self.gpu_triangulator = create_gpu_triangulator(
+                    use_gpu=True,
+                    quality_threshold=self.quality_threshold,
+                    enable_caching=True,
+                    force_cpu=False  # 明示的にCPU強制を無効化
+                )
                 print(f"GPU Delaunay triangulation enabled: {'GPU' if self.gpu_triangulator.use_gpu else 'CPU fallback'}")
+                
+                # デバッグ情報
+                if self.gpu_triangulator.use_gpu:
+                    print(f"✅ GPU triangulation initialized successfully")
+                else:
+                    print(f"⚠️ GPU triangulation fell back to CPU mode")
+                    
             except Exception as e:
                 print(f"GPU triangulation initialization failed: {e}")
                 self.gpu_triangulator = None
@@ -298,11 +310,11 @@ class DelaunayTriangulator:
         if len(points) < 3:
             raise ValueError("At least 3 points required for triangulation")
         
-        # GPU使用判定
+        # GPU使用判定（閾値を下げて実用的に）
         use_gpu_for_this = (
             self.gpu_triangulator is not None and 
             self.gpu_triangulator.use_gpu and 
-            len(points) >= self.gpu_fallback_threshold
+            len(points) >= 100  # fallback_thresholdを無視してより実用的な閾値に
         )
         
         start_time = time.perf_counter()

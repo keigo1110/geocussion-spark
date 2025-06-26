@@ -145,6 +145,16 @@ from src.input.depth_filter import DepthFilter, FilterType
 from src.input.pointcloud import PointCloudConverter
 from src.config import get_config, InputConfig
 
+# GPU加速コンポーネント（CuPy利用可能時のみ）
+try:
+    from src.collision.distance_gpu import GPUDistanceCalculator, create_gpu_distance_calculator
+    from src.mesh.delaunay_gpu import GPUDelaunayTriangulator, create_gpu_triangulator
+    HAS_GPU_ACCELERATION = True
+    print("🚀 GPU acceleration modules loaded (CuPy available)")
+except ImportError:
+    HAS_GPU_ACCELERATION = False
+    print("⚠️ GPU acceleration unavailable (CuPy not installed)")
+
 # -----------------------------------------------------------------------------
 # 前処理最適化システム（Step 1: 解像度最適化 + MediaPipe重複排除）
 # -----------------------------------------------------------------------------
@@ -448,6 +458,44 @@ class FullPipelineViewer(DualViewer):
         
         # 初期化完了フラグ
         self._components_initialized = False
+        
+        # LOD メッシュ生成器（プロ実装済み）
+        from src.mesh.lod_mesh import LODMeshGenerator
+        self.lod_mesh_generator = LODMeshGenerator()
+        
+        # GPU加速コンポーネント初期化
+        self.gpu_distance_calc: Optional[Any] = None
+        self.gpu_triangulator: Optional[Any] = None
+        self.gpu_acceleration_enabled = False
+        
+        if HAS_GPU_ACCELERATION:
+            try:
+                self.gpu_distance_calc = create_gpu_distance_calculator(
+                    use_gpu=True,
+                    batch_size=10000,
+                    memory_limit_ratio=0.8
+                )
+                self.gpu_triangulator = create_gpu_triangulator(
+                    use_gpu=True,
+                    quality_threshold=0.2,
+                    enable_caching=True
+                )
+                self.gpu_acceleration_enabled = True
+                print("🚀 GPU acceleration initialized successfully")
+                print(f"  - GPU Distance Calculator: {'enabled' if hasattr(self.gpu_distance_calc, 'gpu_available') and self.gpu_distance_calc.gpu_available else 'CPU fallback'}")
+                print(f"  - GPU Triangulator: {'enabled' if hasattr(self.gpu_triangulator, 'use_gpu') and self.gpu_triangulator.use_gpu else 'CPU fallback'}")
+            except Exception as e:
+                print(f"⚠️ GPU acceleration initialization failed: {e}")
+                print("⚠️ Falling back to CPU-only processing")
+                self.gpu_acceleration_enabled = False
+        
+        # パフォーマンス統計（GPU対応）
+        self.gpu_stats = {
+            'distance_calculations': 0,
+            'triangulations': 0,
+            'gpu_time_total_ms': 0.0,
+            'cpu_fallbacks': 0
+        }
     
     def update_help_text(self):
         """ヘルプテキストを更新（衝突検出機能を追加）"""
@@ -706,6 +754,13 @@ class FullPipelineViewer(DualViewer):
         self.current_collision_points = []
         print(f"[DEBUG] _detect_collisions: Processing {len(tracked_hands)} hands")
         
+        # GPU加速距離計算の準備
+        use_gpu_distance = (
+            self.gpu_acceleration_enabled and 
+            self.gpu_distance_calc is not None and
+            len(tracked_hands) > 0
+        )
+        
         for i, hand in enumerate(tracked_hands):
             if hand.position is None: 
                 print(f"[DEBUG] _detect_collisions: Hand {i} has no position")
@@ -719,24 +774,115 @@ class FullPipelineViewer(DualViewer):
                 
                 if not res.triangle_indices: continue
                 
-                # None check for collision_tester
-                if self.collision_tester is not None:
-                    info = self.collision_tester.test_sphere_collision(hand_pos_np, self.sphere_radius, res)
-                    print(f"[DEBUG] _detect_collisions: Hand {i} collision test result: {info.has_collision}")
-                    
-                    if info.has_collision:
-                        velocity = np.array(hand.velocity) if hasattr(hand, 'velocity') and hand.velocity is not None else np.zeros(3)
-                        event = self.event_queue.create_event(info, hand.id, hand_pos_np, velocity)
-                        if event:
-                            events.append(event)
-                            for cp in info.contact_points:
-                               self.current_collision_points.append(cp.position)
-                            print(f"[DEBUG] _detect_collisions: Hand {i} generated collision event with {len(info.contact_points)} contact points")
+                # GPU加速距離計算（少数三角形でも使用）
+                if use_gpu_distance and len(res.triangle_indices) > 5:  # 閾値を50→5に下げて実用的に
+                    info = self._gpu_collision_testing(hand_pos_np, self.sphere_radius, res)
+                    self.gpu_stats['distance_calculations'] += 1
+                    print(f"[GPU-DISTANCE] Hand {i} collision test using GPU acceleration on {len(res.triangle_indices)} triangles")
+                else:
+                    # 従来のCPU衝突検出
+                    if self.collision_tester is not None:
+                        info = self.collision_tester.test_sphere_collision(hand_pos_np, self.sphere_radius, res)
+                        if use_gpu_distance:  # GPU利用可能だが閾値未満
+                            self.gpu_stats['cpu_fallbacks'] += 1
+                            print(f"[CPU-FALLBACK] Hand {i} using CPU collision ({len(res.triangle_indices)} triangles < threshold)")
+                    else:
+                        continue
+                
+                print(f"[DEBUG] _detect_collisions: Hand {i} collision test result: {info.has_collision}")
+                
+                if info.has_collision:
+                    velocity = np.array(hand.velocity) if hasattr(hand, 'velocity') and hand.velocity is not None else np.zeros(3)
+                    event = self.event_queue.create_event(info, hand.id, hand_pos_np, velocity)
+                    if event:
+                        events.append(event)
+                        for cp in info.contact_points:
+                           self.current_collision_points.append(cp.position)
+                        print(f"[DEBUG] _detect_collisions: Hand {i} generated collision event with {len(info.contact_points)} contact points")
             except Exception as e:
                 logger.error(f"[DEBUG] _detect_collisions: Error processing hand {i}: {e}")
         
         print(f"[DEBUG] _detect_collisions: Total collision events: {len(events)}")
         return events
+    
+    def _gpu_collision_testing(self, hand_pos: np.ndarray, radius: float, search_result):
+        """GPU加速衝突テスト"""
+        try:
+            import time
+            start_time = time.perf_counter()
+            
+            # 三角形データを抽出
+            if not hasattr(self.current_mesh, 'vertices') or not hasattr(self.current_mesh, 'triangles'):
+                # GPU処理失敗時はCPU処理にフォールバック
+                return self.collision_tester.test_sphere_collision(hand_pos, radius, search_result)
+            
+            vertices = np.asarray(self.current_mesh.vertices)
+            triangles = np.asarray(self.current_mesh.triangles)
+            
+            # 対象三角形のみ抽出
+            target_triangles = triangles[search_result.triangle_indices]
+            
+            # 手位置を配列に変換
+            hand_points = hand_pos.reshape(1, 3)
+            
+            # GPU距離計算
+            distances = self.gpu_distance_calc.point_to_triangle_distance_batch(
+                hand_points, target_triangles, vertices
+            )
+            
+            elapsed = (time.perf_counter() - start_time) * 1000
+            self.gpu_stats['gpu_time_total_ms'] += elapsed
+            
+            if distances is not None and distances.size > 0:
+                # 衝突判定（半径内の距離）
+                collision_mask = distances[0] <= radius
+                collision_triangle_indices = np.array(search_result.triangle_indices)[collision_mask]
+                collision_distances = distances[0][collision_mask]
+                
+                # 衝突結果を従来形式に変換
+                from src.collision.sphere_tri import CollisionInfo, ContactPoint
+                
+                contact_points = []
+                if len(collision_triangle_indices) > 0:
+                    for i, tri_idx in enumerate(collision_triangle_indices):
+                        # 三角形の重心を接触点として使用（簡易版）
+                        tri_vertices = vertices[triangles[tri_idx]]
+                        centroid = np.mean(tri_vertices, axis=0)
+                        
+                        # 法線計算（簡易版）
+                        v1 = tri_vertices[1] - tri_vertices[0]
+                        v2 = tri_vertices[2] - tri_vertices[0]
+                        normal = np.cross(v1, v2)
+                        normal = normal / (np.linalg.norm(normal) + 1e-8)
+                        
+                        contact_point = ContactPoint(
+                            position=centroid,
+                            normal=normal,
+                            distance=float(collision_distances[i]),
+                            triangle_index=int(tri_idx)
+                        )
+                        contact_points.append(contact_point)
+                
+                return CollisionInfo(
+                    has_collision=len(contact_points) > 0,
+                    contact_points=contact_points,
+                    min_distance=float(np.min(collision_distances)) if len(collision_distances) > 0 else float('inf'),
+                    penetration_depth=float(np.max(radius - collision_distances[collision_distances <= radius])) if len(collision_distances[collision_distances <= radius]) > 0 else 0.0
+                )
+            
+            # 衝突なしの場合
+            from src.collision.sphere_tri import CollisionInfo
+            return CollisionInfo(
+                has_collision=False,
+                contact_points=[],
+                min_distance=float('inf'),
+                penetration_depth=0.0
+            )
+            
+        except Exception as e:
+            print(f"GPU collision testing failed: {e}, falling back to CPU")
+            self.gpu_stats['cpu_fallbacks'] += 1
+            return self.collision_tester.test_sphere_collision(hand_pos, radius, search_result)
     
     def _update_mesh_visualization(self, mesh):
         """メッシュ可視化を更新"""
