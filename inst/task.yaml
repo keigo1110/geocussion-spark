@@ -75,25 +75,37 @@ milestones:
     goal: "衝突検出に利用できる地形メッシュを構築"
     description: |
       点群を 2D 投影し Delaunay 三角形分割で地形メッシュを構築。簡略化後に法線・曲率・勾配を計算し、空間インデックスを生成する。
+      現状実装は API が不統一・重複実装が多く、メモリ消費も大きい。以下の新アーキテクチャに沿って全面リファクタリングを行う。
+      - Facade: MeshPipeline (lazy, dirty-flag 再計算)
+      - Strategy: CPU / GPU 切替は triangulation.py 内部で吸収
+      - 型共有: src/mesh/types.py に HeightMap / Mesh / SpatialIndex DataClass を定義
     depends_on: [input]
     deliverables:
-      - src/mesh/projection.py        # XY 平面への 2D 投影
-      - src/mesh/delaunay.py          # scipy.spatial.Delaunay ラッパ
-      - src/mesh/simplify.py          # Open3D simplification API 使用
-      - src/mesh/attributes.py        # 法線／曲率／勾配計算
-      - src/mesh/index.py             # BVH or KDTree 構築
-      - tests/mesh_test.py
+      - src/mesh/types.py            # HeightMap / Mesh / SpatialIndex 型定義
+      - src/mesh/pipeline.py         # Facade: MeshPipeline
+      - src/mesh/projection.py       # 点群→HeightMap (リファクタ)
+      - src/mesh/triangulation.py    # Delaunay (CPU/GPU Strategy)
+      - src/mesh/simplify.py         # LOD & QEM 統合
+      - src/mesh/attributes.py       # 法線／曲率／勾配計算
+      - src/mesh/index.py            # KDTree / BVH 構築
+      - tests/mesh_test.py           # Mesh フェーズ単体テスト
     tasks:
-      - id: project_pointcloud
-        desc: "点群を XY 平面へ射影し密度マップを生成 (height map)"
-      - id: delaunay_triangulation
-        desc: "密度マップから等高線を抽出し Delaunay 分割で三角形メッシュを生成"
-      - id: mesh_simplification
-        desc: "Open3D を用いたメッシュ簡略化 (Quadric Error Simplification)"
-      - id: compute_attributes
-        desc: "各頂点/面の法線・曲率・勾配を計算しメッシュへ付与"
-      - id: spatial_index
-        desc: "バウンディングボリューム階層 (BVH) で高速検索を実装"
+      - id: T-MESH-001
+        desc: "Mesh/HeightMap/SpatialIndex DataClass を src/mesh/types.py に実装"
+      - id: T-MESH-002
+        desc: "projection.py をリファクタし create_height_map() の高速版を実装 (≤3 ms/1 M pts)"
+      - id: T-MESH-003
+        desc: "CPU/GPU Strategy を持つ triangulation.py を実装し API を統一"
+      - id: T-MESH-004
+        desc: "simplify.py に LOD & Open3D 抽象化を実装 (面数 50% 削減, 誤差<2%)"
+      - id: T-MESH-005
+        desc: "attributes.py を NumPy/Numba でベクトル化し法線・曲率・勾配計算を高速化"
+      - id: T-MESH-006
+        desc: "index.py に BVH/KDTree 抽象化を実装し近傍検索を最適化"
+      - id: T-MESH-007
+        desc: "StatsCollector & get_logger を全モジュールに導入、例外分類を実装"
+      - id: T-MESH-008
+        desc: "tests/mesh_test.py を作成し投影・分割・LOD・属性・インデックスを網羅"
 
   - id: collision
     title: "衝突検出フェーズ"

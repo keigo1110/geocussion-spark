@@ -239,3 +239,87 @@ tasks:
       - "2. Kalman lost→terminated 遷移をシミュレーションしアサート。"
     acceptance_criteria:
       - "新規テストが pass し、カバレッジ +10% 向上。"
+
+---
+id: mesh_refactor
+title: "メッシュ生成フェーズリファクタリング: Facade/Strategy + 型統一"
+description: |
+  src/mesh モジュールは API 不統一・二重実装・型重複・catch-all 例外など技術的負債が多い。
+  MeshPipeline (Facade) と CPU/GPU Strategy パターンで再設計し、HeightMap/Mesh/SpatialIndex 型を統一する。
+implementation_summary: |
+  ✅ 実装完了 (2025-01-30):
+  - 型統合: HeightMap, Mesh, MeshSpatialIndex等をsrc/types.pyに統合
+  - Facade Pattern: MeshPipelineでワンストップAPI提供、dirty-flag最適化
+  - Strategy Pattern: UnifiedTriangulatorでCPU/GPU統一
+  - 例外分類: Memory/Data/Import/General例外で分離、適切なログレベル設定
+  - 包括的テスト: 28テスト実装、統合テストでエンドツーエンド検証
+  🔄 部分完了: simplify.py, attributes.py, 完全なindex.py統合
+  📋 残タスク: LOD最適化、Numbaベクトル化、BVH/KDTree抽象化
+problems:
+  - id: P-MESH-001
+    title: "CPU/GPU 二重実装と API 不統一"
+    module: ["src/mesh/delaunay.py", "src/mesh/delaunay_gpu.py"]
+    severity: "High"
+    description: "関数シグネチャ相違により呼び出し側が実装別に分岐している。"
+  - id: P-MESH-002
+    title: "メモリフットプリントが大きい"
+    module: ["src/mesh/projection.py", "src/mesh/lod_mesh.py"]
+    severity: "High"
+    description: "フル解像度 HeightMap / LOD コピーにより >1GB 使用するケースがある。"
+  - id: P-MESH-003
+    title: "catch-all 例外と print ログ"
+    module: "src/mesh/*"
+    severity: "Medium"
+    description: "except Exception と print() が混在し、重大エラーがサイレントに握り潰される。"
+  - id: P-MESH-004
+    title: "テスト & mypy strict 未対応"
+    module: "src/mesh/*"
+    severity: "Medium"
+    description: "UnitTest が無く、strict モードで数百件のエラーが出る。"
+  - id: P-MESH-005
+    title: "自前 BVH 実装の性能・精度不明"
+    module: "src/mesh/index.py"
+    severity: "Low"
+    description: "SciPy KDTree より遅く、衝突フェーズでボトルネックになる可能性。"
+
+tasks:
+  - id: T-MESH-001
+    description: "types.py に Mesh/HeightMap/SpatialIndex DataClass を実装"
+    depends_on: [P-MESH-004]
+    status: "COMPLETED"  # ✅
+    note: "HeightMap, Mesh, MeshSpatialIndex, ProjectionMethod, MeshIndexType等を統合"
+  - id: T-MESH-002
+    description: "projection.py をリファクタし create_height_map() を高速化"
+    depends_on: [P-MESH-001]
+    status: "COMPLETED"  # ✅
+    note: "例外分類・logger置換・types.py統合完了"
+  - id: T-MESH-003
+    description: "triangulation.py で CPU/GPU Strategy パターンを実装"
+    depends_on: [P-MESH-001]
+    status: "COMPLETED"  # ✅
+    note: "UnifiedTriangulator実装、Strategy Enumで戦略選択"
+  - id: T-MESH-004
+    description: "pipeline.py に MeshPipeline Facade パターンを実装"
+    depends_on: [P-MESH-002]
+    status: "COMPLETED"  # ✅
+    note: "Facade Pattern, dirty-flag最適化, キャッシュ機能実装"
+  - id: T-MESH-005
+    description: "attributes.py を Numba ベクトル化"
+    depends_on: [P-MESH-002]
+    status: "NOT_STARTED"  # 📋
+    note: "法線計算の基本実装のみ、Numba最適化は残タスク"
+  - id: T-MESH-006
+    description: "index.py に BVH/KDTree 抽象化を実装"
+    depends_on: [P-MESH-005]
+    status: "NOT_STARTED"  # 📋
+    note: "基本的な構造体のみ、完全な抽象化は残タスク"
+  - id: T-MESH-007
+    description: "StatsCollector と例外分類を各モジュールに導入"
+    depends_on: [P-MESH-003]
+    status: "COMPLETED"  # ✅
+    note: "delaunay.py等で例外分類・logger置換完了"
+  - id: T-MESH-008
+    description: "tests/mesh_test.py を実装し全工程をカバー"
+    depends_on: [P-MESH-004]
+    status: "COMPLETED"  # ✅
+    note: "包括的テストスイート実装、統合テスト含む"
