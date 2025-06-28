@@ -15,8 +15,12 @@ import numpy as np
 # 他フェーズとの連携
 from ..mesh.index import SpatialIndex, BVHNode
 from ..mesh.delaunay import TriangleMesh
-from ..detection.tracker import TrackedHand
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from ..detection.tracker import TrackedHand
 from .sphere_tri import point_triangle_distance
+from .distance import point_triangle_distance_vectorized  # Numba最適化された距離計算
 from ..types import SearchStrategy, SearchResult
 from ..config import get_config
 from .optimization import optimize_array_operations, memory_efficient_context
@@ -78,7 +82,7 @@ class CollisionSearcher:
         }
     
     @optimize_array_operations
-    def search_near_hand(self, hand: TrackedHand, override_radius: Optional[float] = None) -> SearchResult:
+    def search_near_hand(self, hand: 'TrackedHand', override_radius: Optional[float] = None) -> SearchResult:
         """
         手の位置周辺の三角形を検索
         
@@ -137,7 +141,7 @@ class CollisionSearcher:
         )
     
     @optimize_array_operations
-    def batch_search_hands(self, hands: List[TrackedHand]) -> List[SearchResult]:
+    def batch_search_hands(self, hands: List['TrackedHand']) -> List[SearchResult]:
         """
         複数の手を一括検索
         
@@ -210,7 +214,7 @@ class CollisionSearcher:
         
         return result
     
-    def _determine_search_radius(self, hand: TrackedHand, override_radius: Optional[float]) -> float:
+    def _determine_search_radius(self, hand: 'TrackedHand', override_radius: Optional[float]) -> float:
         """検索半径を決定"""
         if override_radius is not None:
             return min(override_radius, self.max_radius)
@@ -339,6 +343,61 @@ class CollisionSearcher:
             'nodes_visited_total': 0
         }
         self.clear_cache()
+
+    def search_near_hand_optimized(
+        self,
+        hand: 'TrackedHand',
+        override_radius: Optional[float] = None,
+        enable_broadphase: bool = True
+    ) -> SearchResult:
+        """
+        最適化された手近傍三角形検索（ブロードフェーズ前処理付き）
+        
+        Args:
+            hand: 追跡された手
+            override_radius: 検索半径のオーバーライド
+            enable_broadphase: ブロードフェーズ最適化の有効化
+            
+        Returns:
+            検索結果（三角形インデックスと距離）
+        """
+        search_radius = override_radius or self.default_radius
+        
+        if enable_broadphase and hasattr(self.spatial_index, 'kdtree') and self.spatial_index.kdtree:
+            # Phase 1: KD-Tree による粗い近傍検索
+            candidate_indices = self.spatial_index.query_point(hand.position, search_radius * 1.5)
+            
+            if len(candidate_indices) == 0:
+                return SearchResult(triangle_indices=[], distances=[])
+                
+            # Phase 2: 候補三角形のみで精密距離計算
+            candidate_triangles = self.spatial_index.mesh.triangles[candidate_indices]
+            triangle_vertices = self.spatial_index.mesh.vertices[candidate_triangles]
+            
+            # 距離計算（最適化された候補のみ）
+            distances = []
+            for i, triangle_verts in enumerate(triangle_vertices):
+                dist = self._calculate_distance_to_triangle(hand.position, triangle_verts)
+                distances.append(dist)
+            
+            # 検索半径内の三角形をフィルタ
+            valid_mask = np.array(distances) <= search_radius
+            final_indices = np.array(candidate_indices)[valid_mask]
+            final_distances = np.array(distances)[valid_mask]
+            
+            # ソートして返す
+            sort_indices = np.argsort(final_distances)
+            return SearchResult(
+                triangle_indices=final_indices[sort_indices].tolist(),
+                distances=final_distances[sort_indices].tolist()
+            )
+        else:
+            # Fallback: 従来の全探索
+            return self.search_near_hand(hand, override_radius)
+    
+    def _calculate_distance_to_triangle(self, point: np.ndarray, triangle_vertices: np.ndarray) -> float:
+        """点と三角形の距離を計算"""
+        return point_triangle_distance_vectorized(point, triangle_vertices)
 
 
 # 便利関数

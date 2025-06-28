@@ -47,6 +47,12 @@ types-setuptools>=69.0.0
 # Hardware-Specific Dependencies
 # ===================================================================
 
+# GPU Acceleration (Optional - requires CUDA)
+# cupy-cuda11x>=12.0.0,<13.0.0  # For CUDA 11.x
+# cupy-cuda12x>=12.0.0,<13.0.0  # For CUDA 12.x
+# Note: Install the appropriate CuPy version for your CUDA installation
+# For GPU mesh generation acceleration (20-40x speedup)
+
 # Orbbec Camera SDK
 # Note: pyorbbecsdk requires manual installation from the included directory
 # Run: pip install ./pyorbbecsdk/install/lib/

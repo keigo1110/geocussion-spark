@@ -12,7 +12,12 @@ from enum import Enum
 import numpy as np
 from scipy.optimize import linear_sum_assignment
 
-from .hands3d import Hand3DResult, Hand3DLandmark, HandednessType
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .hands3d import Hand3DResult, Hand3DLandmark
+
+from .hands2d import HandednessType
 
 
 class TrackingState(Enum):
@@ -58,7 +63,7 @@ class TrackedHand:
     
     # 手のサイズとジェスチャー
     hand_size: float  # 手のサイズ推定値
-    landmarks_3d: Optional[List[Hand3DLandmark]] = None
+    landmarks_3d: Optional[List['Hand3DLandmark']] = None
     palm_normal: Optional[np.ndarray] = None
     
     # カルマンフィルタ状態
@@ -157,7 +162,7 @@ class Hand3DTracker:
         r = self.kalman_config.observation_noise ** 2
         self.R = np.eye(3) * r
     
-    def update(self, hands_3d: List[Hand3DResult]) -> List[TrackedHand]:
+    def update(self, hands_3d: List['Hand3DResult']) -> List[TrackedHand]:
         """
         トラッキング更新
         
@@ -228,7 +233,7 @@ class Hand3DTracker:
     
     def _assign_detections_to_tracks(
         self, 
-        hands_3d: List[Hand3DResult]
+        hands_3d: List['Hand3DResult']
     ) -> Dict[str, Optional[int]]:
         """
         検出結果とトラックの対応付け（ハンガリアンアルゴリズム）
@@ -303,7 +308,7 @@ class Hand3DTracker:
     def _update_assigned_tracks(
         self,
         assignments: Dict[str, Optional[int]],
-        hands_3d: List[Hand3DResult]
+        hands_3d: List['Hand3DResult']
     ) -> None:
         """割り当てられたトラックの更新"""
         current_time = time.perf_counter()
@@ -364,7 +369,7 @@ class Hand3DTracker:
     def _create_new_tracks(
         self,
         assignments: Dict[str, Optional[int]],
-        hands_3d: List[Hand3DResult]
+        hands_3d: List['Hand3DResult']
     ) -> None:
         """新しいトラックの作成"""
         used_indices = set(
