@@ -17,15 +17,10 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from .hands3d import Hand3DResult, Hand3DLandmark
 
-from .hands2d import HandednessType
+from ..types import HandednessType, TrackingState
+from src import get_logger
 
-
-class TrackingState(Enum):
-    """トラッキング状態"""
-    INITIALIZING = "initializing"
-    TRACKING = "tracking"
-    LOST = "lost"
-    TERMINATED = "terminated"
+logger = get_logger(__name__)
 
 
 @dataclass
@@ -190,20 +185,20 @@ class Hand3DTracker:
             # 5. 消失トラックの処理
             self._handle_lost_tracks()
             
-            # 6. 統計更新
-            tracking_time = (time.perf_counter() - start_time) * 1000
-            self._update_stats(tracking_time)
-            
-            # アクティブなトラックを返す
+            # 6. アクティブなトラックのフィルタリング（TERMINATED状態を除外）
             active_tracks = [
                 track for track in self.tracked_hands.values()
                 if track.state in [TrackingState.TRACKING, TrackingState.INITIALIZING]
             ]
             
+            # 7. 統計更新
+            tracking_time = (time.perf_counter() - start_time) * 1000
+            self._update_stats(tracking_time)
+            
             return active_tracks
             
         except Exception as e:
-            print(f"Tracking update error: {e}")
+            logger.warning(f"Tracking update error: {e}")
             return []
     
     def _predict_existing_tracks(self) -> None:
@@ -242,7 +237,12 @@ class Hand3DTracker:
             {track_id: detection_index or None}
         """
         if not hands_3d:
-            return {}
+            # 検出結果がない場合、全てのアクティブトラックをNoneに割り当て
+            active_tracks = [
+                (track_id, track) for track_id, track in self.tracked_hands.items()
+                if track.state in [TrackingState.TRACKING, TrackingState.INITIALIZING, TrackingState.LOST]
+            ]
+            return {track_id: None for track_id, _ in active_tracks}
         
         # アクティブなトラックのリスト
         active_tracks = [
@@ -286,7 +286,7 @@ class Hand3DTracker:
             row_indices, col_indices = linear_sum_assignment(cost_matrix)
         except ValueError as e:
             # cost matrixに問題がある場合は全てをNoneに設定
-            print(f"Assignment algorithm failed: {e}, resetting assignments")
+            logger.error(f"Assignment algorithm failed: {e}, resetting assignments")
             return {track_id: None for track_id, _ in active_tracks}
         
         assignments = {}
@@ -320,6 +320,8 @@ class Hand3DTracker:
                 track.lost_frames += 1
                 
                 if track.lost_frames > self.max_lost_frames:
+                    # max_lost_framesを超えたらLOST状態に変更
+                    # _handle_lost_tracks()で後処理される
                     track.state = TrackingState.LOST
                 
                 continue

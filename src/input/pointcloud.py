@@ -320,8 +320,13 @@ class PointCloudConverter:
             colors: np.ndarray = color_image[valid_mask].astype(np.float32) / 255.0
             return colors
             
+        except (AttributeError, ValueError, cv2.error) as e:
+            # 画像処理エラー（デバッグレベル）
+            logger.debug(f"Color extraction error: {e}")
+            return None
         except Exception as e:
-            logger.warning(f"Color extraction error: {e}")
+            # 予期しないエラー
+            logger.warning(f"Unexpected color extraction error: {e}")
             return None
     
     def numpy_to_pointcloud(

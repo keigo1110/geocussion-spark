@@ -72,6 +72,7 @@ milestones:
   - id: mesh
     title: "地形メッシュ生成フェーズ"
     budget_ms: 15
+    goal: "衝突検出に利用できる地形メッシュを構築"
     description: |
       点群を 2D 投影し Delaunay 三角形分割で地形メッシュを構築。簡略化後に法線・曲率・勾配を計算し、空間インデックスを生成する。
     depends_on: [input]
@@ -97,6 +98,7 @@ milestones:
   - id: collision
     title: "衝突検出フェーズ"
     budget_ms: 5
+    goal: "衝突検出に利用できる接触点情報を生成"
     description: |
       カーソル（球体モデル化された手）と地形メッシュの球-三角形衝突判定を行い、接触点情報を生成する。
     depends_on: [detection, mesh]

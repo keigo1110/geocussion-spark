@@ -118,7 +118,7 @@ class OrbbecCamera(ManagedResource):
         except Exception as e:
             # その他の予期しないエラー（致命的）
             logger.error(f"Unexpected camera initialization error: {e}")
-            raise RuntimeError(f"Camera initialization failed: {e}")
+            raise RuntimeError(f"Camera initialization failed: {e}") from e
     
     def _setup_depth_stream(self) -> bool:
         """深度ストリームを設定"""
@@ -284,7 +284,7 @@ class OrbbecCamera(ManagedResource):
         except Exception as e:
             # その他の予期しないエラー（致命的）
             logger.error(f"Unexpected pipeline start error: {e}")
-            raise RuntimeError(f"Pipeline start failed: {e}")
+            raise RuntimeError(f"Pipeline start failed: {e}") from e
     
     def cleanup(self) -> bool:
         """リソースクリーンアップ（ManagedResourceインターフェース）"""
@@ -295,15 +295,23 @@ class OrbbecCamera(ManagedResource):
                 try:
                     del self.pipeline
                     self.pipeline = None
+                except (AttributeError, RuntimeError) as e:
+                    # パイプライン削除エラー（警告レベル）
+                    logger.warning(f"Error cleaning up pipeline: {e}")
                 except Exception as e:
-                    logger.error(f"Error cleaning up pipeline: {e}")
+                    # 予期しないエラー
+                    logger.error(f"Unexpected error cleaning up pipeline: {e}")
             
             if self.config:
                 try:
                     del self.config
                     self.config = None
+                except (AttributeError, RuntimeError) as e:
+                    # 設定削除エラー（警告レベル）
+                    logger.warning(f"Error cleaning up config: {e}")
                 except Exception as e:
-                    logger.error(f"Error cleaning up config: {e}")
+                    # 予期しないエラー
+                    logger.error(f"Unexpected error cleaning up config: {e}")
             
             self.depth_intrinsics = None
             self.color_intrinsics = None
@@ -323,8 +331,13 @@ class OrbbecCamera(ManagedResource):
                 self.pipeline.stop()
                 self.is_started = False
                 logger.info("Pipeline stopped")
+            except (OBError, RuntimeError) as e:
+                # パイプライン停止エラー（警告レベル）
+                logger.warning(f"Error stopping pipeline: {e}")
+                self.is_started = False
             except Exception as e:
-                logger.error(f"Error stopping pipeline: {e}")
+                # 予期しないエラー
+                logger.error(f"Unexpected error stopping pipeline: {e}")
                 self.is_started = False
     
     def get_frame(self, timeout_ms: int = 100) -> Optional[FrameData]:
