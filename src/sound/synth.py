@@ -13,12 +13,6 @@ from typing import Dict, List, Optional, Callable, Any
 from enum import Enum
 import numpy as np
 
-try:
-    import pyo
-except ImportError:
-    print("Warning: pyo not available. Audio synthesis will be disabled.")
-    pyo = None
-
 # 他フェーズとの連携
 from .mapping import AudioParameters, InstrumentType
 from ..config import get_config, AudioConfig as GlobalAudioConfig
@@ -26,6 +20,12 @@ from ..resource_manager import ManagedResource, get_resource_manager
 from .. import get_logger
 
 logger = get_logger(__name__)
+
+try:
+    import pyo
+except ImportError:
+    logger.warning("pyo not available. Audio synthesis will be disabled.")
+    pyo = None
 
 
 class EngineState(Enum):
@@ -144,7 +144,7 @@ class AudioSynthesizer(ManagedResource):
             成功したかどうか
         """
         if pyo is None:
-            print("Error: pyo is not available")
+            logger.error("pyo is not available")
             self.state = EngineState.ERROR
             return False
         
@@ -169,11 +169,11 @@ class AudioSynthesizer(ManagedResource):
             self._initialize_effects()
             
             self.state = EngineState.RUNNING
-            print(f"Audio engine started successfully. Latency: {self.config.latency_ms:.1f}ms")
+            logger.info(f"Audio engine started successfully. Latency: {self.config.latency_ms:.1f}ms")
             return True
             
         except Exception as e:
-            print(f"Failed to start audio engine: {e}")
+            logger.exception(f"Failed to start audio engine: {e}")
             self.state = EngineState.ERROR
             return False
     
@@ -281,7 +281,7 @@ class AudioSynthesizer(ManagedResource):
                 return voice_id
                 
             except Exception as e:
-                print(f"Error playing audio: {e}")
+                logger.exception(f"Error playing audio: {e}")
                 return None
     
     def stop_voice(self, voice_id: str):
@@ -303,14 +303,14 @@ class AudioSynthesizer(ManagedResource):
                         if hasattr(voice, 'out'):
                             voice.out(0)  # 出力を停止
                     except Exception as e:
-                        print(f"[VOICE-STOP] Error stopping pyo voice: {e}")
+                        logger.error(f"Error stopping pyo voice: {e}")
                 
                 # 管理から削除
                 del self.active_voices[voice_id]
                 self.stats['active_voices_count'] = len(self.active_voices)
                 
             except Exception as e:
-                print(f"[VOICE-STOP] Error stopping voice {voice_id}: {e}")
+                logger.exception(f"Error stopping voice {voice_id}: {e}")
                 # エラーでも削除を試行
                 try:
                     if voice_id in self.active_voices:
@@ -359,7 +359,7 @@ class AudioSynthesizer(ManagedResource):
             self.server.setAmp(self.config.master_volume)
             
         except Exception as e:
-            print(f"Error initializing effects: {e}")
+            logger.exception(f"Error initializing effects: {e}")
     
     def _create_instrument_template(self, instrument_type: InstrumentType) -> Dict:
         """楽器テンプレートを作成"""
@@ -475,7 +475,7 @@ class AudioSynthesizer(ManagedResource):
             return voice
             
         except Exception as e:
-            print(f"Error creating voice: {e}")
+            logger.exception(f"Error creating voice: {e}")
             return None
     
     def _create_oscillator(self, params: AudioParameters, template: Dict, freq: float) -> Any:
@@ -536,16 +536,28 @@ class AudioSynthesizer(ManagedResource):
                         # 時間計算エラーの場合も削除
                         finished_voices.append(voice_id)
             except Exception as e:
-                print(f"[SYNTH-CLEANUP] Error during voice scan: {e}")
-                return
+                logger.debug(f"Error during voice scan: {e}")
+                voices_to_remove = []
+                for voice_id, voice_data in list(self.active_voices.items()):
+                    if voice_data is None:
+                        voices_to_remove.append(voice_id)
+                        continue
+                    
+                    try:
+                        elapsed = time.perf_counter() - voice_data['start_time']
+                        duration = voice_data.get('duration', 1.0)
+                        if elapsed >= duration + 0.1:  # 100ms余裕
+                            voices_to_remove.append(voice_id)
+                    except Exception:
+                        # 時間計算エラーの場合も削除
+                        voices_to_remove.append(voice_id)
         
-        # 2. ロック外で安全に停止
-        if finished_voices:
-            for voice_id in finished_voices:
-                try:
-                    self.stop_voice(voice_id)
-                except Exception as e:
-                    print(f"[SYNTH-CLEANUP] Error stopping voice {voice_id}: {e}")
+        # 問題のあるボイスを削除
+        for voice_id in voices_to_remove:
+            try:
+                self.stop_voice(voice_id)
+            except Exception as e:
+                logger.error(f"Error stopping voice {voice_id}: {e}")
     
     def get_performance_stats(self) -> dict:
         """パフォーマンス統計取得"""
