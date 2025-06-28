@@ -1,14 +1,14 @@
-version: "1.0"
+version: "2.0"
 meta:
   project: "Geocussion-SP リアルタイム処理パイプライン"
-  author: "AI assistant"
-  created: "2025-06-19"
-  description: "深度カメラ入力から音響生成までを 40 ms 以内で実行するリアルタイム処理パイプラインの実装計画。Open3D ビューワはデバッグ用途として維持し、全フェーズの可視化をサポートする。"
-  frame_budget_ms: 40  # 1 フレームあたりの目標最大処理時間
+  author: "User"
+  created: "2025-06-29"
+  description: "深度カメラ入力から音響生成までを目標30Hzのリアルタイム処理パイプラインの実装計画。Open3D ビューワはデバッグ用途として維持し、全フェーズの可視化をサポートする。実運用はヘッドレスモードで利用。"
 
 # ライブラリ／外部依存
-requirements:
+requirements
   python: ">=3.10"
+  env: venv
   pip:
     - pyorbbecsdk  # センサ入力
     - open3d
@@ -33,6 +33,7 @@ milestones:
   - id: input
     title: "入力フェーズ"
     budget_ms: 5
+    goal: "RGB フレームとポイントクラウド情報をリアルタイムで取得"
     description: |
       深度および RGB フレームをカメラから取得し、ノイズ除去後に点群へ変換する。
     deliverables:
@@ -51,6 +52,7 @@ milestones:
   - id: detection
     title: "手検出フェーズ"
     budget_ms: 10
+    goal: "手の3D位置と速度を推定"
     description: |
       MediaPipe による 2D 手検出 → 深度マップ参照による 3D 座標化 → カルマンフィルタによる平滑化＆速度推定。
     depends_on: [input]
@@ -134,6 +136,18 @@ milestones:
       - id: spatialization
         desc: "X 座標に応じたパンニング (等電圧) を適用"
 
+  - id: integration
+    title: "統合フェーズ"
+    budget_ms: 5
+    description: |
+      全フェーズを統合し、リアルタイム処理パイプラインを完成させる。
+    depends_on: [input, detection, mesh, collision, sound]
+    deliverables:
+      - demo_collision_detection.py      # 統合パイプラインクラス
+    tasks:
+      - id: integration_test
+        desc: "全フェーズを統合し、リアルタイム処理パイプラインを完成させる。"
+
 # デバッグ & 可視化
 debug:
   open3d_viewer:
@@ -147,20 +161,6 @@ debug:
   perf_logger:
     description: "各フェーズの処理時間を rolling 平均で表示 (terminal + log)"
     file: src/debug/profiler.py
-
-'timeline':
-  - week: 1
-    focus: [input]
-  - week: 2
-    focus: [detection]
-  - week: 3
-    focus: [mesh]
-  - week: 4
-    focus: [collision]
-  - week: 5
-    focus: [sound]
-  - week: 6
-    focus: [integration, performance_tuning]
 
 # 完了基準
 acceptance_criteria:

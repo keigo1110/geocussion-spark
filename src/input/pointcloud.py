@@ -11,6 +11,11 @@ import numpy as np
 import cv2
 
 try:
+    # vendor配下から直接import
+    import sys
+    import os
+    vendor_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', 'vendor', 'pyorbbecsdk')
+    sys.path.insert(0, vendor_path)
     from pyorbbecsdk import OBFormat
     import open3d as o3d
     HAS_OPEN3D = True
@@ -19,7 +24,10 @@ except ImportError:
     from ..types import OBFormat
     HAS_OPEN3D = False
 
-from .stream import CameraIntrinsics, FrameData
+from ..types import CameraIntrinsics, FrameData
+from src import get_logger
+
+logger = get_logger(__name__)
 
 
 class PointCloudConverter:
@@ -74,10 +82,7 @@ class PointCloudConverter:
         else:
             self.downsampled_intrinsics = depth_intrinsics
         
-        # メッシュグリッドを事前計算（パフォーマンス最適化）
-        self._precompute_meshgrid()
-        
-        # 3D座標計算用の係数を事前計算（高速化）
+        # 3D座標計算用の係数を事前計算（統合版）
         self._precompute_coefficients()
         
         # パフォーマンス統計
@@ -93,30 +98,21 @@ class PointCloudConverter:
             'resolution_downsampling_ratio': f"{target_width}x{target_height}" if enable_resolution_downsampling else "disabled"
         }
         
-    def _precompute_meshgrid(self) -> None:
-        """メッシュグリッドを事前計算"""
-        width = self.depth_intrinsics.width
-        height = self.depth_intrinsics.height
-        
-        # ピクセル座標のメッシュグリッド
-        self.pixel_x, self.pixel_y = np.meshgrid(
-            np.arange(width, dtype=np.float32),
-            np.arange(height, dtype=np.float32)
-        )
-        
-        # カメラ座標系への変換係数を事前計算
-        self.x_coeff = (self.pixel_x - self.depth_intrinsics.cx) / self.depth_intrinsics.fx
-        self.y_coeff = -(self.pixel_y - self.depth_intrinsics.cy) / self.depth_intrinsics.fy  # 手の3D投影と座標系統一
-    
     def _precompute_coefficients(self):
-        """3D座標計算用の係数を事前計算"""
+        """3D座標計算用の係数を事前計算（統合版・lazy-init対応）"""
+        if hasattr(self, 'x_coeff') and hasattr(self, 'y_coeff'):
+            # 既に計算済みの場合はスキップ
+            return
+            
         # ピクセル座標のメッシュグリッドを作成
         height, width = self.depth_intrinsics.height, self.depth_intrinsics.width
         u, v = np.meshgrid(np.arange(width), np.arange(height))
         
         # X, Y座標の計算係数（Z値との乗算で3D座標が得られる）
         self.x_coeff = (u - self.depth_intrinsics.cx) / self.depth_intrinsics.fx
-        self.y_coeff = -(v - self.depth_intrinsics.cy) / self.depth_intrinsics.fy  # Y軸反転
+        self.y_coeff = -(v - self.depth_intrinsics.cy) / self.depth_intrinsics.fy  # Y軸反転（手の3D投影と座標系統一）
+        
+        logger.debug(f"Precomputed 3D projection coefficients for {width}x{height} resolution")
     
     def depth_to_pointcloud(
         self,
@@ -270,8 +266,17 @@ class PointCloudConverter:
             
             return downsampled_points, downsampled_colors
             
+        except (ImportError, AttributeError) as e:
+            # Open3D関連のエラー（復旧可能）
+            logger.warning(f"Voxel downsampling unavailable: {e}")
+            return points, colors
+        except (MemoryError, ValueError) as e:
+            # メモリ不足やデータエラー（致命的）
+            logger.error(f"Critical error during voxel downsampling: {e}")
+            raise RuntimeError(f"Voxel downsampling failed: {e}")
         except Exception as e:
-            print(f"Voxel downsampling failed, using original points: {e}")
+            # その他のエラー（警告して元の点群を返す）
+            logger.warning(f"Unexpected voxel downsampling error: {e}")
             return points, colors
     
     def _extract_colors(self, color_frame: Any, valid_mask: np.ndarray) -> Optional[np.ndarray]:
@@ -316,7 +321,7 @@ class PointCloudConverter:
             return colors
             
         except Exception as e:
-            print(f"Color extraction error: {e}")
+            logger.warning(f"Color extraction error: {e}")
             return None
     
     def numpy_to_pointcloud(
@@ -417,18 +422,18 @@ class PointCloudConverter:
             voxel_size: 新しいボクセルサイズ (m)
         """
         self.voxel_size = max(0.001, min(0.1, voxel_size))  # 1mm-10cmの範囲に制限
-        print(f"Voxel size updated to: {self.voxel_size*1000:.1f}mm")
+        logger.info(f"Voxel size updated to: {self.voxel_size*1000:.1f}mm")
     
     def toggle_voxel_downsampling(self):
         """ボクセルダウンサンプリングのON/OFF切り替え"""
         self.enable_voxel_downsampling = not self.enable_voxel_downsampling
-        print(f"Voxel downsampling: {'enabled' if self.enable_voxel_downsampling else 'disabled'}")
+        logger.info(f"Voxel downsampling: {'enabled' if self.enable_voxel_downsampling else 'disabled'}")
     
     def toggle_resolution_downsampling(self):
         """解像度ダウンサンプリングのON/OFF切り替え"""
         self.enable_resolution_downsampling = not self.enable_resolution_downsampling
-        print(f"Resolution downsampling: {'enabled' if self.enable_resolution_downsampling else 'disabled'} "
-              f"(target: {self.target_width}x{self.target_height})")
+        logger.info(f"Resolution downsampling: {'enabled' if self.enable_resolution_downsampling else 'disabled'} "
+                   f"(target: {self.target_width}x{self.target_height})")
         
         # 統計情報を更新
         self.performance_stats['resolution_downsampling_enabled'] = self.enable_resolution_downsampling
@@ -458,8 +463,8 @@ class PointCloudConverter:
         self.performance_stats['resolution_downsampling_enabled'] = enabled
         self.performance_stats['resolution_downsampling_ratio'] = f"{target_width}x{target_height}" if enabled else "disabled"
         
-        print(f"Resolution downsampling: {'enabled' if enabled else 'disabled'} "
-              f"(target: {target_width}x{target_height})")
+        logger.info(f"Resolution downsampling: {'enabled' if enabled else 'disabled'} "
+                   f"(target: {target_width}x{target_height})")
     
     def get_performance_stats(self) -> dict:
         """パフォーマンス統計を取得"""
@@ -477,26 +482,26 @@ class PointCloudConverter:
     def print_performance_stats(self):
         """パフォーマンス統計を表示"""
         stats = self.get_performance_stats()
-        print("\n" + "="*50)
-        print("Point Cloud Converter Performance Stats")
-        print("="*50)
-        print(f"Total conversions: {stats['total_conversions']}")
-        print(f"Average processing time: {stats['average_time_ms']:.2f}ms")
-        print(f"Last input points: {stats['last_input_points']:,}")
-        print(f"Last output points: {stats['last_output_points']:,}")
-        print(f"Last downsampling ratio: {stats['last_downsampling_ratio']:.3f}")
+        logger.debug("="*50)
+        logger.debug("Point Cloud Converter Performance Stats")
+        logger.debug("="*50)
+        logger.debug(f"Total conversions: {stats['total_conversions']}")
+        logger.debug(f"Average processing time: {stats['average_time_ms']:.2f}ms")
+        logger.debug(f"Last input points: {stats['last_input_points']:,}")
+        logger.debug(f"Last output points: {stats['last_output_points']:,}")
+        logger.debug(f"Last downsampling ratio: {stats['last_downsampling_ratio']:.3f}")
         
         if stats['open3d_available']:
-            print(f"Voxel downsampling: {'Enabled' if stats['voxel_downsampling_enabled'] else 'Disabled'}")
+            logger.debug(f"Voxel downsampling: {'Enabled' if stats['voxel_downsampling_enabled'] else 'Disabled'}")
             if stats['voxel_downsampling_enabled']:
-                print(f"Current voxel size: {stats['current_voxel_size_mm']:.1f}mm")
+                logger.debug(f"Current voxel size: {stats['current_voxel_size_mm']:.1f}mm")
                 if stats['total_conversions'] > 0:
                     avg_downsampling_time = stats['total_downsampling_time_ms'] / stats['total_conversions']
-                    print(f"Average downsampling time: {avg_downsampling_time:.2f}ms")
+                    logger.debug(f"Average downsampling time: {avg_downsampling_time:.2f}ms")
         else:
-            print("Open3D not available - downsampling disabled")
+            logger.debug("Open3D not available - downsampling disabled")
         
-        print("="*50)
+        logger.debug("="*50)
 
 
 def create_converter_from_frame_data(frame_data: FrameData, depth_intrinsics: CameraIntrinsics) -> PointCloudConverter:

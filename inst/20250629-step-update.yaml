@@ -1,0 +1,99 @@
+id: core_refactor
+title: "基盤リファクタリング: 型定義統合と依存整理"
+description: |
+  `src/input` 系モジュールで発生している型クラス重複と、`pyorbbecsdk` のローカル配置による import 衝突を解消し、
+  コードベース全体の保守性・環境再現性を向上させる。
+problems:
+  - id: P-CORE-001
+    title: "CameraIntrinsics / FrameData が多重定義"
+    module: ["src/types.py", "src/input/stream.py", "src/input/pointcloud.py"]
+    description: |
+      現在 `CameraIntrinsics` と `FrameData` が `src/types.py` と `src/input/stream.py` の双方で定義されており、
+      将来的に型の仕様が乖離するリスクが高い。IDE の型解決や mypy 検証でも混乱を招く。
+    severity: "High"
+    fix_suggestion: |
+      `src/types.py` に一本化し、他ファイルでは同モジュールを import して利用する。
+  - id: P-CORE-002
+    title: "pyorbbecsdk パッケージの二重定義"
+    module: "pyorbbecsdk/"
+    description: |
+      サブディレクトリにベンダーライブラリを直接配置しているため、`pip install pyorbbecsdk` と名前衝突が発生する。
+      開発環境によって標準パスが優先される場合があり、ビルド・ランタイムで挙動が変わる。
+    severity: "High"
+    fix_suggestion: |
+      - サブモジュール化 or 自前 wheel 配布に切り替え。
+      - リポジトリ内では import 先を `vendor.pyorbbecsdk` などにネームスペース隔離する。
+  - id: P-CORE-003
+    title: "例外ハンドリングが catch-all"
+    module: ["src/input/stream.py", "src/input/pointcloud.py"]
+    description: |
+      `except Exception:` で全て握り潰しており、致命的エラーが上位に伝搬しない。デバッグが困難。
+    severity: "Medium"
+    fix_suggestion: |
+      - SDK 例外 (`OBError`) / 一般例外 / 致命例外 で捕捉を分離。
+      - 致命例外は再 raise して呼び出し側に通知する。
+  - id: P-CORE-004
+    title: "print ベースのログ混在"
+    module: ["src/input/pointcloud.py", "src/input/depth_filter.py"]
+    description: |
+      `print()` が logger と併用されており、ログレベル制御ができない。
+    severity: "Low"
+    fix_suggestion: |
+      全て `get_logger(__name__)` に統一し、`logger.debug/info/warning` を使用する。
+  - id: P-CORE-005
+    title: "メッシュグリッド計算の重複"
+    module: "src/input/pointcloud.py"
+    description: |
+      `_precompute_meshgrid` と `_precompute_coefficients` が実質同じ計算を重複実行し、
+      メモリと初期化時間を浪費している。
+    severity: "Low"
+    fix_suggestion: |
+      どちらか一つに統合し、lazy-init で一度だけ計算する。
+
+tasks:
+  - id: T-CORE-001
+    description: "`src/types.py` に型定義を統合し、全ファイルをリファクタリング"
+    depends_on: [P-CORE-001]
+    steps:
+      - "1. `CameraIntrinsics`, `FrameData` を `src/types.py` へ集約。"
+      - "2. `src/input/stream.py` と `src/input/pointcloud.py` から重複定義を削除。"
+      - "3. import 文を `from src.types import CameraIntrinsics, FrameData` に統一。"
+    acceptance_criteria:
+      - "重複定義が無くなり、mypy strict が型重複エラーを出さない。"
+
+  - id: T-CORE-002
+    description: "pyorbbecsdk を外部依存に切り替え、名前衝突を回避"
+    depends_on: [P-CORE-002]
+    steps:
+      - "1. `pyorbbecsdk` ディレクトリを `vendor/pyorbbecsdk` へ移動 (一時措置)。"
+      - "2. `src` 内の import を `from vendor.pyorbbecsdk import ...` へ一括置換。"
+      - "3. requirements.txt に正規版 pyorbbecsdk==2.0.10 を pin し、vendor 版は将来的に削除。"
+    acceptance_criteria:
+      - "ローカル環境と CI で import 競合が発生しない。"
+
+  - id: T-CORE-003
+    description: "例外ハンドリングを分類し再 raise 方針を実装"
+    depends_on: [P-CORE-003]
+    steps:
+      - "1. `src/input/stream.py` の `initialize`, `start`, `get_frame` を SDK/一般/致命系で `except` 分岐。"
+      - "2. `src/input/pointcloud.py` の catch-all を特定例外に置き換え、ログ後に再 raise。"
+    acceptance_criteria:
+      - "致命的エラー時に上位で正しく例外が捕捉でき、テストで確認できる。"
+
+  - id: T-CORE-004
+    description: "print → logger への置換"
+    depends_on: [P-CORE-004]
+    steps:
+      - "1. `src/input` 配下の print 文を検索し、logger 呼び出しへ置換。"
+      - "2. logger のレベルは debug で冗長ログ、info で通常ログとする指針を README に追記。"
+    acceptance_criteria:
+      - "標準出力にデバッグ文字列が出ない。ログファイルに記録される。"
+
+  - id: T-CORE-005
+    description: "メッシュグリッド計算の二重化を解消"
+    depends_on: [P-CORE-005]
+    steps:
+      - "1. `_precompute_meshgrid` と `_precompute_coefficients` を統合。"
+      - "2. 呼び出し箇所を更新しテストを通す。"
+    acceptance_criteria:
+      - "初期化時のメモリフットプリントが削減し、CI の memory_optimization_test が pass。"

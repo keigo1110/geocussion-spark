@@ -70,16 +70,37 @@ class OBFormat(Enum):
 
 @dataclass
 class FrameData:
-    """フレームデータ構造"""
-    depth_image: np.ndarray
-    color_data: Optional[np.ndarray] = None
-    timestamp: float = 0.0
+    """フレームデータ構造（Orbbec SDK互換）"""
+    depth_frame: Optional[Any] = None
+    color_frame: Optional[Any] = None
+    timestamp_ms: float = 0.0
     frame_number: int = 0
     
     @property
     def has_color(self) -> bool:
         """カラーデータが存在するか"""
-        return self.color_data is not None
+        return self.color_frame is not None
+    
+    # 後方互換性のためのプロパティ
+    @property
+    def depth_image(self) -> Optional[np.ndarray]:
+        """深度画像データ（後方互換性）"""
+        if self.depth_frame is None:
+            return None
+        # OrbbecフレームからNumPy配列を取得する処理を想定
+        return getattr(self.depth_frame, 'get_data', lambda: None)()
+    
+    @property
+    def color_data(self) -> Optional[np.ndarray]:
+        """カラーデータ（後方互換性）"""
+        if self.color_frame is None:
+            return None
+        return getattr(self.color_frame, 'get_data', lambda: None)()
+    
+    @property
+    def timestamp(self) -> float:
+        """タイムスタンプ（秒）"""
+        return self.timestamp_ms / 1000.0
 
 
 @dataclass

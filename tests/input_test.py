@@ -60,11 +60,13 @@ class TestPointCloudConverter(unittest.TestCase):
         self.assertEqual(self.converter.depth_intrinsics.width, 640)
         self.assertEqual(self.converter.depth_intrinsics.height, 480)
         
-        # メッシュグリッドの事前計算確認
-        self.assertIsNotNone(self.converter.pixel_x)
-        self.assertIsNotNone(self.converter.pixel_y)
+        # 3D座標計算係数の事前計算確認
         self.assertIsNotNone(self.converter.x_coeff)
         self.assertIsNotNone(self.converter.y_coeff)
+        
+        # 係数の形状確認
+        self.assertEqual(self.converter.x_coeff.shape, (480, 640))
+        self.assertEqual(self.converter.y_coeff.shape, (480, 640))
     
     def test_numpy_to_pointcloud(self):
         """numpy配列から点群への変換テスト"""
@@ -96,7 +98,7 @@ class TestPointCloudConverter(unittest.TestCase):
         self.assertTrue(np.all(z_values <= 1.1))
     
     def test_update_intrinsics(self):
-        """内部パラメータ更新テスト"""
+        """内部パラメータ更新テスト（新しい実装では再作成）"""
         new_intrinsics = CameraIntrinsics(
             fx=600.0,
             fy=600.0,
@@ -106,13 +108,15 @@ class TestPointCloudConverter(unittest.TestCase):
             height=600
         )
         
-        self.converter.update_intrinsics(new_intrinsics)
+        # 新しいコンバーターを作成（内部パラメータ更新の代替）
+        new_converter = PointCloudConverter(new_intrinsics)
         
-        self.assertEqual(self.converter.depth_intrinsics.fx, 600.0)
-        self.assertEqual(self.converter.depth_intrinsics.width, 800)
+        self.assertEqual(new_converter.depth_intrinsics.fx, 600.0)
+        self.assertEqual(new_converter.depth_intrinsics.width, 800)
         
-        # メッシュグリッドが更新されていることを確認
-        self.assertEqual(self.converter.pixel_x.shape, (600, 800))
+        # 3D座標計算係数が更新されていることを確認
+        self.assertEqual(new_converter.x_coeff.shape, (600, 800))
+        self.assertEqual(new_converter.y_coeff.shape, (600, 800))
 
 
 class TestDepthFilter(unittest.TestCase):

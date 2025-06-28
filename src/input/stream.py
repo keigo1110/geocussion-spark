@@ -18,6 +18,11 @@ from ..resource_manager import ManagedResource, get_resource_manager
 logger = get_logger(__name__)
 
 try:
+    # vendor配下から直接import
+    import sys
+    import os
+    vendor_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', 'vendor', 'pyorbbecsdk')
+    sys.path.insert(0, vendor_path)
     from pyorbbecsdk import Pipeline, Config, OBSensorType, FrameSet, OBError
 except ImportError:
     # テスト用のモック定義
@@ -45,24 +50,7 @@ except ImportError:
         pass
 
 
-@dataclass
-class CameraIntrinsics:
-    """カメラ内部パラメータ"""
-    fx: float
-    fy: float
-    cx: float
-    cy: float
-    width: int
-    height: int
-
-
-@dataclass 
-class FrameData:
-    """フレームデータコンテナ"""
-    depth_frame: Optional[Any] = None
-    color_frame: Optional[Any] = None
-    timestamp_ms: float = 0.0
-    frame_number: int = 0
+# CameraIntrinsics と FrameData は src/types.py で定義済み
 
 
 class OrbbecCamera(ManagedResource):
@@ -101,6 +89,9 @@ class OrbbecCamera(ManagedResource):
         
         Returns:
             成功した場合True
+            
+        Raises:
+            RuntimeError: 致命的な初期化エラー
         """
         try:
             self.pipeline = Pipeline()
@@ -116,9 +107,18 @@ class OrbbecCamera(ManagedResource):
                 
             return True
             
-        except Exception as e:
-            logger.error(f"Camera initialization error: {e}")
+        except OBError as e:
+            # OrbbecSDK固有のエラー
+            logger.error(f"Orbbec SDK error during initialization: {e}")
             return False
+        except (OSError, IOError) as e:
+            # システムリソースエラー（致命的）
+            logger.error(f"System resource error during camera initialization: {e}")
+            raise RuntimeError(f"Camera hardware access failed: {e}")
+        except Exception as e:
+            # その他の予期しないエラー（致命的）
+            logger.error(f"Unexpected camera initialization error: {e}")
+            raise RuntimeError(f"Camera initialization failed: {e}")
     
     def _setup_depth_stream(self) -> bool:
         """深度ストリームを設定"""
@@ -260,6 +260,9 @@ class OrbbecCamera(ManagedResource):
         
         Returns:
             成功した場合True
+            
+        Raises:
+            RuntimeError: 致命的な開始エラー
         """
         if not self.pipeline or not self.config:
             logger.error("Camera not initialized")
@@ -270,9 +273,18 @@ class OrbbecCamera(ManagedResource):
             self.is_started = True
             logger.info("Pipeline started!")
             return True
-        except Exception as e:
-            logger.error(f"Failed to start pipeline: {e}")
+        except OBError as e:
+            # OrbbecSDK固有のエラー（復旧可能）
+            logger.error(f"Orbbec SDK error during start: {e}")
             return False
+        except (OSError, IOError) as e:
+            # システムリソースエラー（致命的）
+            logger.error(f"System resource error during pipeline start: {e}")
+            raise RuntimeError(f"Camera pipeline start failed: {e}")
+        except Exception as e:
+            # その他の予期しないエラー（致命的）
+            logger.error(f"Unexpected pipeline start error: {e}")
+            raise RuntimeError(f"Pipeline start failed: {e}")
     
     def cleanup(self) -> bool:
         """リソースクリーンアップ（ManagedResourceインターフェース）"""
@@ -324,6 +336,9 @@ class OrbbecCamera(ManagedResource):
             
         Returns:
             フレームデータまたはNone
+            
+        Raises:
+            RuntimeError: 致命的なフレーム取得エラー
         """
         if not self.is_started:
             return None
@@ -343,8 +358,17 @@ class OrbbecCamera(ManagedResource):
             self.frame_count += 1
             return frame_data
             
+        except OBError as e:
+            # OrbbecSDK固有のエラー（タイムアウト等、復旧可能）
+            logger.debug(f"Orbbec SDK frame acquisition error: {e}")
+            return None
+        except (OSError, IOError, MemoryError) as e:
+            # システムリソースエラー（致命的）
+            logger.error(f"System resource error during frame acquisition: {e}")
+            raise RuntimeError(f"Frame acquisition failed: {e}")
         except Exception as e:
-            logger.error(f"Frame acquisition error: {e}")
+            # その他の予期しないエラー（警告してNoneを返す）
+            logger.warning(f"Unexpected frame acquisition error: {e}")
             return None
     
     def get_stats(self) -> Dict[str, Any]:
