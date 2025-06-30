@@ -209,7 +209,7 @@ class TestVoiceManager:
     
     def test_voice_cleanup(self):
         """ボイスクリーンアップテスト"""
-        params = AudioParameters(
+            params = AudioParameters(
             frequency=440.0,
             amplitude=0.5,
             pan=0.0,

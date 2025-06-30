@@ -84,6 +84,16 @@ class TrackedHand:
     def is_moving(self) -> bool:
         """動いているかどうか"""
         return self.speed > 0.05  # 5cm/s 以上で動いているとみなす
+    
+    @property
+    def palm_center(self) -> np.ndarray:
+        """手のひら中心位置（位置と同じ）"""
+        return self.position
+    
+    @property
+    def hand_id(self) -> str:
+        """手のID（idと同じ）"""
+        return self.id
 
 
 class Hand3DTracker:

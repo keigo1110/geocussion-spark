@@ -2,7 +2,7 @@
 """
 深度画像ノイズフィルタモジュール
 median / bilateral / temporal フィルタによるノイズ除去
-残像低減・エッジ保持対応
+残像低減・エッジ保持対応 + CUDA高速化対応
 """
 
 import time
@@ -11,9 +11,25 @@ from collections import deque
 from enum import Enum
 import numpy as np
 import cv2
+import threading
+from concurrent.futures import ThreadPoolExecutor
 
 # メモリ最適化
 from ..collision.optimization import optimize_array_operations, memory_efficient_context, InPlaceOperations
+from .. import get_logger
+
+logger = get_logger(__name__)
+
+# CUDA利用可能性チェック
+try:
+    # OpenCV CUDA機能の確認
+    cv2.cuda.getCudaEnabledDeviceCount()
+    HAS_CUDA = cv2.cuda.getCudaEnabledDeviceCount() > 0
+    if HAS_CUDA:
+        logger.info(f"CUDA enabled: {cv2.cuda.getCudaEnabledDeviceCount()} devices found")
+except (cv2.error, AttributeError):
+    HAS_CUDA = False
+    logger.info("CUDA not available, using CPU fallback")
 
 
 class FilterType(Enum):
@@ -24,8 +40,68 @@ class FilterType(Enum):
     COMBINED = "combined"
 
 
+class CudaBilateralFilter:
+    """CUDA対応バイラテラルフィルタ"""
+    
+    def __init__(self):
+        self.gpu_mat_cache = {}
+        self.stream = cv2.cuda.Stream() if HAS_CUDA else None
+        self.initialized = False
+        
+    def initialize(self, image_shape: tuple):
+        """GPU行列の初期化"""
+        if not HAS_CUDA:
+            return False
+            
+        try:
+            h, w = image_shape
+            # GPU行列をキャッシュ
+            self.gpu_mat_cache['input'] = cv2.cuda.GpuMat(h, w, cv2.CV_32F)
+            self.gpu_mat_cache['output'] = cv2.cuda.GpuMat(h, w, cv2.CV_32F)
+            self.initialized = True
+            logger.debug(f"CUDA bilateral filter initialized for {w}x{h}")
+            return True
+        except Exception as e:
+            logger.warning(f"CUDA bilateral filter initialization failed: {e}")
+            return False
+    
+    def apply(self, depth_image: np.ndarray, d: int, sigma_color: float, sigma_space: float) -> np.ndarray:
+        """CUDA バイラテラルフィルタ適用"""
+        if not HAS_CUDA or not self.initialized:
+            return None
+            
+        try:
+            # CPU → GPU転送
+            gpu_input = self.gpu_mat_cache['input']
+            gpu_output = self.gpu_mat_cache['output']
+            
+            gpu_input.upload(depth_image)
+            
+            # CUDA バイラテラルフィルタ実行
+            cv2.cuda.bilateralFilter(
+                gpu_input, 
+                gpu_output, 
+                d, 
+                sigma_color, 
+                sigma_space,
+                stream=self.stream
+            )
+            
+            # GPU → CPU転送
+            result = gpu_output.download()
+            
+            if self.stream:
+                self.stream.waitForCompletion()
+                
+            return result
+            
+        except Exception as e:
+            logger.warning(f"CUDA bilateral filter error: {e}")
+            return None
+
+
 class DepthFilter:
-    """深度画像ノイズフィルタクラス"""
+    """深度画像ノイズフィルタクラス（CUDA高速化対応）"""
     
     def __init__(
         self,
@@ -37,21 +113,18 @@ class DepthFilter:
         temporal_alpha: float = 0.3,
         temporal_history_size: int = 3,
         min_valid_depth: float = 0.1,
-        max_valid_depth: float = 10.0
+        max_valid_depth: float = 10.0,
+        use_cuda: bool = True,
+        enable_multiscale: bool = True,
+        enable_async: bool = True
     ):
         """
         初期化
         
         Args:
-            filter_types: 適用するフィルタタイプのリスト
-            median_kernel_size: メディアンフィルタのカーネルサイズ
-            bilateral_d: バイラテラルフィルタの近傍径
-            bilateral_sigma_color: バイラテラルフィルタの色空間標準偏差
-            bilateral_sigma_space: バイラテラルフィルタの座標空間標準偏差
-            temporal_alpha: 時間フィルタの重み（0.0-1.0、小さいほど平滑化強）
-            temporal_history_size: 時間フィルタの履歴サイズ
-            min_valid_depth: 有効深度の最小値
-            max_valid_depth: 有効深度の最大値
+            use_cuda: CUDA加速を使用するか
+            enable_multiscale: マルチスケール処理を有効にするか
+            enable_async: 非同期処理を有効にするか
         """
         self.filter_types = filter_types or [FilterType.COMBINED]
         self.median_kernel_size = median_kernel_size
@@ -63,12 +136,26 @@ class DepthFilter:
         self.min_valid_depth = min_valid_depth
         self.max_valid_depth = max_valid_depth
         
-        # 時間フィルタ用の履歴バッファ
-        self.depth_history: Deque[np.ndarray] = deque(maxlen=temporal_history_size)
-        self.temporal_avg: Optional[np.ndarray] = None
+        # CUDA & パフォーマンス設定
+        self.use_cuda = use_cuda and HAS_CUDA
+        self.enable_multiscale = enable_multiscale
+        self.enable_async = enable_async
+        
+        # CUDA フィルタ初期化
+        self.cuda_bilateral = CudaBilateralFilter() if self.use_cuda else None
+        
+        # EMA 時間フィルタ用（履歴バッファ削除）
+        self.temporal_ema: Optional[np.ndarray] = None
+        self.ema_initialized = False
+        
+        # 非同期処理用
+        self.executor = ThreadPoolExecutor(max_workers=2) if enable_async else None
         
         # パフォーマンス計測
         self.processing_times: Dict[str, float] = {}
+        
+        logger.info(f"DepthFilter initialized: CUDA={self.use_cuda}, "
+                   f"multiscale={enable_multiscale}, async={enable_async}")
         
     @optimize_array_operations
     def apply_filter(self, depth_image: np.ndarray) -> np.ndarray:
@@ -140,9 +227,9 @@ class DepthFilter:
         self.processing_times['median'] = (time.perf_counter() - start_time) * 1000
         return filtered
     
-    def _apply_bilateral_filter(self, depth_image: np.ndarray, valid_mask: np.ndarray) -> np.ndarray:
+    def _apply_bilateral_filter_cuda(self, depth_image: np.ndarray, valid_mask: np.ndarray) -> np.ndarray:
         """
-        バイラテラルフィルタを適用（エッジ保持平滑化）
+        CUDA バイラテラルフィルタを適用（高速版）
         
         Args:
             depth_image: 深度画像
@@ -150,32 +237,107 @@ class DepthFilter:
             
         Returns:
             フィルタ済み画像
+        """
+        start_time = time.perf_counter()
+        
+        filtered = depth_image.copy()
+        
+        if not np.any(valid_mask):
+            self.processing_times['bilateral_cuda'] = (time.perf_counter() - start_time) * 1000
+            return filtered
+        
+        try:
+            # CUDA フィルタ初期化（初回のみ）
+            if not self.cuda_bilateral.initialized:
+                if not self.cuda_bilateral.initialize(depth_image.shape):
+                    # CUDA初期化失敗時はCPU版にフォールバック
+                    return self._apply_bilateral_filter_cpu(depth_image, valid_mask)
+            
+            # マルチスケール処理
+            if self.enable_multiscale and min(depth_image.shape) > 400:
+                # 1/2解像度で前処理
+                h, w = depth_image.shape
+                small_h, small_w = h // 2, w // 2
+                
+                # ダウンサンプリング
+                depth_small = cv2.resize(depth_image, (small_w, small_h), interpolation=cv2.INTER_NEAREST)
+                depth_small_float = depth_small.astype(np.float32) / 65535.0
+                
+                # 小解像度でバイラテラルフィルタ
+                filtered_small_result = self.cuda_bilateral.apply(
+                    depth_small_float, 
+                    self.bilateral_d // 2,  # 解像度に応じてパラメータ調整
+                    self.bilateral_sigma_color / 255.0,
+                    self.bilateral_sigma_space / 2
+                )
+                
+                if filtered_small_result is not None:
+                    # アップサンプリング
+                    filtered_small_up = cv2.resize(
+                        filtered_small_result, (w, h), 
+                        interpolation=cv2.INTER_LINEAR
+                    )
+                    filtered = (filtered_small_up * 65535.0).astype(np.uint16)
+                else:
+                    # CUDA失敗時はCPU版フォールバック
+                    filtered = self._apply_bilateral_filter_cpu(depth_image, valid_mask)
+            else:
+                # フル解像度処理
+                depth_float = depth_image.astype(np.float32) / 65535.0
+                filtered_float_result = self.cuda_bilateral.apply(
+                    depth_float,
+                    self.bilateral_d,
+                    self.bilateral_sigma_color / 255.0,
+                    self.bilateral_sigma_space
+                )
+                
+                if filtered_float_result is not None:
+                    filtered = (filtered_float_result * 65535.0).astype(np.uint16)
+                else:
+                    # CUDA失敗時はCPU版フォールバック
+                    filtered = self._apply_bilateral_filter_cpu(depth_image, valid_mask)
+                    
+        except Exception as e:
+            logger.warning(f"CUDA bilateral filter error, falling back to CPU: {e}")
+            filtered = self._apply_bilateral_filter_cpu(depth_image, valid_mask)
+        
+        self.processing_times['bilateral_cuda'] = (time.perf_counter() - start_time) * 1000
+        return filtered
+    
+    def _apply_bilateral_filter_cpu(self, depth_image: np.ndarray, valid_mask: np.ndarray) -> np.ndarray:
+        """
+        CPU バイラテラルフィルタを適用（従来版）
         """
         start_time = time.perf_counter()
         
         filtered = depth_image.copy()
         if np.any(valid_mask):
-            # バイラテラルフィルタ（エッジ保持）
-            # uint16のままではcv2.bilateralFilterが期待通りに動作しないことがあるため、
-            # float32に正規化してから処理し、精度を維持する。
             depth_float = depth_image.astype(np.float32) / 65535.0
             
             filtered_float = cv2.bilateralFilter(
                 depth_float,
                 self.bilateral_d,
-                self.bilateral_sigma_color / 255.0,  # sigmaColorをfloatスケールに調整
+                self.bilateral_sigma_color / 255.0,
                 self.bilateral_sigma_space
             )
             
-            # 16bitに戻す
             filtered = (filtered_float * 65535.0).astype(np.uint16)
         
-        self.processing_times['bilateral'] = (time.perf_counter() - start_time) * 1000
+        self.processing_times['bilateral_cpu'] = (time.perf_counter() - start_time) * 1000
         return filtered
     
-    def _apply_temporal_filter(self, depth_image: np.ndarray, valid_mask: np.ndarray) -> np.ndarray:
+    def _apply_bilateral_filter(self, depth_image: np.ndarray, valid_mask: np.ndarray) -> np.ndarray:
         """
-        時間フィルタを適用（残像低減）
+        バイラテラルフィルタを適用（CUDA/CPU自動切替）
+        """
+        if self.use_cuda:
+            return self._apply_bilateral_filter_cuda(depth_image, valid_mask)
+        else:
+            return self._apply_bilateral_filter_cpu(depth_image, valid_mask)
+    
+    def _apply_temporal_ema_filter(self, depth_image: np.ndarray, valid_mask: np.ndarray) -> np.ndarray:
+        """
+        EMA 時間フィルタを適用（履歴バッファ不要版）
         
         Args:
             depth_image: 深度画像
@@ -186,38 +348,29 @@ class DepthFilter:
         """
         start_time = time.perf_counter()
         
-        # 履歴に追加（コピーは必要最小限）
-        self.depth_history.append(depth_image.copy())
+        if not self.ema_initialized:
+            # 初回はそのまま使用
+            self.temporal_ema = depth_image.astype(np.float32)
+            self.ema_initialized = True
+            filtered = depth_image.copy()
+        else:
+            # EMA更新: ema = alpha * current + (1-alpha) * ema
+            cv2.accumulateWeighted(
+                depth_image.astype(np.float32),
+                self.temporal_ema,
+                self.temporal_alpha,
+                mask=valid_mask.astype(np.uint8)
+            )
+            filtered = self.temporal_ema.astype(np.uint16)
         
-        filtered = depth_image.copy()
-        
-        if len(self.depth_history) > 1:
-            if self.temporal_avg is None:
-                # 初回は単純平均
-                self.temporal_avg = np.mean(
-                    [img.astype(np.float32) for img in self.depth_history],
-                    axis=0
-                ).astype(np.uint16)
-            else:
-                # 指数移動平均（EMA）による平滑化
-                current_float = depth_image.astype(np.float32)
-                avg_float = self.temporal_avg.astype(np.float32)
-                
-                # 動きが大きい領域は追従性を高める
-                diff = np.abs(current_float - avg_float)
-                adaptive_alpha = np.clip(
-                    self.temporal_alpha + diff / 500.0,  # 差が大きいほど追従性向上
-                    0.1, 0.9
-                )
-                
-                new_avg = adaptive_alpha * current_float + (1 - adaptive_alpha) * avg_float
-                self.temporal_avg = new_avg.astype(np.uint16)
-            
-            assert self.temporal_avg is not None
-            filtered = self.temporal_avg.copy()
-        
-        self.processing_times['temporal'] = (time.perf_counter() - start_time) * 1000
+        self.processing_times['temporal_ema'] = (time.perf_counter() - start_time) * 1000
         return filtered
+    
+    def _apply_temporal_filter(self, depth_image: np.ndarray, valid_mask: np.ndarray) -> np.ndarray:
+        """
+        時間フィルタを適用（EMA版使用）
+        """
+        return self._apply_temporal_ema_filter(depth_image, valid_mask)
     
     def _apply_combined_filter(self, depth_image: np.ndarray, valid_mask: np.ndarray) -> np.ndarray:
         """
@@ -246,8 +399,8 @@ class DepthFilter:
     
     def reset_temporal_history(self) -> None:
         """時間フィルタの履歴をリセット"""
-        self.depth_history.clear()
-        self.temporal_avg = None
+        self.temporal_ema = None
+        self.ema_initialized = False
     
     def get_performance_stats(self) -> Dict[str, float]:
         """パフォーマンス統計を取得"""

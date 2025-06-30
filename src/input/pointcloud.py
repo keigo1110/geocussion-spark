@@ -2,11 +2,11 @@
 """
 点群変換処理モジュール
 既存 depth_to_pointcloud 関数のリファクタリング版
-numpy 最適化とゼロコピー転送対応
+numpy 最適化とゼロコピー転送対応 + 高速ボクセルダウンサンプリング
 """
 
 import time
-from typing import Optional, Tuple, Union, Any
+from typing import Optional, Tuple, Union, Any, Dict
 import numpy as np
 import cv2
 
@@ -25,13 +25,79 @@ except ImportError:
     HAS_OPEN3D = False
 
 from ..types import CameraIntrinsics, FrameData
+from ..collision.optimization import ArrayPool
 from src import get_logger
 
 logger = get_logger(__name__)
 
 
+class NumpyVoxelDownsampler:
+    """NumPy ベース高速ボクセルダウンサンプリング"""
+    
+    @staticmethod
+    def voxel_downsample_numpy(
+        points: np.ndarray, 
+        colors: Optional[np.ndarray], 
+        voxel_size: float,
+        color_strategy: str = "first"
+    ) -> Tuple[np.ndarray, Optional[np.ndarray]]:
+        """
+        NumPy ベースの高速ボクセルダウンサンプリング
+        
+        Args:
+            points: 入力点群 (N, 3)
+            colors: 入力カラー (N, 3) または None
+            voxel_size: ボクセルサイズ
+            color_strategy: "first" (初回値) または "average" (平均値)
+            
+        Returns:
+            ダウンサンプリング後の (points, colors)
+        """
+        if len(points) == 0:
+            return points, colors
+        
+        # ボクセル座標に変換（整数化）
+        voxel_coords = np.floor(points / voxel_size).astype(np.int32)
+        
+        # unique な組み合わせを取得（高速化のためreturn_inverse=Trueのみ使用）
+        unique_voxels, inverse_indices = np.unique(
+            voxel_coords, axis=0, return_inverse=True
+        )
+        
+        # 各ボクセルの代表点を選択
+        if color_strategy == "first":
+            # 最初に見つかった点を使用（高速）
+            # np.unique は安定ソートなので、最初のインデックスを効率的に取得
+            first_indices = np.zeros(len(unique_voxels), dtype=np.int32)
+            seen = set()
+            for i, voxel_idx in enumerate(inverse_indices):
+                if voxel_idx not in seen:
+                    first_indices[voxel_idx] = i
+                    seen.add(voxel_idx)
+            
+            downsampled_points = points[first_indices]
+            downsampled_colors = colors[first_indices] if colors is not None else None
+            
+        elif color_strategy == "average":
+            # 各ボクセル内の平均値を計算（高品質）
+            n_voxels = len(unique_voxels)
+            downsampled_points = np.zeros((n_voxels, 3), dtype=np.float32)
+            downsampled_colors = np.zeros((n_voxels, 3), dtype=np.float32) if colors is not None else None
+            
+            # ベクトル化された平均計算
+            for voxel_idx in range(n_voxels):
+                mask = (inverse_indices == voxel_idx)
+                downsampled_points[voxel_idx] = np.mean(points[mask], axis=0)
+                if colors is not None:
+                    downsampled_colors[voxel_idx] = np.mean(colors[mask], axis=0)
+        else:
+            raise ValueError(f"Unknown color_strategy: {color_strategy}")
+        
+        return downsampled_points, downsampled_colors
+
+
 class PointCloudConverter:
-    """深度フレームから点群への変換クラス"""
+    """深度フレームから点群への変換クラス（高速化対応）"""
     
     def __init__(
         self, 
@@ -41,24 +107,23 @@ class PointCloudConverter:
         voxel_size: float = 0.005,  # 5mm voxel size for good balance
         enable_resolution_downsampling: bool = False,
         target_width: int = 424,
-        target_height: int = 240
+        target_height: int = 240,
+        use_numpy_voxel: bool = True,
+        color_strategy: str = "first"
     ):
         """
         初期化
         
         Args:
-            depth_intrinsics: 深度カメラの内部パラメータ
-            depth_scale: 深度スケール (mm → m変換)
-            enable_voxel_downsampling: ボクセルダウンサンプリングを有効にするか
-            voxel_size: ボクセルサイズ (m) - 小さいほど高精度、大きいほど高速
-            enable_resolution_downsampling: 解像度ダウンサンプリングを有効にするか
-            target_width: 目標解像度（幅）
-            target_height: 目標解像度（高さ）
+            use_numpy_voxel: NumPy版ボクセルダウンサンプリングを使用するか
+            color_strategy: "first" または "average" 
         """
         self.depth_intrinsics = depth_intrinsics
         self.depth_scale = depth_scale
         self.enable_voxel_downsampling = enable_voxel_downsampling
         self.voxel_size = voxel_size
+        self.use_numpy_voxel = use_numpy_voxel
+        self.color_strategy = color_strategy
         
         # 解像度ダウンサンプリング設定
         self.enable_resolution_downsampling = enable_resolution_downsampling
@@ -82,8 +147,15 @@ class PointCloudConverter:
         else:
             self.downsampled_intrinsics = depth_intrinsics
         
-        # 3D座標計算用の係数を事前計算（統合版）
-        self._precompute_coefficients()
+        # メッシュグリッド係数キャッシュ（T-INP-003対応）
+        self._coeff_cache: Dict[Tuple[int, int], Tuple[np.ndarray, np.ndarray]] = {}
+        
+        # ArrayPool for memory optimization
+        self.array_pool = ArrayPool()
+        
+        # 3D座標計算用の係数を事前計算（遅延初期化）
+        self.x_coeff = None
+        self.y_coeff = None
         
         # パフォーマンス統計
         self.performance_stats = {
@@ -94,25 +166,57 @@ class PointCloudConverter:
             'last_output_points': 0,
             'last_downsampling_ratio': 0.0,
             'total_downsampling_time_ms': 0.0,
+            'numpy_voxel_enabled': use_numpy_voxel,
             'resolution_downsampling_enabled': enable_resolution_downsampling,
             'resolution_downsampling_ratio': f"{target_width}x{target_height}" if enable_resolution_downsampling else "disabled"
         }
         
+        logger.info(f"PointCloudConverter initialized: numpy_voxel={use_numpy_voxel}, "
+                   f"color_strategy={color_strategy}")
+        
+    def _get_cached_coefficients(self, width: int, height: int) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        メッシュグリッド係数のキャッシュ取得（T-INP-003対応）
+        
+        Args:
+            width: 幅
+            height: 高さ
+            
+        Returns:
+            (x_coeff, y_coeff): 3D座標計算用係数
+        """
+        cache_key = (width, height)
+        
+        if cache_key not in self._coeff_cache:
+            # ピクセル座標のメッシュグリッドを作成
+            u, v = np.meshgrid(np.arange(width), np.arange(height))
+            
+            # 内部パラメータを決定（解像度ダウンサンプリング対応）
+            if self.enable_resolution_downsampling and (width, height) == (self.target_width, self.target_height):
+                intrinsics = self.downsampled_intrinsics
+            else:
+                intrinsics = self.depth_intrinsics
+            
+            # X, Y座標の計算係数（Z値との乗算で3D座標が得られる）
+            x_coeff = (u - intrinsics.cx) / intrinsics.fx
+            y_coeff = -(v - intrinsics.cy) / intrinsics.fy  # Y軸反転
+            
+            self._coeff_cache[cache_key] = (x_coeff, y_coeff)
+            logger.debug(f"Cached meshgrid coefficients for {width}x{height}")
+        
+        return self._coeff_cache[cache_key]
+    
     def _precompute_coefficients(self):
         """3D座標計算用の係数を事前計算（統合版・lazy-init対応）"""
-        if hasattr(self, 'x_coeff') and hasattr(self, 'y_coeff'):
+        if self.x_coeff is not None and self.y_coeff is not None:
             # 既に計算済みの場合はスキップ
             return
             
-        # ピクセル座標のメッシュグリッドを作成
-        height, width = self.depth_intrinsics.height, self.depth_intrinsics.width
-        u, v = np.meshgrid(np.arange(width), np.arange(height))
+        # デフォルト解像度用の係数をキャッシュから取得
+        width, height = self.depth_intrinsics.width, self.depth_intrinsics.height
+        self.x_coeff, self.y_coeff = self._get_cached_coefficients(width, height)
         
-        # X, Y座標の計算係数（Z値との乗算で3D座標が得られる）
-        self.x_coeff = (u - self.depth_intrinsics.cx) / self.depth_intrinsics.fx
-        self.y_coeff = -(v - self.depth_intrinsics.cy) / self.depth_intrinsics.fy  # Y軸反転（手の3D投影と座標系統一）
-        
-        logger.debug(f"Precomputed 3D projection coefficients for {width}x{height} resolution")
+        logger.debug(f"Precomputed default 3D projection coefficients for {width}x{height}")
     
     def depth_to_pointcloud(
         self,
@@ -145,95 +249,21 @@ class PointCloudConverter:
             (self.depth_intrinsics.height, self.depth_intrinsics.width)
         )
         
-        # 解像度ダウンサンプリング適用
-        if self.enable_resolution_downsampling:
-            # 深度画像をリサイズ
-            depth_image = cv2.resize(
-                depth_image, 
-                (self.target_width, self.target_height), 
-                interpolation=cv2.INTER_NEAREST  # 深度値保持のためNearest使用
-            )
-            # ダウンサンプリング後の内部パラメータを使用
-            effective_intrinsics = self.downsampled_intrinsics
-        else:
-            effective_intrinsics = self.depth_intrinsics
-        
-        # 深度スケール適用
-        scale = depth_scale if depth_scale is not None else self.depth_scale
-        z = depth_image.astype(np.float32) / scale
-        
-        # 深度範囲フィルタ
-        valid_depth = (z > min_depth) & (z < max_depth)
-        
-        # 3D座標計算用のメッシュグリッド（ダウンサンプリング対応）
-        if self.enable_resolution_downsampling:
-            height, width = self.target_height, self.target_width
-            u, v = np.meshgrid(np.arange(width), np.arange(height))
-            
-            # ダウンサンプリング後の座標計算係数
-            x_coeff = (u - effective_intrinsics.cx) / effective_intrinsics.fx
-            y_coeff = -(v - effective_intrinsics.cy) / effective_intrinsics.fy  # Y軸反転
-        else:
-            # 元の係数を使用
-            x_coeff = self.x_coeff
-            y_coeff = self.y_coeff
-        
-        # 3D座標計算（vectorized operations）
-        x = x_coeff * z
-        y = y_coeff * z
-        
-        # 有効点のマスク
-        valid = valid_depth
-        
-        # 点群座標を作成（ゼロコピー最適化）
-        points = np.column_stack([
-            x[valid],
-            y[valid], 
-            z[valid]
-        ])
-        
-        # カラー情報処理
-        colors = None
-        if color_frame is not None:
-            colors = self._extract_colors(color_frame, valid)
-        
-        # 入力点数を記録
-        input_points = len(points)
-        self.performance_stats['last_input_points'] = input_points
-        
-        # ボクセルダウンサンプリング適用
-        if self.enable_voxel_downsampling and input_points > 0:
-            downsampling_start = time.perf_counter()
-            points, colors = self._apply_voxel_downsampling(
-                points, colors, voxel_size or self.voxel_size
-            )
-            downsampling_time = (time.perf_counter() - downsampling_start) * 1000
-            self.performance_stats['total_downsampling_time_ms'] += downsampling_time
-            
-            # ダウンサンプリング率を計算
-            output_points = len(points)
-            self.performance_stats['last_output_points'] = output_points
-            self.performance_stats['last_downsampling_ratio'] = (
-                output_points / input_points if input_points > 0 else 0.0
-            )
-        else:
-            self.performance_stats['last_output_points'] = input_points
-            self.performance_stats['last_downsampling_ratio'] = 1.0
-        
-        # パフォーマンス統計更新
-        processing_time = (time.perf_counter() - start_time) * 1000
-        self._update_performance_stats(processing_time)
+        # numpy配列変換を直接呼び出し（高速化）
+        points, colors = self.numpy_to_pointcloud(
+            depth_image, color_frame, depth_scale, min_depth, max_depth, voxel_size
+        )
         
         return points, colors
     
-    def _apply_voxel_downsampling(
+    def _apply_voxel_downsampling_numpy(
         self,
         points: np.ndarray,
         colors: Optional[np.ndarray],
         voxel_size: float
     ) -> Tuple[np.ndarray, Optional[np.ndarray]]:
         """
-        ボクセルダウンサンプリングを適用
+        NumPy 高速ボクセルダウンサンプリングを適用
         
         Args:
             points: 入力点群 (N, 3)
@@ -242,6 +272,26 @@ class PointCloudConverter:
             
         Returns:
             ダウンサンプリング後の (points, colors)
+        """
+        if len(points) == 0:
+            return points, colors
+        
+        try:
+            return NumpyVoxelDownsampler.voxel_downsample_numpy(
+                points, colors, voxel_size, self.color_strategy
+            )
+        except Exception as e:
+            logger.warning(f"NumPy voxel downsampling error: {e}")
+            return points, colors
+    
+    def _apply_voxel_downsampling_open3d(
+        self,
+        points: np.ndarray,
+        colors: Optional[np.ndarray],
+        voxel_size: float
+    ) -> Tuple[np.ndarray, Optional[np.ndarray]]:
+        """
+        Open3D ボクセルダウンサンプリングを適用（フォールバック用）
         """
         if not HAS_OPEN3D or len(points) == 0:
             return points, colors
@@ -268,16 +318,30 @@ class PointCloudConverter:
             
         except (ImportError, AttributeError) as e:
             # Open3D関連のエラー（復旧可能）
-            logger.warning(f"Voxel downsampling unavailable: {e}")
+            logger.warning(f"Open3D voxel downsampling unavailable: {e}")
             return points, colors
         except (MemoryError, ValueError) as e:
             # メモリ不足やデータエラー（致命的）
-            logger.error(f"Critical error during voxel downsampling: {e}")
-            raise RuntimeError(f"Voxel downsampling failed: {e}")
+            logger.error(f"Critical error during Open3D voxel downsampling: {e}")
+            raise RuntimeError(f"Open3D voxel downsampling failed: {e}")
         except Exception as e:
             # その他のエラー（警告して元の点群を返す）
-            logger.warning(f"Unexpected voxel downsampling error: {e}")
+            logger.warning(f"Unexpected Open3D voxel downsampling error: {e}")
             return points, colors
+    
+    def _apply_voxel_downsampling(
+        self,
+        points: np.ndarray,
+        colors: Optional[np.ndarray],
+        voxel_size: float
+    ) -> Tuple[np.ndarray, Optional[np.ndarray]]:
+        """
+        ボクセルダウンサンプリングを適用（NumPy/Open3D自動切替）
+        """
+        if self.use_numpy_voxel:
+            return self._apply_voxel_downsampling_numpy(points, colors, voxel_size)
+        else:
+            return self._apply_voxel_downsampling_open3d(points, colors, voxel_size)
     
     def _extract_colors(self, color_frame: Any, valid_mask: np.ndarray) -> Optional[np.ndarray]:
         """
@@ -354,8 +418,11 @@ class PointCloudConverter:
         """
         start_time = time.perf_counter()
         
-        if depth_array.shape != (self.depth_intrinsics.height, self.depth_intrinsics.width):
-            raise ValueError(f"Depth array shape mismatch. Expected {(self.depth_intrinsics.height, self.depth_intrinsics.width)}, got {depth_array.shape}")
+        # 入力配列の解像度を取得
+        input_height, input_width = depth_array.shape
+        
+        # 適切な係数を取得（キャッシュ機能付き）
+        x_coeff, y_coeff = self._get_cached_coefficients(input_width, input_height)
         
         # 深度スケール適用
         scale = depth_scale if depth_scale is not None else self.depth_scale
@@ -365,8 +432,8 @@ class PointCloudConverter:
         valid = (z > min_depth) & (z < max_depth)
         
         # 3D座標計算
-        x = self.x_coeff * z
-        y = self.y_coeff * z  # 既にy_coeffでマイナス符号適用済み
+        x = x_coeff * z
+        y = y_coeff * z  # 既にy_coeffでマイナス符号適用済み
         
         # 点群作成
         points = np.column_stack([
@@ -378,9 +445,17 @@ class PointCloudConverter:
         # カラー情報
         colors = None
         if color_array is not None:
-            if color_array.shape[:2] != depth_array.shape:
-                color_array = cv2.resize(color_array, (depth_array.shape[1], depth_array.shape[0]))
-            colors = color_array[valid].astype(np.float32) / 255.0
+            # ndarray とフレームオブジェクトを判別
+            if isinstance(color_array, np.ndarray):
+                # NumPy 配列の場合
+                if color_array.shape[:2] != depth_array.shape:
+                    color_array = cv2.resize(color_array, (depth_array.shape[1], depth_array.shape[0]))
+                colors = color_array[valid].astype(np.float32) / 255.0
+            elif hasattr(color_array, 'get_data'):
+                # OrbbecSDK の ColorFrame オブジェクトの場合
+                colors = self._extract_colors(color_array, valid)
+            else:
+                logger.debug("Unsupported color_array type: %s", type(color_array))
         
         # 入力点数を記録
         input_points = len(points)

@@ -323,3 +323,224 @@ tasks:
     depends_on: [P-MESH-004]
     status: "COMPLETED"  # ✅
     note: "包括的テストスイート実装、統合テスト含む"
+
+id: collision_refactor
+version: "1.0"
+title: "衝突フェーズリファクタリング: 型整合・ロギング統一・パフォーマンス修正"
+owner: "dev-team"
+created: "2025-06-29"
+description: |
+  collision モジュールは NumPy/Numba を駆使した意欲的な高速化実装だが、
+  mesh リファクタ後の型不整合・ロガー未定義・過剰最適化によるテスト失敗が顕在化している。
+  本タスクでは基盤整合性 (型／ロギング／フラグ) を最優先に修正し、
+  その後パフォーマンス指標およびメモリプールの実効性を再評価する。
+
+problems:
+  - id: P-COL-001
+    title: "SpatialIndex 型名不一致"
+    severity: "High"
+    description: |
+      mesh フェーズで SpatialIndex → MeshSpatialIndex へリネームしたが、
+      collision/search.py 等は旧名を import しており実行時エラーとなる。
+  - id: P-COL-002
+    title: "ロガー未定義 / NameError"
+    severity: "High"
+    description: |
+      search.py, events.py などで logger 参照が漏れ、テストで NameError が発生。
+  - id: P-COL-003
+    title: "NUMBA_AVAILABLE フラグ欠落"
+    severity: "Medium"
+    description: |
+      performance_vectorized テストが patch 対象フラグを探すが distance/vectorized に未定義で AttributeError。
+  - id: P-COL-004
+    title: "過度なパフォーマンステスト基準と JIT ウォームアップ漏れ"
+    severity: "Medium"
+    description: |
+      距離計算 0.001ms/計算など非現実的。初回 JIT コンパイル時間も含まれておりテストが恒常的に失敗。
+  - id: P-COL-005
+    title: "依存密度過多と循環リスク"
+    severity: "Low"
+    description: |
+      search.py が config/mesh/detection 等へ多重依存。 DI で解決すべき。
+  - id: P-COL-006
+    title: "例外分類が曖昧"
+    severity: "Low"
+    description: |
+      Numba, MemoryError, ValueError などを一括 catch してしまいデバッグが困難。
+
+tasks:
+  - id: T-COL-001
+    title: "型整合: SpatialIndex → MeshSpatialIndex へ更新"
+    depends_on: [P-COL-001]
+    status: "PENDING"
+    steps:
+      - "search.py, sphere_tri.py, events.py 等の import を更新"
+      - "types.py へ SearchResult, SearchStrategy を正式定義して参照"
+    acceptance_criteria:
+      - "mypy/pytest で型エラー・ImportError が発生しない"
+
+  - id: T-COL-002
+    title: "ロガー統一 & print 廃止"
+    depends_on: [P-COL-002, P-COL-006]
+    status: "PENDING"
+    steps:
+      - "全ファイルで get_logger(__name__) を使用"
+      - "logger.debug/info/warning/error にレベル分割"
+      - "MemoryError/ValueError/ImportError は再 raise"
+    acceptance_criteria:
+      - "NameError: logger が一切出ない"
+
+  - id: T-COL-003
+    title: "NUMBA_AVAILABLE フラグ導入"
+    depends_on: [P-COL-003]
+    status: "PENDING"
+    steps:
+      - "distance.py, distance_gpu.py, vectorized.py で NUMBA_AVAILABLE を定義"
+      - "テスト monkeypatch 対応確認"
+    acceptance_criteria:
+      - "AttributeError: NUMBA_AVAILABLE が出ない"
+
+  - id: T-COL-004
+    title: "パフォーマンステスト閾値とウォームアップ調整"
+    depends_on: [P-COL-004]
+    status: "PENDING"
+    steps:
+      - "テストコード側の閾値を実測ベースに再設定"
+      - "distance.* に warmup() 関数を追加し JIT 初回を除外"
+    acceptance_criteria:
+      - "performance_vectorized, performance_unified テストが pass"
+
+  - id: T-COL-005
+    title: "依存性の簡素化と DI 対応"
+    depends_on: [P-COL-005]
+    status: "PENDING"
+    steps:
+      - "CollisionSearcher に config を渡すコンストラクタ引数を追加 (デフォルトは None)"
+      - "テストでモック設定を注入可能に"
+    acceptance_criteria:
+      - "検索クラスを単体でインスタンス化しても循環 import が無い"
+
+  - id: T-COL-006
+    title: "ユニットテスト更新 & カバレッジ保証"
+    depends_on: [T-COL-001, T-COL-002, T-COL-003, T-COL-004]
+    status: "PENDING"
+    steps:
+      - "既存 collision テストを新 API に合わせて更新"
+      - "missing branch のテストケースを追加 (face_culling on/off 等)"
+    acceptance_criteria:
+      - "tests/collision_test.py 系が全 pass"
+
+implementation_notes: |
+  • 基盤整合 (T-COL-001〜003) を最優先で解決し、既存テスト失敗をゼロにする。
+  • パフォーマンス指標は実測値 +15% マージンで再設定し、JIT ウォームアップ時間を除外。
+  • メモリプール最適化は feature_flag=true で有効、デフォルトは無効化してバグ影響を限定。
+
+---
+id: sound_refactor
+version: "1.0"
+title: "音響フェーズリファクタリング: ロギング統一・設計分割・テスト追加"
+owner: "dev-team"
+created: "2025-06-29"
+description: |
+  sound モジュールは mapping → synth → voice_mgr の三層構造で設計思想は優れるものの、
+  600 行超の巨大クラス・粗いロック粒度・print/ logger 混在・ユニットテスト欠如等が保守性と
+  リアルタイム性能を阻害している。本タスクでは設計分割と基盤改善を行い、将来の機能追加に
+  耐えうるモジュール構造へ刷新する。
+
+problems:
+  - id: P-SND-001
+    title: "ロギングと print() 混在"
+    severity: "High"
+    description: |
+      synth.py 内で print() が残存しログレベル制御不可。エラー時の stacktrace も欠落。
+  - id: P-SND-002
+    title: "クラス肥大化と Strategy パターン欠如"
+    severity: "Medium"
+    description: |
+      _create_instrument_template/_create_voice が if-else で 300 行以上。Instrument クラス化が必要。
+  - id: P-SND-003
+    title: "ロック粒度が粗くスループット劣化"
+    severity: "Medium"
+    description: |
+      AudioSynthesizer と VoiceManager がクラス全体を mutex で囲み、ポリフォニー増でスケールしない。
+  - id: P-SND-004
+    title: "ユニットテスト/バックエンドフォールバック欠如"
+    severity: "High"
+    description: |
+      pyo が CI でビルドできないため NullBackend 必須。現在は AttributeError のリスクあり。
+  - id: P-SND-005
+    title: "DSP パフォーマンスボトルネック"
+    severity: "Low"
+    description: |
+      mapping.py が毎フレーム pow/ sin を呼び CPU 使用率増。LUT 化または numba 対応が必要。
+  - id: P-SND-006
+    title: "ハードコード設定とホットリロード不能"
+    severity: "Low"
+    description: |
+      楽器プリセット・スケール定義がコード内固定。YAML 外部化しライブ更新を可能にする。
+
+tasks:
+  - id: T-SND-001
+    title: "ロギング統一 & print 廃止"
+    depends_on: [P-SND-001]
+    status: "PENDING"
+    steps:
+      - "synth.py / voice_mgr.py の print() を logger に置換"
+      - "logger.exception で stacktrace を出力"
+    acceptance_criteria:
+      - "grep -R "print(" src/sound | wc -l == 0"
+
+  - id: T-SND-002
+    title: "Instrument Strategy パターン導入"
+    depends_on: [P-SND-002]
+    status: "PENDING"
+    steps:
+      - "synth/instruments/ ディレクトリを新規作成し InstrumentBase を定義"
+      - "マリンバ・パッド等をクラス実装し _create_instrument_template を撤去"
+    acceptance_criteria:
+      - "mypy strict が通過、コード行数 synth.py -20%"
+
+  - id: T-SND-003
+    title: "ロック粒度最適化"
+    depends_on: [P-SND-003]
+    status: "PENDING"
+    steps:
+      - "VoiceManager を heapq + RWLock に置換"
+      - "AudioSynthesizer.play_audio_parameters で voice 単位の lock に変更"
+    acceptance_criteria:
+      - "100 同時ボイス時のスループット +30%"
+
+  - id: T-SND-004
+    title: "NullBackend とユニットテスト追加"
+    depends_on: [P-SND-004]
+    status: "PENDING"
+    steps:
+      - "backend/null_backend.py を実装し pyo 不在でも動作"
+      - "pytest で mapper→synth→voice_mgr の E2E テスト作成"
+    acceptance_criteria:
+      - "CI (no-pyo env) ですべての sound テストが pass"
+
+  - id: T-SND-005
+    title: "DSP ルックアップテーブル化 / numba 最適化"
+    depends_on: [P-SND-005]
+    status: "PENDING"
+    steps:
+      - "mapping._map_velocity 等の重い関数を LUT or njit 化"
+      - "ベンチマークで CPU 使用率 -20%"
+    acceptance_criteria:
+      - "tests/sound_test.py が pass、benchmark 改善を確認"
+
+  - id: T-SND-006
+    title: "設定 YAML 外部化 & ホットリロード"
+    depends_on: [P-SND-006]
+    status: "PENDING"
+    steps:
+      - "config/sound_presets.yaml にスケール / 楽器プリセットを移動"
+      - "ファイル変更を watchdog で監視しランタイム再読込"
+    acceptance_criteria:
+      - "プリセット変更後 1s 以内に反映"
+
+implementation_notes: |
+  • SND-001,002 を先行しテスト基盤を整備。次に SND-004 で NullBackend を導入し CI 通過を確保。
+  • パフォーマンス系 (SND-003,005) は後続イテレーションで実測ベースで最適化。
+  • 外部化 (SND-006) は JSON5 / YAML いずれか採用し、再シリアライズもサポートする。

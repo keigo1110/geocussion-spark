@@ -75,6 +75,7 @@ class FrameData:
     color_frame: Optional[Any] = None
     timestamp_ms: float = 0.0
     frame_number: int = 0
+    points: Optional[np.ndarray] = None  # 点群データ
     
     @property
     def has_color(self) -> bool:
