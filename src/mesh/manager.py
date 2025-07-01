@@ -34,6 +34,17 @@ class PipelineManager:
     ) -> MeshResult:
         """Return up-to-date mesh (may be cached)."""
         now = time.perf_counter()
+        # ---------------- Hand gating (P-HAND-001) -----------------
+        if hands and self._cached_mesh is not None:
+            slow_hands = True
+            for h in hands:
+                vel = getattr(h, "velocity", None)
+                if vel is not None and np.linalg.norm(vel) > 0.05:
+                    slow_hands = False
+                    break
+            if slow_hands and not force:
+                return self._cached_mesh
+
         # Debounce heavy regenerate (<0.2 s)
         if not force and self._cached_mesh and (now - self._last_update_ts) < 0.2:
             return self._cached_mesh

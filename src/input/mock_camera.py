@@ -13,7 +13,7 @@ import numpy as np
 from types import SimpleNamespace
 from typing import Any, Optional
 
-from src.types import CameraIntrinsics, OBFormat
+from src.types import CameraIntrinsics, FrameData, OBFormat
 
 __all__ = ["MockCamera"]
 
@@ -36,8 +36,14 @@ class MockCamera:
     # ------------------------------------------------------------------
     # Public API expected by FullPipelineViewer / DualViewer
     # ------------------------------------------------------------------
-    def get_frame(self, timeout_ms: int = 100) -> Any:  # return type kept flexible
-        """Return a synthetic depth+color frame bundle."""
+    def get_frame(self, timeout_ms: int = 100) -> FrameData:  # type: ignore[override]
+        """Return a synthetic depth+color frame bundle.
+
+        The object mimics the attributes accessed by the viewer code and is
+        wrapped into the project-wide ``FrameData`` dataclass for maximum
+        compatibility with downstream pipelines.
+        """
+
         self._frame_counter += 1
 
         depth_pixels = self.depth_intrinsics.width * self.depth_intrinsics.height
@@ -45,13 +51,23 @@ class MockCamera:
 
         depth_frame = SimpleNamespace(get_data=lambda: depth_data.tobytes())
 
+        # Produce RGB frame bytes (720×1280×3) – resolution not critical for tests
         color_bytes = np.random.randint(0, 255, 720 * 1280 * 3, dtype=np.uint8)
         color_frame = SimpleNamespace(
             get_data=lambda: color_bytes.tobytes(),
             get_format=lambda: OBFormat.RGB,
         )
 
-        return SimpleNamespace(depth_frame=depth_frame, color_frame=color_frame)
+        # Timestamp in milliseconds for compatibility with real SDK
+        ts_ms = time.perf_counter() * 1000.0
+
+        return FrameData(
+            depth_frame=depth_frame,
+            color_frame=color_frame,
+            timestamp_ms=ts_ms,
+            frame_number=self._frame_counter,
+            points=None,
+        )
 
     # The following dummies satisfy `ManagedResource`-style clean-up calls
     def start(self) -> bool:  # noqa: D401

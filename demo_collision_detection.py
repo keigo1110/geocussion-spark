@@ -49,7 +49,7 @@ logger = logging.getLogger(__name__)
 HAS_ORBBEC_SDK = False
 try:
     # type: ignore[import]
-    from pyorbbecsdk import Pipeline, FrameSet, Config, OBSensorType, OBError, OBFormat
+    from pyorbbecsdk import Pipeline, FrameSet, Config, OBSensorType, OBError, OBFormat  # type: ignore  # pylint: disable=import-error
     HAS_ORBBEC_SDK = True
     logger.info("OrbbecSDK is available")
 except ImportError:
@@ -1305,15 +1305,33 @@ class FullPipelineViewer(DualViewer):
         # フィルタ適用
         depth_image = self._apply_depth_filter(depth_image)
         
+        # ---------------- Hand masking (P-HAND-002) ----------------
+        from src.detection.hand_mask import HandMasker  # type: ignore
+        if not hasattr(self, "_hand_masker"):
+            self._hand_masker = HandMasker()
+
+        depth_image_masked, centers_3d, radii_arr = self._hand_masker.apply_mask(
+            depth_image,
+            self.current_hands_2d,
+            self.current_tracked_hands,
+        )
+
         # 最新深度をキャッシュ
-        self._latest_depth_image = depth_image
-        
+        self._latest_depth_image = depth_image_masked
+
         # 点群生成
-        points_3d = self._generate_point_cloud_if_needed(depth_image)
-        
-        # 手検出処理
+        points_3d = self._generate_point_cloud_if_needed(depth_image_masked)
+
+        # 手検出処理はマスク前の深度画像を使用
+
         hands_2d, hands_3d, tracked_hands = self._perform_hand_detection(depth_image)
         self._save_hand_detection_results(hands_2d, hands_3d, tracked_hands)
+
+        # ----- adjust further references -----
+        # Use adaptive exclusion when we regenerate pointcloud on subsequent calls
+        self._exclude_centers_cached = (centers_3d, radii_arr)
+
+        # Continue pipeline below so we need to skip duplicated code (return later edits)
         
         # 衝突検出とメッシュ生成のパイプライン
         collision_events = self._process_collision_pipeline(points_3d, tracked_hands)
@@ -1454,7 +1472,17 @@ class FullPipelineViewer(DualViewer):
         
         if self.pointcloud_converter and (self.frame_count % self.update_interval == 0 or need_points_for_mesh):
             pointcloud_start = time.perf_counter()
-            points_3d, _ = self.pointcloud_converter.numpy_to_pointcloud(depth_image)
+            # Exclude hand vicinity points – adaptive radii (P-HAND-002)
+            if hasattr(self, "_exclude_centers_cached"):
+                exc_centers, exc_radii = self._exclude_centers_cached
+            else:
+                exc_centers, exc_radii = None, 0.03
+
+            points_3d, _ = self.pointcloud_converter.numpy_to_pointcloud(
+                depth_image,
+                exclude_centers=exc_centers,
+                exclude_radii=exc_radii,
+            )
             self.performance_stats['pointcloud_time'] = (time.perf_counter() - pointcloud_start) * 1000
             
             # キャッシュ
@@ -2170,7 +2198,7 @@ class FullPipelineViewer(DualViewer):
         """手検出結果を描画（親クラスのメソッドをオーバーライド）"""
         # 親クラスの実装があれば使用
         if hasattr(super(), '_draw_hand_detections'):
-            return super()._draw_hand_detections(image, hands_2d, hands_3d, tracked_hands)
+            return super()._draw_hand_detections(image, hands_2d, hands_3d, tracked_hands)  # type: ignore[attr-defined]
         
         # --- Custom implementation for our HandDetectionResult dataclass ---
         if hands_2d and self.hands_2d is not None:

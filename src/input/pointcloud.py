@@ -101,7 +101,7 @@ class PointCloudConverter:
     
     def __init__(
         self, 
-        depth_intrinsics: CameraIntrinsics,
+        depth_intrinsics: Optional[CameraIntrinsics],
         depth_scale: float = 1000.0,
         enable_voxel_downsampling: bool = True,
         voxel_size: float = 0.005,  # 5mm voxel size for good balance
@@ -118,6 +118,13 @@ class PointCloudConverter:
             use_numpy_voxel: NumPy版ボクセルダウンサンプリングを使用するか
             color_strategy: "first" または "average" 
         """
+        # ------------------------------------------------------------------
+        # Robust intrinsics handling (P-INPUT-002)
+        # ------------------------------------------------------------------
+        if depth_intrinsics is None:
+            logger.warning("PointCloudConverter: depth_intrinsics is None – using default fallback")
+            depth_intrinsics = _create_default_intrinsics()
+
         self.depth_intrinsics = depth_intrinsics
         self.depth_scale = depth_scale
         self.enable_voxel_downsampling = enable_voxel_downsampling
@@ -400,7 +407,9 @@ class PointCloudConverter:
         depth_scale: Optional[float] = None,
         min_depth: float = 0.1,
         max_depth: float = 10.0,
-        voxel_size: Optional[float] = None
+        voxel_size: Optional[float] = None,
+        exclude_centers: Optional[np.ndarray] = None,
+        exclude_radii: Optional[np.ndarray] | float = 0.03,
     ) -> Tuple[np.ndarray, Optional[np.ndarray]]:
         """
         numpy配列から直接点群を生成（ボクセルダウンサンプリング対応）
@@ -412,6 +421,8 @@ class PointCloudConverter:
             min_depth: 最小深度閾値
             max_depth: 最大深度閾値
             voxel_size: ボクセルサイズ（None でデフォルト使用）
+            exclude_centers: 除外する中心点のリスト
+            exclude_radii: 除外する半径
             
         Returns:
             (points, colors): 点群座標とカラー情報
@@ -479,6 +490,26 @@ class PointCloudConverter:
         else:
             self.performance_stats['last_output_points'] = input_points
             self.performance_stats['last_downsampling_ratio'] = 1.0
+        
+        # ---------------- Hand mask (P-HAND) ----------------
+        if exclude_centers is not None and len(exclude_centers) > 0:
+            centers_arr = np.asarray(exclude_centers, dtype=np.float32)
+
+            # Determine radii per center
+            if isinstance(exclude_radii, np.ndarray):
+                radii_arr = exclude_radii.astype(np.float32).reshape(1, -1)
+            else:
+                radii_arr = float(exclude_radii) * np.ones((1, centers_arr.shape[0]), dtype=np.float32)
+
+            # Compute distances (N_points x N_centers)
+            dists = np.linalg.norm(points[:, None, :] - centers_arr[None, :, :], axis=2)
+
+            # Keep points that are outside all radii thresholds
+            keep_mask = (dists > radii_arr).all(axis=1)
+
+            points = points[keep_mask]
+            if colors is not None:
+                colors = colors[keep_mask]
         
         # パフォーマンス統計更新
         processing_time = (time.perf_counter() - start_time) * 1000
@@ -640,4 +671,19 @@ def create_pointcloud_converter(
         depth_intrinsics=depth_intrinsics,
         enable_voxel_downsampling=enable_voxel_downsampling,
         voxel_size=voxel_size
-    ) 
+    )
+
+
+def _create_default_intrinsics(width: int = 424, height: int = 240) -> CameraIntrinsics:
+    """Return a reasonable fallback intrinsics when real values are unavailable.
+
+    The focal length is approximated with the image dimensions (fx = fy = max(w, h)).
+    This is *only* intended for headless or mock-camera modes where absolute scale
+    accuracy is not critical but array reshaping and projection maths must succeed.
+    """
+
+    fx = float(max(width, height))
+    fy = fx
+    cx = width / 2.0
+    cy = height / 2.0
+    return CameraIntrinsics(fx=fx, fy=fy, cx=cx, cy=cy, width=width, height=height) 
