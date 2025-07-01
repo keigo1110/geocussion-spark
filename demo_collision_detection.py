@@ -926,8 +926,11 @@ class FullPipelineViewer(DualViewer):
             import time
             start_time = time.perf_counter()
             
+            # Type safety hints for static analysers
+            assert self.gpu_distance_calc is not None, "GPU distance calculator not initialized"
+
             # 三角形データを抽出
-            if not hasattr(self.current_mesh, 'vertices') or not hasattr(self.current_mesh, 'triangles'):
+            if self.current_mesh is None or not hasattr(self.current_mesh, 'vertices') or not hasattr(self.current_mesh, 'triangles'):
                 # GPU処理失敗時はCPU処理にフォールバック
                 if self.collision_tester is not None:
                     return self.collision_tester.test_sphere_collision(hand_pos, radius, search_result)
@@ -1106,6 +1109,8 @@ class FullPipelineViewer(DualViewer):
     
     def _visualize_contact_points(self) -> None:
         """接触点を可視化"""
+        if self.vis is None:
+            return
         for contact in self.current_collision_points:
             # ContactPointオブジェクトから直接アクセス
             position = contact.position
@@ -1130,6 +1135,8 @@ class FullPipelineViewer(DualViewer):
     
     def _visualize_collision_spheres(self) -> None:
         """衝突球を可視化"""
+        if self.vis is None:
+            return
         if self.current_tracked_hands:
             for tracked in self.current_tracked_hands:
                 if tracked.position is not None:
