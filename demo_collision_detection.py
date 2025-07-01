@@ -354,7 +354,8 @@ class FullPipelineViewer(DualViewer):
         self.projector = PointCloudProjector(
             resolution=0.01,  # 1cm解像度
             method=ProjectionMethod.MEDIAN_HEIGHT,
-            fill_holes=True
+            fill_holes=True,
+            plane="xz",  # カメラ座標系に合わせて XZ 平面投影
         )
         
         # LODメッシュ生成器
