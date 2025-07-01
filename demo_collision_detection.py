@@ -48,6 +48,7 @@ logger = logging.getLogger(__name__)
 # OrbbecSDKの動的インポート
 HAS_ORBBEC_SDK = False
 try:
+    # type: ignore-next-line
     from pyorbbecsdk import Pipeline, FrameSet, Config, OBSensorType, OBError, OBFormat
     HAS_ORBBEC_SDK = True
     logger.info("OrbbecSDK is available")
@@ -983,7 +984,18 @@ class FullPipelineViewer(DualViewer):
         except Exception as e:
             logger.error(f"GPU collision testing failed: {e}, falling back to CPU")
             self.gpu_stats['cpu_fallbacks'] += 1
-            return self.collision_tester.test_sphere_collision(hand_pos, radius, search_result)
+            if self.collision_tester is not None:
+                return self.collision_tester.test_sphere_collision(hand_pos, radius, search_result)
+            from src.collision.sphere_tri import CollisionInfo
+            import numpy as _np
+            return CollisionInfo(
+                has_collision=False,
+                contact_points=[],
+                closest_point=None,
+                total_penetration_depth=0.0,
+                collision_normal=_np.array([0.0, 0.0, 1.0]),
+                collision_time_ms=0.0,
+            )
     
     def _create_collision_info_from_distances(self, distances: np.ndarray, hand_pos: np.ndarray, 
                                             radius: float, vertices: np.ndarray, 
@@ -1295,7 +1307,7 @@ class FullPipelineViewer(DualViewer):
 
                 # 型チェッカー対策で OrbbecCamera 互換として扱う
                 self.camera = cast(Any, self._mock_camera)
-                return self.camera.get_frame()
+                return self._mock_camera.get_frame()
             logger.warning("Camera not available")
             return None
         
