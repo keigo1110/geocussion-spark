@@ -227,6 +227,18 @@ class VoiceManager:
                 spatial_time_ms = (time.perf_counter() - start_time) * 1000
                 self.stats['spatial_processing_time_ms'] = spatial_time_ms
                 
+                # --- Auto cleanup for percussive voices ------------------
+                if audio_params.sustain == 0.0:
+                    total_dur = (
+                        float(audio_params.attack)
+                        + float(audio_params.decay)
+                        + float(audio_params.release)
+                        + 0.05
+                    )
+                    timer = threading.Timer(total_dur, self.deallocate_voice, args=[voice_id, False])
+                    timer.daemon = True
+                    timer.start()
+                
                 return voice_id
                 
             except Exception as e:

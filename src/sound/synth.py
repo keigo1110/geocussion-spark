@@ -455,8 +455,8 @@ class AudioSynthesizer(ManagedResource):
             # 楽器に応じたオシレーター生成
             oscillator = self._create_oscillator(params, instrument_template, freq)
             
-            # 音量適用（型変換確実に）
-            voice = oscillator * envelope * float(params.velocity)
+            # 音量適用 + 基準ゲイン
+            voice = oscillator * envelope * float(params.velocity) * float(getattr(params, "gain", 1.0))
             
             # パンニング適用（型変換を確実に）
             if self.enable_spatial_audio and self.config.channels == 2:
@@ -471,6 +471,16 @@ class AudioSynthesizer(ManagedResource):
             # 出力開始
             voice.out()
             envelope.play()
+            
+            # --- Global Limiter (simple hard clip) ------------------------
+            try:
+                if not hasattr(self, "_global_limiter"):
+                    # Create a compressor/limiter on server out when first voice created
+                    self._global_limiter = pyo.Clip(
+                        self.server.getOutput(), min=-0.95, max=0.95
+                    ).out()
+            except Exception:
+                pass
             
             return voice
             

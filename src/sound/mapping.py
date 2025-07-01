@@ -68,6 +68,9 @@ class AudioParameters:
     hand_id: str                  # 手のID
     timestamp: float              # タイムスタンプ
     
+    # ゲイン（振幅スケール）
+    gain: float = 1.0             # 0.0-1.0, 音色別に基準音量を調整
+    
     @property
     def midi_note(self) -> int:
         """MIDI note numberとして取得"""
@@ -179,6 +182,9 @@ class AudioMapper:
         # エンベロープ
         attack, decay, sustain, release = self._map_envelope(event, instrument)
         
+        # ゲイン（音色ごとの基準値）
+        gain = self._map_gain(instrument)
+        
         # 適応的パラメータ更新
         if self.enable_adaptive_mapping:
             self._update_adaptive_params(event)
@@ -197,6 +203,7 @@ class AudioMapper:
             decay=float(decay),
             sustain=float(sustain),
             release=float(release),
+            gain=float(gain),
             event_id=event.event_id,
             hand_id=event.hand_id,
             timestamp=float(event.timestamp)
@@ -422,6 +429,22 @@ class AudioMapper:
             max(0.0, min(1.0, sustain)),  # ← 0.0 OK
             max(0.05, release)
         )
+
+    def _map_gain(self, instrument: InstrumentType) -> float:
+        """音色別に基準ゲインを設定（FM や Noise 系は出力が大きい）"""
+        loud_instruments = {
+            InstrumentType.MARIMBA,
+            InstrumentType.BELL,
+            InstrumentType.DRUM,
+            InstrumentType.CRYSTAL,
+        }
+
+        if instrument in loud_instruments:
+            return 0.35  # -9 dBFS 相当
+        elif instrument == InstrumentType.SYNTH_PAD:
+            return 0.6
+        else:
+            return 0.5
 
     def _initialize_scale_patterns(self) -> Dict[ScaleType, List[int]]:
         """音階パターンを初期化"""

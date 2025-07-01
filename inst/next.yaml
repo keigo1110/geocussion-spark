@@ -46,3 +46,29 @@ issues:
       • Tests
         – tests/sound_test.py::test_percussive_tap ensures RMS stays < −6 dBFS and
           voice count < 16 after a single tap burst.
+  - id: DEMO-013-REMAINING-BUZZ
+    title: "Residual buzz – frame-wise re-trigger and FM aliasing still accumulate"
+    root_cause: |
+      After DEMO-012 fixes, voices are now short and gain-scaled, but logs show
+      40–60 notes/sec when the hand rests on the surface due to:
+        • Predictive collision loop keeps searching _hand_position_history and
+          returns slightly different centroids each frame → different triangle
+          index → new CollisionEvent ID → debouncer miss.
+        • _audio_cooldown_time is per-hand, not per-triangle contact; multiple
+          fingers/hands still sum to >16 voices.
+        • FM templates use high modulation_index=2.5; at low frequencies the
+          side-bands exceed Nyquist causing audible noise, perceived as "ジリジリ".
+        • Freeverb input is not low-passed; accumulating high-freq FM content
+          excites reverb tail producing sustained hiss.
+    impact: "Shorter but numerous notes plus FM alias components still mask the intended percussive tone."
+    proposed_action: |
+      1. Spatial contact hash
+         – Build contact_hash = (triangle_index, hand_id) and store last_time.
+           Suppress new audio if same hash <250 ms ago (independent from cooldown).
+      2. FM alias filter
+         – Before pyo.Clip, apply pyo.LPF at 10 kHz to each FM/Noise voice.
+         – Reduce modulation_index to 1.2 for MARIMBA/BELL presets.
+      3. Reverb pre-EQ
+         – Insert high-shelf −6 dB @ 8 kHz before Freeverb to tame hiss.
+      4. Polyphony guardrail
+         – If active_voices ≥ polyphony*0.8, skip new note unless velocity>0.8.
