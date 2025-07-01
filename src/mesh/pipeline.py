@@ -100,6 +100,13 @@ class MeshPipeline:  # pylint: disable=too-few-public-methods
         selected_path = "cache"
         mesh: Optional[TriangleMesh] = None
 
+        if not force_update and self._cached_mesh is not None:
+            # 新アルゴリズム: 点群差分が小さい場合はキャッシュを返す (T-MESH-102)
+            if not self._is_significant_change(points_3d):
+                elapsed = (time.perf_counter() - start) * 1000.0
+                self._stats.record(elapsed, "cache")
+                return self._cached_mesh
+
         if force_update:
             # Explicit regeneration request
             mesh = self._lod.generate_mesh(points_3d, tracked_hands, force_update=True)
@@ -135,6 +142,42 @@ class MeshPipeline:  # pylint: disable=too-few-public-methods
     def get_stats(self) -> MeshPipelineStats:  # noqa: D401 simple verbs OK
         """Return aggregated performance statistics."""
         return self._stats
+
+    # ------------------------------------------------------------------
+    # Private helpers – point-cloud diff
+    # ------------------------------------------------------------------
+
+    _SAMPLE_SIZE: int = 5000
+    _DIFF_THRESHOLD_M: float = 0.02  # 2 cm 平均距離で更新
+
+    _prev_sample: Optional[np.ndarray] = None
+
+    def _is_significant_change(self, points_3d: np.ndarray) -> bool:
+        """Return *True* if *points_3d* is sufficiently different from last frame.
+
+        Implementation: take random sample (≤5k points) and compute mean Euclidean
+        distance to previous sample of equal size (aligned index-wise).  If the
+        mean exceeds ``_DIFF_THRESHOLD_M`` → deemed significant.
+        """
+        if points_3d.shape[0] < 10:
+            return False
+
+        # Sampling (repeatable within the same call not required)
+        sample_size = min(self._SAMPLE_SIZE, len(points_3d))
+        idx = np.random.choice(points_3d.shape[0], size=sample_size, replace=False)
+        sample = points_3d[idx]
+
+        if self._prev_sample is None or len(self._prev_sample) != sample_size:
+            self._prev_sample = sample.copy()
+            return True  # first frame considered change
+
+        # Compute mean distance between corresponding points (cheap heuristic)
+        mean_dist = float(np.linalg.norm(sample - self._prev_sample, axis=1).mean())
+
+        # Update stored sample for next comparison
+        self._prev_sample = sample.copy()
+
+        return mean_dist > self._DIFF_THRESHOLD_M
 
 
 # ---------------------------------------------------------------------------
