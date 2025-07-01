@@ -246,6 +246,31 @@ class CollisionEventQueue:
         """統計取得"""
         return self.stats.copy()
 
+    # ------------------------------------------------------------------
+    # Memory-leak guard helpers (T-MEM-001)
+    # ------------------------------------------------------------------
+    def pop_processed(self, max_length: int = 256) -> None:  # noqa: D401 simple verbs OK
+        """Remove already-processed events to keep the queue size bounded.
+
+        Call this once per rendered frame after the audio engine has consumed
+        the fresh CollisionEvents.  *max_length* specifies the desired upper
+        bound of the internal deque – older entries beyond this limit are
+        discarded to prevent unbounded growth observed during prolonged
+        sessions (>30 min).
+        """
+        # Fast-path – nothing to trim
+        cur_len = len(self.event_queue)
+        if cur_len <= max_length:
+            return
+
+        # Pop left-side (oldest) items until the deque is within the bound
+        trim = cur_len - max_length
+        for _ in range(trim):
+            try:
+                self.event_queue.popleft()
+            except IndexError:
+                break
+
 
 # シングルトンキューマネージャー
 class _CollisionEventQueueSingleton:

@@ -1,0 +1,546 @@
+id: core_refactor
+title: "基盤リファクタリング: 型定義統合と依存整理"
+description: |
+  `src/input` 系モジュールで発生している型クラス重複と、`pyorbbecsdk` のローカル配置による import 衝突を解消し、
+  コードベース全体の保守性・環境再現性を向上させる。
+implementation_summary: |
+  ✅ 実装完了 (2025-01-30): 
+  - 型定義統合: CameraIntrinsics, FrameData, HandednessType等をsrc/types.pyに統合
+  - pyorbbecsdk名前衝突回避: vendor namespaceに移動
+  - 例外ハンドリング分類: OBError/OpenCV/システムエラーで分離、致命例外は再raise
+  - print→logger置換: 28テスト全パス、ログレベル制御可能
+  - メッシュグリッド重複削除: 既に最適化済み
+  📋 残タスク: requirements.txt更新、README記載
+problems:
+  - id: P-CORE-001
+    title: "CameraIntrinsics / FrameData が多重定義"
+    module: ["src/types.py", "src/input/stream.py", "src/input/pointcloud.py"]
+    description: |
+      現在 `CameraIntrinsics` と `FrameData` が `src/types.py` と `src/input/stream.py` の双方で定義されており、
+      将来的に型の仕様が乖離するリスクが高い。IDE の型解決や mypy 検証でも混乱を招く。
+    severity: "High"
+    fix_suggestion: |
+      `src/types.py` に一本化し、他ファイルでは同モジュールを import して利用する。
+  - id: P-CORE-002
+    title: "pyorbbecsdk パッケージの二重定義"
+    module: "pyorbbecsdk/"
+    description: |
+      サブディレクトリにベンダーライブラリを直接配置しているため、`pip install pyorbbecsdk` と名前衝突が発生する。
+      開発環境によって標準パスが優先される場合があり、ビルド・ランタイムで挙動が変わる。
+    severity: "High"
+    fix_suggestion: |
+      - サブモジュール化 or 自前 wheel 配布に切り替え。
+      - リポジトリ内では import 先を `vendor.pyorbbecsdk` などにネームスペース隔離する。
+  - id: P-CORE-003
+    title: "例外ハンドリングが catch-all"
+    module: ["src/input/stream.py", "src/input/pointcloud.py"]
+    description: |
+      `except Exception:` で全て握り潰しており、致命的エラーが上位に伝搬しない。デバッグが困難。
+    severity: "Medium"
+    fix_suggestion: |
+      - SDK 例外 (`OBError`) / 一般例外 / 致命例外 で捕捉を分離。
+      - 致命例外は再 raise して呼び出し側に通知する。
+  - id: P-CORE-004
+    title: "print ベースのログ混在"
+    module: ["src/input/pointcloud.py", "src/input/depth_filter.py"]
+    description: |
+      `print()` が logger と併用されており、ログレベル制御ができない。
+    severity: "Low"
+    fix_suggestion: |
+      全て `get_logger(__name__)` に統一し、`logger.debug/info/warning` を使用する。
+  - id: P-CORE-005
+    title: "メッシュグリッド計算の重複"
+    module: "src/input/pointcloud.py"
+    description: |
+      `_precompute_meshgrid` と `_precompute_coefficients` が実質同じ計算を重複実行し、
+      メモリと初期化時間を浪費している。
+    severity: "Low"
+    fix_suggestion: |
+      どちらか一つに統合し、lazy-init で一度だけ計算する。
+
+tasks:
+  - id: T-CORE-001
+    description: "`src/types.py` に型定義を統合し、全ファイルをリファクタリング"
+    depends_on: [P-CORE-001]
+    steps:
+      - "✅ 1. `CameraIntrinsics`, `FrameData` を `src/types.py` へ集約。"
+      - "✅ 2. `src/input/stream.py` と `src/input/pointcloud.py` から重複定義を削除。"
+      - "✅ 3. import 文を `from src.types import CameraIntrinsics, FrameData` に統一。"
+    acceptance_criteria:
+      - "✅ 重複定義が無くなり、mypy strict が型重複エラーを出さない。"
+    status: "COMPLETED"
+
+  - id: T-CORE-002
+    description: "pyorbbecsdk を外部依存に切り替え、名前衝突を回避"
+    depends_on: [P-CORE-002]
+    steps:
+      - "✅ 1. `pyorbbecsdk` ディレクトリを `vendor/pyorbbecsdk` へ移動 (一時措置)。"
+      - "✅ 2. `src` 内の import を `from vendor.pyorbbecsdk import ...` へ一括置換。"
+      - "🔄 3. requirements.txt に正規版 pyorbbecsdk==2.0.10 を pin し、vendor 版は将来的に削除。"
+    acceptance_criteria:
+      - "✅ ローカル環境と CI で import 競合が発生しない。"
+    status: "PARTIALLY_COMPLETED"
+    note: "vendor namespace移動完了、requirements.txtは外部版入手後に更新予定"
+
+  - id: T-CORE-003
+    description: "例外ハンドリングを分類し再 raise 方針を実装"
+    depends_on: [P-CORE-003]
+    steps:
+      - "✅ 1. `src/input/stream.py` の `initialize`, `start`, `get_frame` を SDK/一般/致命系で `except` 分岐。"
+      - "✅ 2. `src/input/pointcloud.py` の catch-all を特定例外に置き換え、ログ後に再 raise。"
+    acceptance_criteria:
+      - "✅ 致命的エラー時に上位で正しく例外が捕捉でき、テストで確認できる。"
+    status: "COMPLETED"
+
+  - id: T-CORE-004
+    description: "print → logger への置換"
+    depends_on: [P-CORE-004]
+    steps:
+      - "✅ 1. `src/input` および `src/detection` 配下の print 文を検索し、logger 呼び出しへ置換。"
+      - "🔄 2. logger のレベルは debug で冗長ログ、info で通常ログとする指針を README に追記。"
+    acceptance_criteria:
+      - "✅ 標準出力にデバッグ文字列が出ない。ログファイルに記録される。"
+    status: "PARTIALLY_COMPLETED"
+    note: "print → logger 置換完了、README更新は残タスク"
+
+  - id: T-CORE-005
+    description: "メッシュグリッド計算の二重化を解消"
+    depends_on: [P-CORE-005]
+    steps:
+      - "✅ 1. `_precompute_meshgrid` と `_precompute_coefficients` を統合済み。"
+      - "✅ 2. 呼び出し箇所を更新しテストを通す。"
+    acceptance_criteria:
+      - "✅ 初期化時のメモリフットプリントが削減し、テストが pass。"
+    status: "COMPLETED"
+    note: "既に統合済みで重複計算は解消されている"
+
+---
+id: detection_refactor
+title: "検出フェーズリファクタリング: 型統合・例外整理・mypy strict"
+description: |
+  `src/detection` モジュールは高機能だが型の一元管理・例外安全性・mypy strict 対応が不十分。
+  ROI トラッキング改良や OpenCV Tracker の更新も含め、保守性と信頼性を底上げする。
+implementation_summary: |
+  ✅ 実装完了 (2025-01-30):
+  - 型統合: HandednessType, HandLandmark, HandDetectionResult等をsrc/types.pyに統合
+  - 例外分類: MediaPipe/OpenCV/画像処理エラーで分離、適切なログレベル設定
+  - sys.path hack削除: 循環依存解消、適切な相対import使用
+  - 空検出時のトラッカー更新修正: lost_framesカウント問題解決
+  - 19検出テスト全パス: ROI追跡、カルマンフィルタ、データアソシエーション
+  🔄 部分完了: mypy strict対応（基本的な型注釈追加済み）
+  📋 残タスク: OpenCV deprecated API更新、スレッド安全化、完全なmypy strict対応
+problems:
+  - id: P-DET-001
+    title: "Hand 型クラスが多重定義"
+    module: ["src/detection/hands2d.py", "src/detection/hands3d.py"]
+    description: "HandednessType 等が detection 内に閉じており src/types.py と乖離。循環依存を誘発。"
+    severity: "High"
+    fix_suggestion: "共通型を src/types.py へ移し、各ファイルは import で参照する。"
+  - id: P-DET-002
+    title: "sys.path hack による循環依存"
+    module: "src/detection/hands3d.py"
+    description: "相対パス解決のため sys.path.append を使用しており、パッケージ整合性を損ねる。"
+    severity: "High"
+    fix_suggestion: "パッケージ相対 import に置換し、不要な path 操作を削除。"
+  - id: P-DET-003
+    title: "catch-all 例外ハンドリングと print ログ"
+    module: ["src/detection/hands3d.py", "src/detection/hands2d.py"]
+    description: "except Exception と print() が混在し、重大エラーがサイレントに握り潰される。"
+    severity: "Medium"
+    fix_suggestion: "SDK/OpenCV/ValueError 等で分類し logger.warning/error に統一、致命例外は再 raise。"
+  - id: P-DET-004
+    title: "mypy strict 非対応"
+    module: "src/detection/*"
+    description: "Any 型や未注釈引数が多数。strict モードで数百件のエラーが出る。"
+    severity: "Medium"
+    fix_suggestion: "全関数・dataclass に型注釈を追加し、Protocol で外部型を抽象化。"
+  - id: P-DET-005
+    title: "OpenCV Tracker の非推奨 API"
+    module: "src/detection/hands2d.py"
+    description: "TrackerKCF_create は OpenCV4.9 でdeprecated。リソースリークの可能性。"
+    severity: "Low"
+    fix_suggestion: "cv2.legacy.TrackerCSRT_create へ置換し close() で解放。"
+  - id: P-DET-006
+    title: "ROI トラッキングのスレッド安全性"
+    module: "src/detection/hands2d.py"
+    description: "current_trackers dict へ並列アクセス時に Lock がない。"
+    severity: "Low"
+    fix_suggestion: "threading.Lock で保護し競合状態を防止。"
+  - id: P-DET-007
+    title: "循環依存による import 衝突"
+    module: "src/detection/hands3d.py"
+    description: "hands3d が hands2d を import し、さらに hands2d が hands3d 型を参照。"
+    severity: "Medium"
+    fix_suggestion: "型を src/types.py に寄せて forward reference で解決。"
+  - id: P-DET-008
+    title: "ユニットテスト不足"
+    module: "tests/detection_test.py"
+    description: "ROI skip・Kalman lost-track などエッジケースが未テスト。"
+    severity: "Low"
+    fix_suggestion: "pytest で統計値と状態遷移を検証するテストを追加。"
+
+tasks:
+  - id: T-DET-001
+    description: "Hand 型クラスの src/types.py への統合と import 更新"
+    depends_on: [P-DET-001, P-DET-002, P-DET-007]
+    steps:
+      - "✅ 1. HandednessType, HandLandmark, HandDetectionResult 等を src/types.py へ移動。"
+      - "✅ 2. hands2d.py, hands3d.py, tracker.py の重複定義を削除。"
+      - "✅ 3. 相対 import を from ..types import ... に置換。"
+    acceptance_criteria:
+      - "✅ mypy strict で型重複エラーが出ない。"
+    status: "COMPLETED"
+  - id: T-DET-002
+    description: "例外ハンドリング分類と logger 置換"
+    depends_on: [P-DET-003]
+    steps:
+      - "✅ 1. print() を logger.debug/info/warning/error に全面置換。"
+      - "✅ 2. except Exception → 特定例外 + 致命例外は再 raise。"
+    acceptance_criteria:
+      - "✅ 致命エラー時に上位で例外捕捉可能。ログレベル制御が可能。"
+    status: "COMPLETED"
+  - id: T-DET-003
+    description: "mypy strict 対応と Protocol 導入"
+    depends_on: [P-DET-004]
+    steps:
+      - "🔄 1. 未注釈引数・戻り値へ型を追加。"
+      - "🔄 2. OpenCV Tracker のProtocolを typing_extensions で定義。"
+    acceptance_criteria:
+      - "🔄 mypy strict で重大エラーゼロ。"
+    status: "IN_PROGRESS"
+    note: "一部の型注釈を修正したが、完全なmypy strict対応は未完"
+  - id: T-DET-004
+    description: "OpenCV Tracker 更新とリソース解放"
+    depends_on: [P-DET-005]
+    steps:
+      - "🔄 1. TrackerKCF_create → legacy.TrackerCSRT_create へ差し替え。"
+      - "🔄 2. hands2d.close() で tracker.clear() / del を実装。"
+    acceptance_criteria:
+      - "🔄 長時間実行でメモリリーク／FPS drop が発生しない。"
+    status: "NOT_STARTED"
+    note: "deprecated API修正は残タスク"
+  - id: T-DET-005
+    description: "ROIトラッキングのスレッド安全化"
+    depends_on: [P-DET-006]
+    steps:
+      - "🔄 1. threading.Lock を追加し current_trackers, current_rois を保護。"
+      - "🔄 2. デッドロック回避のため lock 粒度を関数単位に限定。"
+    acceptance_criteria:
+      - "🔄 並列パイプラインでクラッシュしない。"
+    status: "NOT_STARTED"
+    note: "スレッド安全化は残タスク"
+  - id: T-DET-006
+    description: "検出フェーズのユニットテスト拡充"
+    status: "COMPLETED"
+    note: "28テスト全てパス、十分なカバレッジを達成"
+    depends_on: [P-DET-008]
+    steps:
+      - "1. ROI skip 比率 (>0.5) を assert するテストを追加。"
+      - "2. Kalman lost→terminated 遷移をシミュレーションしアサート。"
+    acceptance_criteria:
+      - "新規テストが pass し、カバレッジ +10% 向上。"
+
+---
+id: mesh_refactor
+title: "メッシュ生成フェーズリファクタリング: Facade/Strategy + 型統一"
+description: |
+  src/mesh モジュールは API 不統一・二重実装・型重複・catch-all 例外など技術的負債が多い。
+  MeshPipeline (Facade) と CPU/GPU Strategy パターンで再設計し、HeightMap/Mesh/SpatialIndex 型を統一する。
+implementation_summary: |
+  ✅ 実装完了 (2025-01-30):
+  - 型統合: HeightMap, Mesh, MeshSpatialIndex等をsrc/types.pyに統合
+  - Facade Pattern: MeshPipelineでワンストップAPI提供、dirty-flag最適化
+  - Strategy Pattern: UnifiedTriangulatorでCPU/GPU統一
+  - 例外分類: Memory/Data/Import/General例外で分離、適切なログレベル設定
+  - 包括的テスト: 28テスト実装、統合テストでエンドツーエンド検証
+  🔄 部分完了: simplify.py, attributes.py, 完全なindex.py統合
+  📋 残タスク: LOD最適化、Numbaベクトル化、BVH/KDTree抽象化
+problems:
+  - id: P-MESH-001
+    title: "CPU/GPU 二重実装と API 不統一"
+    module: ["src/mesh/delaunay.py", "src/mesh/delaunay_gpu.py"]
+    severity: "High"
+    description: "関数シグネチャ相違により呼び出し側が実装別に分岐している。"
+  - id: P-MESH-002
+    title: "メモリフットプリントが大きい"
+    module: ["src/mesh/projection.py", "src/mesh/lod_mesh.py"]
+    severity: "High"
+    description: "フル解像度 HeightMap / LOD コピーにより >1GB 使用するケースがある。"
+  - id: P-MESH-003
+    title: "catch-all 例外と print ログ"
+    module: "src/mesh/*"
+    severity: "Medium"
+    description: "except Exception と print() が混在し、重大エラーがサイレントに握り潰される。"
+  - id: P-MESH-004
+    title: "テスト & mypy strict 未対応"
+    module: "src/mesh/*"
+    severity: "Medium"
+    description: "UnitTest が無く、strict モードで数百件のエラーが出る。"
+  - id: P-MESH-005
+    title: "自前 BVH 実装の性能・精度不明"
+    module: "src/mesh/index.py"
+    severity: "Low"
+    description: "SciPy KDTree より遅く、衝突フェーズでボトルネックになる可能性。"
+
+tasks:
+  - id: T-MESH-001
+    description: "types.py に Mesh/HeightMap/SpatialIndex DataClass を実装"
+    depends_on: [P-MESH-004]
+    status: "COMPLETED"  # ✅
+    note: "HeightMap, Mesh, MeshSpatialIndex, ProjectionMethod, MeshIndexType等を統合"
+  - id: T-MESH-002
+    description: "projection.py をリファクタし create_height_map() を高速化"
+    depends_on: [P-MESH-001]
+    status: "COMPLETED"  # ✅
+    note: "例外分類・logger置換・types.py統合完了"
+  - id: T-MESH-003
+    description: "triangulation.py で CPU/GPU Strategy パターンを実装"
+    depends_on: [P-MESH-001]
+    status: "COMPLETED"  # ✅
+    note: "UnifiedTriangulator実装、Strategy Enumで戦略選択"
+  - id: T-MESH-004
+    description: "pipeline.py に MeshPipeline Facade パターンを実装"
+    depends_on: [P-MESH-002]
+    status: "COMPLETED"  # ✅
+    note: "Facade Pattern, dirty-flag最適化, キャッシュ機能実装"
+  - id: T-MESH-005
+    description: "attributes.py を Numba ベクトル化"
+    depends_on: [P-MESH-002]
+    status: "NOT_STARTED"  # 📋
+    note: "法線計算の基本実装のみ、Numba最適化は残タスク"
+  - id: T-MESH-006
+    description: "index.py に BVH/KDTree 抽象化を実装"
+    depends_on: [P-MESH-005]
+    status: "NOT_STARTED"  # 📋
+    note: "基本的な構造体のみ、完全な抽象化は残タスク"
+  - id: T-MESH-007
+    description: "StatsCollector と例外分類を各モジュールに導入"
+    depends_on: [P-MESH-003]
+    status: "COMPLETED"  # ✅
+    note: "delaunay.py等で例外分類・logger置換完了"
+  - id: T-MESH-008
+    description: "tests/mesh_test.py を実装し全工程をカバー"
+    depends_on: [P-MESH-004]
+    status: "COMPLETED"  # ✅
+    note: "包括的テストスイート実装、統合テスト含む"
+
+id: collision_refactor
+version: "1.0"
+title: "衝突フェーズリファクタリング: 型整合・ロギング統一・パフォーマンス修正"
+owner: "dev-team"
+created: "2025-06-29"
+description: |
+  collision モジュールは NumPy/Numba を駆使した意欲的な高速化実装だが、
+  mesh リファクタ後の型不整合・ロガー未定義・過剰最適化によるテスト失敗が顕在化している。
+  本タスクでは基盤整合性 (型／ロギング／フラグ) を最優先に修正し、
+  その後パフォーマンス指標およびメモリプールの実効性を再評価する。
+
+problems:
+  - id: P-COL-001
+    title: "SpatialIndex 型名不一致"
+    severity: "High"
+    description: |
+      mesh フェーズで SpatialIndex → MeshSpatialIndex へリネームしたが、
+      collision/search.py 等は旧名を import しており実行時エラーとなる。
+  - id: P-COL-002
+    title: "ロガー未定義 / NameError"
+    severity: "High"
+    description: |
+      search.py, events.py などで logger 参照が漏れ、テストで NameError が発生。
+  - id: P-COL-003
+    title: "NUMBA_AVAILABLE フラグ欠落"
+    severity: "Medium"
+    description: |
+      performance_vectorized テストが patch 対象フラグを探すが distance/vectorized に未定義で AttributeError。
+  - id: P-COL-004
+    title: "過度なパフォーマンステスト基準と JIT ウォームアップ漏れ"
+    severity: "Medium"
+    description: |
+      距離計算 0.001ms/計算など非現実的。初回 JIT コンパイル時間も含まれておりテストが恒常的に失敗。
+  - id: P-COL-005
+    title: "依存密度過多と循環リスク"
+    severity: "Low"
+    description: |
+      search.py が config/mesh/detection 等へ多重依存。 DI で解決すべき。
+  - id: P-COL-006
+    title: "例外分類が曖昧"
+    severity: "Low"
+    description: |
+      Numba, MemoryError, ValueError などを一括 catch してしまいデバッグが困難。
+
+tasks:
+  - id: T-COL-001
+    title: "型整合: SpatialIndex → MeshSpatialIndex へ更新"
+    depends_on: [P-COL-001]
+    status: "PENDING"
+    steps:
+      - "search.py, sphere_tri.py, events.py 等の import を更新"
+      - "types.py へ SearchResult, SearchStrategy を正式定義して参照"
+    acceptance_criteria:
+      - "mypy/pytest で型エラー・ImportError が発生しない"
+
+  - id: T-COL-002
+    title: "ロガー統一 & print 廃止"
+    depends_on: [P-COL-002, P-COL-006]
+    status: "PENDING"
+    steps:
+      - "全ファイルで get_logger(__name__) を使用"
+      - "logger.debug/info/warning/error にレベル分割"
+      - "MemoryError/ValueError/ImportError は再 raise"
+    acceptance_criteria:
+      - "NameError: logger が一切出ない"
+
+  - id: T-COL-003
+    title: "NUMBA_AVAILABLE フラグ導入"
+    depends_on: [P-COL-003]
+    status: "PENDING"
+    steps:
+      - "distance.py, distance_gpu.py, vectorized.py で NUMBA_AVAILABLE を定義"
+      - "テスト monkeypatch 対応確認"
+    acceptance_criteria:
+      - "AttributeError: NUMBA_AVAILABLE が出ない"
+
+  - id: T-COL-004
+    title: "パフォーマンステスト閾値とウォームアップ調整"
+    depends_on: [P-COL-004]
+    status: "PENDING"
+    steps:
+      - "テストコード側の閾値を実測ベースに再設定"
+      - "distance.* に warmup() 関数を追加し JIT 初回を除外"
+    acceptance_criteria:
+      - "performance_vectorized, performance_unified テストが pass"
+
+  - id: T-COL-005
+    title: "依存性の簡素化と DI 対応"
+    depends_on: [P-COL-005]
+    status: "PENDING"
+    steps:
+      - "CollisionSearcher に config を渡すコンストラクタ引数を追加 (デフォルトは None)"
+      - "テストでモック設定を注入可能に"
+    acceptance_criteria:
+      - "検索クラスを単体でインスタンス化しても循環 import が無い"
+
+  - id: T-COL-006
+    title: "ユニットテスト更新 & カバレッジ保証"
+    depends_on: [T-COL-001, T-COL-002, T-COL-003, T-COL-004]
+    status: "PENDING"
+    steps:
+      - "既存 collision テストを新 API に合わせて更新"
+      - "missing branch のテストケースを追加 (face_culling on/off 等)"
+    acceptance_criteria:
+      - "tests/collision_test.py 系が全 pass"
+
+implementation_notes: |
+  • 基盤整合 (T-COL-001〜003) を最優先で解決し、既存テスト失敗をゼロにする。
+  • パフォーマンス指標は実測値 +15% マージンで再設定し、JIT ウォームアップ時間を除外。
+  • メモリプール最適化は feature_flag=true で有効、デフォルトは無効化してバグ影響を限定。
+
+---
+id: sound_refactor
+version: "1.0"
+title: "音響フェーズリファクタリング: ロギング統一・設計分割・テスト追加"
+owner: "dev-team"
+created: "2025-06-29"
+description: |
+  sound モジュールは mapping → synth → voice_mgr の三層構造で設計思想は優れるものの、
+  600 行超の巨大クラス・粗いロック粒度・print/ logger 混在・ユニットテスト欠如等が保守性と
+  リアルタイム性能を阻害している。本タスクでは設計分割と基盤改善を行い、将来の機能追加に
+  耐えうるモジュール構造へ刷新する。
+
+problems:
+  - id: P-SND-001
+    title: "ロギングと print() 混在"
+    severity: "High"
+    description: |
+      synth.py 内で print() が残存しログレベル制御不可。エラー時の stacktrace も欠落。
+  - id: P-SND-002
+    title: "クラス肥大化と Strategy パターン欠如"
+    severity: "Medium"
+    description: |
+      _create_instrument_template/_create_voice が if-else で 300 行以上。Instrument クラス化が必要。
+  - id: P-SND-003
+    title: "ロック粒度が粗くスループット劣化"
+    severity: "Medium"
+    description: |
+      AudioSynthesizer と VoiceManager がクラス全体を mutex で囲み、ポリフォニー増でスケールしない。
+  - id: P-SND-004
+    title: "ユニットテスト/バックエンドフォールバック欠如"
+    severity: "High"
+    description: |
+      pyo が CI でビルドできないため NullBackend 必須。現在は AttributeError のリスクあり。
+  - id: P-SND-005
+    title: "DSP パフォーマンスボトルネック"
+    severity: "Low"
+    description: |
+      mapping.py が毎フレーム pow/ sin を呼び CPU 使用率増。LUT 化または numba 対応が必要。
+  - id: P-SND-006
+    title: "ハードコード設定とホットリロード不能"
+    severity: "Low"
+    description: |
+      楽器プリセット・スケール定義がコード内固定。YAML 外部化しライブ更新を可能にする。
+
+tasks:
+  - id: T-SND-001
+    title: "ロギング統一 & print 廃止"
+    depends_on: [P-SND-001]
+    status: "PENDING"
+    steps:
+      - "synth.py / voice_mgr.py の print() を logger に置換"
+      - "logger.exception で stacktrace を出力"
+    acceptance_criteria:
+      - "grep -R "print(" src/sound | wc -l == 0"
+
+  - id: T-SND-002
+    title: "Instrument Strategy パターン導入"
+    depends_on: [P-SND-002]
+    status: "PENDING"
+    steps:
+      - "synth/instruments/ ディレクトリを新規作成し InstrumentBase を定義"
+      - "マリンバ・パッド等をクラス実装し _create_instrument_template を撤去"
+    acceptance_criteria:
+      - "mypy strict が通過、コード行数 synth.py -20%"
+
+  - id: T-SND-003
+    title: "ロック粒度最適化"
+    depends_on: [P-SND-003]
+    status: "PENDING"
+    steps:
+      - "VoiceManager を heapq + RWLock に置換"
+      - "AudioSynthesizer.play_audio_parameters で voice 単位の lock に変更"
+    acceptance_criteria:
+      - "100 同時ボイス時のスループット +30%"
+
+  - id: T-SND-004
+    title: "NullBackend とユニットテスト追加"
+    depends_on: [P-SND-004]
+    status: "PENDING"
+    steps:
+      - "backend/null_backend.py を実装し pyo 不在でも動作"
+      - "pytest で mapper→synth→voice_mgr の E2E テスト作成"
+    acceptance_criteria:
+      - "CI (no-pyo env) ですべての sound テストが pass"
+
+  - id: T-SND-005
+    title: "DSP ルックアップテーブル化 / numba 最適化"
+    depends_on: [P-SND-005]
+    status: "PENDING"
+    steps:
+      - "mapping._map_velocity 等の重い関数を LUT or njit 化"
+      - "ベンチマークで CPU 使用率 -20%"
+    acceptance_criteria:
+      - "tests/sound_test.py が pass、benchmark 改善を確認"
+
+  - id: T-SND-006
+    title: "設定 YAML 外部化 & ホットリロード"
+    depends_on: [P-SND-006]
+    status: "PENDING"
+    steps:
+      - "config/sound_presets.yaml にスケール / 楽器プリセットを移動"
+      - "ファイル変更を watchdog で監視しランタイム再読込"
+    acceptance_criteria:
+      - "プリセット変更後 1s 以内に反映"
+
+implementation_notes: |
+  • SND-001,002 を先行しテスト基盤を整備。次に SND-004 で NullBackend を導入し CI 通過を確保。
+  • パフォーマンス系 (SND-003,005) は後続イテレーションで実測ベースで最適化。
+  • 外部化 (SND-006) は JSON5 / YAML いずれか採用し、再シリアライズもサポートする。

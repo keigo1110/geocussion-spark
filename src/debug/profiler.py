@@ -543,4 +543,78 @@ def stop_global_profiling() -> Optional[PerformanceReport]:
     """グローバルプロファイリング停止"""
     if global_profiler:
         return global_profiler.stop_profiling()
-    return None 
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Memory leak diagnostics – tracemalloc logger (T-MEM-001)
+# ---------------------------------------------------------------------------
+
+import tracemalloc
+
+
+def start_tracemalloc_logger(enable: bool = True, interval: int = 1000, top_n: int = 20) -> None:  # noqa: D401
+    """Start a background thread that periodically prints the largest memory
+    allocations captured by *tracemalloc*.
+
+    Parameters
+    ----------
+    enable
+        Enable or disable the logger (no-op when *False*).
+    interval
+        Number of **frames** between snapshot comparisons – piggy-back on the
+        global `PerformanceProfiler` frame counter. 1000 frames at 30 FPS ≈ 33 s.
+    top_n
+        How many top allocation statistics to display.
+    """
+
+    if not enable:
+        logger.debug("Tracemalloc logger disabled by configuration")
+        return
+
+    if tracemalloc.is_tracing():
+        logger.debug("Tracemalloc logger already running – skipping re-initialisation")
+        return
+
+    tracemalloc.start()
+
+    logger.info("📈 Tracemalloc logger started – interval=%d frames, top=%d", interval, top_n)
+
+    import threading
+    import time
+
+    def _worker() -> None:  # pragma: no cover – debug utility
+        global_prof = get_global_profiler()
+        if global_prof is None:
+            logger.warning("No global PerformanceProfiler – tracemalloc logger will poll on wall-clock instead")
+
+        last_snapshot = tracemalloc.take_snapshot()
+        last_frame = 0
+
+        while True:
+            # Determine whether *interval* frames have elapsed (if profiler available)
+            frame_ok = False
+            if global_prof and global_prof.current_frame - last_frame >= interval:
+                frame_ok = True
+                last_frame = global_prof.current_frame
+            elif global_prof is None:
+                # Fallback: wait fixed seconds (approx 30 FPS)
+                time.sleep(interval / 30.0)
+                frame_ok = True
+
+            if not frame_ok:
+                time.sleep(0.01)
+                continue
+
+            try:
+                snapshot = tracemalloc.take_snapshot()
+                top_stats = snapshot.compare_to(last_snapshot, "lineno")[:top_n]
+                logger.info("📊 [Tracemalloc] Top %d differences:", top_n)
+                for stat in top_stats:
+                    logger.info("  %s", stat)
+                last_snapshot = snapshot
+            except Exception as exc:  # pylint: disable=broad-except
+                logger.error("Tracemalloc logger error: %s", exc)
+                break
+
+    threading.Thread(target=_worker, daemon=True, name="TracemallocLogger").start() 

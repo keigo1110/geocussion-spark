@@ -9,7 +9,7 @@
 import time
 from enum import Enum
 from dataclasses import dataclass
-from typing import Tuple, Optional, List, Union
+from typing import Tuple, Optional, List, Union, Literal
 import numpy as np
 import cv2
 from scipy import ndimage
@@ -25,6 +25,11 @@ class ProjectionMethod(Enum):
     DENSITY = "density"         # 各グリッドセルの点密度
 
 
+# ---------------------------------------------------------------------------
+# Data structures
+# ---------------------------------------------------------------------------
+
+
 @dataclass
 class HeightMap:
     """ハイトマップデータ構造"""
@@ -33,6 +38,7 @@ class HeightMap:
     bounds: Tuple[float, float, float, float]  # (min_x, max_x, min_y, max_y)
     resolution: float            # グリッド解像度 (m/pixel)
     valid_mask: np.ndarray      # 有効ピクセルマスク (H, W)
+    plane: str = "xy"           # 投影平面 (xy/xz/yz)
     
     @property
     def shape(self) -> Tuple[int, int]:
@@ -73,7 +79,8 @@ class PointCloudProjector:
         method: ProjectionMethod = ProjectionMethod.MEAN_HEIGHT,
         smooth_factor: float = 0.0,  # ガウシアン平滑化係数
         fill_holes: bool = True,     # 穴埋め処理
-        min_points_per_cell: int = 1 # セルあたりの最小点数
+        min_points_per_cell: int = 1, # セルあたりの最小点数
+        plane: Literal["xy", "xz", "yz"] = "xy",  # 投影平面
     ):
         """
         初期化
@@ -84,12 +91,14 @@ class PointCloudProjector:
             smooth_factor: ガウシアン平滑化係数 (0で無効)
             fill_holes: 穴埋め処理を行うか
             min_points_per_cell: セルあたりの最小点数
+            plane: 投影平面
         """
         self.resolution = resolution
         self.method = method
         self.smooth_factor = smooth_factor
         self.fill_holes = fill_holes
         self.min_points_per_cell = min_points_per_cell
+        self.plane = plane  # 新規: 投影平面
         
         # パフォーマンス統計
         self.stats = {
@@ -118,21 +127,33 @@ class PointCloudProjector:
         if points.shape[1] != 3:
             raise ValueError(f"Points must be (N, 3), got {points.shape}")
         
-        # バウンディングボックス計算
-        min_x, min_y = np.min(points[:, :2], axis=0)
-        max_x, max_y = np.max(points[:, :2], axis=0)
-        
+        # ------------------------------
+        # 軸の選択 (plane に応じて)
+        # ------------------------------
+        if self.plane == "xy":
+            axis0, axis1, height_idx = 0, 1, 2  # Z が高さ
+        elif self.plane == "xz":
+            axis0, axis1, height_idx = 0, 2, 1  # Y が高さ
+        elif self.plane == "yz":
+            axis0, axis1, height_idx = 1, 2, 0  # X が高さ
+        else:
+            raise ValueError(f"Invalid projection plane: {self.plane}")
+
+        # バウンディングボックス計算（選択軸）
+        min_axis0, min_axis1 = np.min(points[:, [axis0, axis1]], axis=0)
+        max_axis0, max_axis1 = np.max(points[:, [axis0, axis1]], axis=0)
+
         # グリッドサイズ計算
-        width = int(np.ceil((max_x - min_x) / self.resolution)) + 1
-        height = int(np.ceil((max_y - min_y) / self.resolution)) + 1
-        
+        width = int(np.ceil((max_axis0 - min_axis0) / self.resolution)) + 1
+        height = int(np.ceil((max_axis1 - min_axis1) / self.resolution)) + 1
+
         # 境界を調整（余裕を持たせる）
         margin = self.resolution
-        bounds = (min_x - margin, max_x + margin, min_y - margin, max_y + margin)
-        
-        # グリッド座標計算
-        grid_x = ((points[:, 0] - bounds[0]) / self.resolution).astype(np.int32)
-        grid_y = ((bounds[3] - points[:, 1]) / self.resolution).astype(np.int32)  # Y軸反転
+        bounds = (min_axis0 - margin, max_axis0 + margin, min_axis1 - margin, max_axis1 + margin)
+
+        # グリッド座標計算 (第二軸は反転しない実装)
+        grid_x = ((points[:, axis0] - bounds[0]) / self.resolution).astype(np.int32)
+        grid_y = ((points[:, axis1] - bounds[2]) / self.resolution).astype(np.int32)
         
         # 範囲外の点を除外
         valid_mask = (
@@ -149,7 +170,7 @@ class PointCloudProjector:
         
         # ハイトマップ生成
         heights, densities, valid_pixels = self._create_heightmap(
-            valid_points[:, 2],  # Z座標
+            valid_points[:, height_idx],  # Z座標
             valid_grid_x,
             valid_grid_y,
             height,
@@ -172,7 +193,8 @@ class PointCloudProjector:
             densities=densities,
             bounds=bounds,
             resolution=self.resolution,
-            valid_mask=valid_pixels
+            valid_mask=valid_pixels,
+            plane=self.plane
         )
     
     def _create_heightmap(

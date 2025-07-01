@@ -28,106 +28,9 @@ except ImportError:
                 DrawingSpec = lambda *args: None
 
 from .. import get_logger
+from ..types import HandednessType, HandLandmark, HandROI, HandDetectionResult, ROITrackingStats
+
 logger = get_logger(__name__)
-
-
-class HandednessType(Enum):
-    """手の左右判定"""
-    LEFT = "Left"
-    RIGHT = "Right"
-    UNKNOWN = "Unknown"
-
-
-@dataclass
-class HandLandmark:
-    """手のランドマーク座標"""
-    x: float  # 0-1の正規化座標
-    y: float  # 0-1の正規化座標
-    z: float  # 深度情報（相対値）
-    visibility: float = 1.0  # 可視性スコア
-
-
-@dataclass
-class HandROI:
-    """手領域の矩形情報"""
-    x: int
-    y: int
-    width: int
-    height: int
-    confidence: float = 1.0
-    last_updated_frame: int = 0
-    hand_id: str = ""
-    
-    @property
-    def bbox(self) -> Tuple[int, int, int, int]:
-        """OpenCV tracker用のバウンディングボックス (x, y, w, h)"""
-        return (self.x, self.y, self.width, self.height)
-    
-    @property
-    def center(self) -> Tuple[int, int]:
-        """矩形の中心座標"""
-        return (self.x + self.width // 2, self.y + self.height // 2)
-    
-    def area(self) -> int:
-        """矩形の面積"""
-        return self.width * self.height
-
-
-@dataclass
-class HandDetectionResult:
-    """手検出結果"""
-    id: str  # 手のID（トラッキング用）
-    landmarks: List[HandLandmark]
-    handedness: HandednessType
-    confidence: float
-    bounding_box: Tuple[int, int, int, int]  # (x, y, width, height)
-    timestamp_ms: float
-    is_tracked: bool = False  # ROIトラッキングで生成されたかどうか
-    
-    @property
-    def center_point(self) -> Tuple[float, float]:
-        """手の中心点を計算"""
-        if not self.landmarks:
-            return (0.0, 0.0)
-        avg_x = sum(lm.x for lm in self.landmarks) / len(self.landmarks)
-        avg_y = sum(lm.y for lm in self.landmarks) / len(self.landmarks)
-        return (avg_x, avg_y)
-    
-    @property
-    def palm_center(self) -> Tuple[float, float]:
-        """手のひら中心を計算（ランドマーク0, 5, 9, 13, 17の平均）"""
-        if len(self.landmarks) < 21:
-            return self.center_point
-        palm_indices = [0, 5, 9, 13, 17]  # 手首・各指の付け根
-        avg_x = sum(self.landmarks[i].x for i in palm_indices) / len(palm_indices)
-        avg_y = sum(self.landmarks[i].y for i in palm_indices) / len(palm_indices)
-        return (avg_x, avg_y)
-
-
-@dataclass
-class ROITrackingStats:
-    """ROIトラッキング統計情報"""
-    total_frames: int = 0
-    mediapipe_executions: int = 0
-    tracking_successes: int = 0
-    tracking_failures: int = 0
-    total_tracking_time_ms: float = 0.0
-    total_mediapipe_time_ms: float = 0.0
-    
-    @property
-    def skip_ratio(self) -> float:
-        """MediaPipe スキップ率"""
-        if self.total_frames == 0:
-            return 0.0
-        return 1.0 - (self.mediapipe_executions / self.total_frames)
-    
-    @property
-    def success_rate(self) -> float:
-        """トラッキング成功率"""
-        total_attempts = self.tracking_successes + self.tracking_failures
-        if total_attempts == 0:
-            return 0.0
-        return self.tracking_successes / total_attempts
 
 
 class MediaPipeHandsWrapper:
@@ -204,40 +107,62 @@ class MediaPipeHandsWrapper:
     def _initialize(self) -> bool:
         """MediaPipe初期化"""
         if not MEDIAPIPE_AVAILABLE:
-            print("Warning: MediaPipe not available, using mock implementation")
+            logger.warning("MediaPipe not available, using mock implementation")
             return False
         
         try:
             self.mp_hands = mp.solutions.hands
             self.mp_drawing = mp.solutions.drawing_utils
             
-            # GPU/CPU設定
-            if self.use_gpu:
-                # GPU使用時の設定
-                self.hands = self.mp_hands.Hands(
+            def _create_hands_instance(use_gpu: bool):
+                return self.mp_hands.Hands(
                     static_image_mode=False,
                     max_num_hands=self.max_num_hands,
                     min_detection_confidence=self.min_detection_confidence,
                     min_tracking_confidence=self.min_tracking_confidence,
-                    model_complexity=self.model_complexity
+                    model_complexity=self.model_complexity if use_gpu else 0  # CPU時は lite
                 )
+
+            # 1) GPU でトライ
+            init_success = False
+            try:
+                self.hands = _create_hands_instance(use_gpu=self.use_gpu)
+                init_success = True
+            except (RuntimeError, ValueError, Exception) as e:
+                if self.use_gpu:
+                    logger.warning(f"MediaPipe GPU initialization failed: {e}. Falling back to CPU mode.")
+                else:
+                    logger.warning(f"MediaPipe CPU initialization error: {e}")
+
+            # 2) CPU フォールバック
+            if not init_success:
+                try:
+                    self.hands = _create_hands_instance(use_gpu=False)
+                    self.use_gpu = False  # 状態を更新
+                    init_success = True
+                except Exception as e:
+                    logger.error(f"MediaPipe CPU fallback also failed: {e}")
+                    init_success = False
+
+            if init_success:
+                self.is_initialized = True
+                roi_status = f" (ROI tracking: {'enabled' if self.enable_roi_tracking else 'disabled'})"
+                logger.info(f"MediaPipe Hands initialized ({'GPU' if self.use_gpu else 'CPU'} mode){roi_status}")
+                return True
             else:
-                # CPU使用時の設定
-                self.hands = self.mp_hands.Hands(
-                    static_image_mode=False,
-                    max_num_hands=self.max_num_hands,
-                    min_detection_confidence=self.min_detection_confidence,
-                    min_tracking_confidence=self.min_tracking_confidence,
-                    model_complexity=0  # CPU時はliteモデル使用
-                )
+                return False
             
-            self.is_initialized = True
-            roi_status = f" (ROI tracking: {'enabled' if self.enable_roi_tracking else 'disabled'})"
-            print(f"MediaPipe Hands initialized ({'GPU' if self.use_gpu else 'CPU'} mode){roi_status}")
-            return True
-            
+        except ImportError as e:
+            # MediaPipeモジュールのインポートエラー
+            logger.error(f"MediaPipe import error: {e}")
+            return False
+        except (RuntimeError, OSError) as e:
+            # GPU/ハードウェアエラー（復旧可能）
+            logger.warning(f"MediaPipe hardware initialization error: {e}")
+            return False
         except Exception as e:
-            print(f"MediaPipe initialization error: {e}")
+            # その他の予期しないエラー
+            logger.error(f"Unexpected MediaPipe initialization error: {e}")
             return False
     
     def detect_hands(self, image: np.ndarray) -> List[HandDetectionResult]:
@@ -329,8 +254,17 @@ class MediaPipeHandsWrapper:
             
             return hand_results
             
+        except cv2.error as e:
+            # OpenCV画像処理エラー
+            logger.warning(f"OpenCV error during hand detection: {e}")
+            return []
+        except (RuntimeError, ValueError) as e:
+            # MediaPipe処理エラー
+            logger.warning(f"MediaPipe processing error: {e}")
+            return []
         except Exception as e:
-            logger.error(f"MediaPipe hand detection error: {e}")
+            # その他の予期しないエラー
+            logger.error(f"Unexpected MediaPipe hand detection error: {e}")
             return []
     
     def _update_roi_tracking(self, image: np.ndarray) -> List[HandDetectionResult]:
@@ -434,8 +368,13 @@ class MediaPipeHandsWrapper:
             else:
                 logger.warning(f"Unknown tracker type: {self.tracker_type}, using KCF")
                 return cv2.TrackerKCF_create()
+        except (AttributeError, cv2.error) as e:
+            # OpenCVトラッカー作成エラー
+            logger.warning(f"Failed to create tracker {self.tracker_type}: {e}")
+            return None
         except Exception as e:
-            logger.error(f"Failed to create tracker {self.tracker_type}: {e}")
+            # その他の予期しないエラー
+            logger.error(f"Unexpected tracker creation error: {e}")
             return None
     
     def _estimate_tracking_confidence(self, image: np.ndarray, bbox: Tuple[float, float, float, float]) -> float:
@@ -459,8 +398,13 @@ class MediaPipeHandsWrapper:
             
             return max(0.0, normalized_confidence)
             
+        except (IndexError, ValueError) as e:
+            # 画像境界エラー
+            logger.debug(f"Tracking confidence estimation error: {e}")
+            return 0.0
         except Exception as e:
-            logger.error(f"Failed to estimate tracking confidence: {e}")
+            # その他の予期しないエラー
+            logger.warning(f"Unexpected tracking confidence error: {e}")
             return 0.0
     
     def _create_tracked_hand_result(self, roi: HandROI, hand_id: str) -> Optional[HandDetectionResult]:
@@ -485,8 +429,13 @@ class MediaPipeHandsWrapper:
                 is_tracked=True
             )
             
+        except (IndexError, ValueError) as e:
+            # ランドマーク生成エラー
+            logger.debug(f"Failed to create tracked hand result: {e}")
+            return None
         except Exception as e:
-            logger.error(f"Failed to create tracked hand result: {e}")
+            # その他の予期しないエラー
+            logger.warning(f"Unexpected tracked hand result creation error: {e}")
             return None
 
     def detect_hands_batch(self, images: List[np.ndarray]) -> List[List[HandDetectionResult]]:
@@ -566,8 +515,13 @@ class MediaPipeHandsWrapper:
                 is_tracked=False
             )
             
+        except (IndexError, AttributeError, ValueError) as e:
+            # MediaPipe結果変換エラー
+            logger.debug(f"MediaPipe result conversion error: {e}")
+            return None
         except Exception as e:
-            logger.error(f"Failed to convert MediaPipe result: {e}")
+            # その他の予期しないエラー
+            logger.warning(f"Unexpected MediaPipe conversion error: {e}")
             return None
 
     def get_roi_tracking_stats(self) -> ROITrackingStats:
@@ -590,48 +544,47 @@ class MediaPipeHandsWrapper:
         draw_connections: bool = True
     ) -> np.ndarray:
         """ランドマーク描画"""
-        if not self.is_initialized or not self.mp_drawing:
+        if not self.is_initialized:
             return image
-        
+
         try:
-            if hand_result.is_tracked:
-                # ROI トラッキング結果の場合は矩形のみ描画
-                x, y, w, h = hand_result.bounding_box
-                cv2.rectangle(image, (x, y), (x + w, y + h), (0, 255, 255), 2)  # 黄色の矩形
-                cv2.putText(image, f"Tracked: {hand_result.confidence:.2f}", 
-                           (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
-                return image
-            
-            # MediaPipe ランドマークの描画
-            # landmark list を MediaPipe format に変換
             height, width = image.shape[:2]
-            mp_landmarks = []
-            
-            for landmark in hand_result.landmarks:
-                mp_landmark = type('', (), {})()
-                mp_landmark.x = landmark.x
-                mp_landmark.y = landmark.y
-                mp_landmark.z = landmark.z
-                mp_landmarks.append(mp_landmark)
-            
-            # MediaPipe format の landmark list
-            landmarks_container = type('', (), {})()
-            landmarks_container.landmark = mp_landmarks
-            
-            # 描画
-            self.mp_drawing.draw_landmarks(
-                image, 
-                landmarks_container,
-                self.mp_hands.HAND_CONNECTIONS if draw_connections else None
-            )
-            
-            # 手の種類とID表示
-            x, y, w, h = hand_result.bounding_box
+
+            # ROI トラッキング結果: バウンディングボックスのみ
+            if hand_result.is_tracked:
+                x, y, w, h = hand_result.bounding_box
+                cv2.rectangle(image, (x, y), (x + w, y + h), (0, 255, 255), 2)
+                cv2.putText(image, f"Tracked {hand_result.confidence:.2f}",
+                            (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+                return image
+
+            # --- 軽量 OpenCV 描画 ---
+            pts = []
+            for lm in hand_result.landmarks:
+                cx, cy = int(lm.x * width), int(lm.y * height)
+                pts.append((cx, cy))
+                cv2.circle(image, (cx, cy), 3, (0, 255, 0), -1)
+
+            # 簡易骨格線（親指とそれ以外をざっくり接続）
+            basic_connections = [
+                (0, 1), (1, 2), (2, 3), (3, 4),   # 親指
+                (5, 6), (6, 7), (7, 8),            # 人差し指
+                (9,10), (10,11), (11,12),          # 中指
+                (13,14), (14,15), (15,16),         # 薬指
+                (17,18), (18,19), (19,20),         # 小指
+                (0,5), (5,9), (9,13), (13,17), (17,0)  # 手のひら
+            ] if draw_connections and len(pts) == 21 else []
+
+            for a, b in basic_connections:
+                cv2.line(image, pts[a], pts[b], (0, 255, 0), 1)
+
+            # ラベル
+            x, y, w_box, h_box = hand_result.bounding_box
             label = f"{hand_result.handedness.value} {hand_result.id}"
             cv2.putText(image, label, (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
-            
+
         except Exception as e:
-            logger.error(f"Error drawing landmarks: {e}")
+            logger.warning(f"Landmark drawing error: {e}")
         
         return image
 

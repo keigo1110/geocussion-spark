@@ -68,6 +68,9 @@ class AudioParameters:
     hand_id: str                  # 手のID
     timestamp: float              # タイムスタンプ
     
+    # ゲイン（振幅スケール）
+    gain: float = 1.0             # 0.0-1.0, 音色別に基準音量を調整
+    
     @property
     def midi_note(self) -> int:
         """MIDI note numberとして取得"""
@@ -179,6 +182,9 @@ class AudioMapper:
         # エンベロープ
         attack, decay, sustain, release = self._map_envelope(event, instrument)
         
+        # ゲイン（音色ごとの基準値）
+        gain = self._map_gain(instrument)
+        
         # 適応的パラメータ更新
         if self.enable_adaptive_mapping:
             self._update_adaptive_params(event)
@@ -197,6 +203,7 @@ class AudioMapper:
             decay=float(decay),
             sustain=float(sustain),
             release=float(release),
+            gain=float(gain),
             event_id=event.event_id,
             hand_id=event.hand_id,
             timestamp=float(event.timestamp)
@@ -276,18 +283,26 @@ class AudioMapper:
         return max(0.01, min(1.0, mapped_velocity))  # 完全無音は避ける
     
     def _map_duration(self, event: CollisionEvent) -> float:
-        """持続時間をマッピング（打楽器らしく短く）"""
-        # 基本持続時間を大幅に短縮
-        base_duration = 0.8  # 1.0 → 0.8秒に短縮
-        
-        # 接触面積による調整（影響を減少）
-        area_factor = 1.0 + min(event.contact_area * 500, 0.5)  # 最大1.5倍に制限
-        
-        # 強度による調整（影響を減少）
-        intensity_factor = 0.8 + (event.intensity.value / CollisionIntensity.MAXIMUM.value) * 0.4
-        
+        """持続時間をマッピング
+
+        打楽器的な衝突は短いパルスが望ましいため、これまでよりも短い基本値を採用。
+        面積・強度による伸び幅も抑え、全体として 0.15-0.8 秒程度に収まるようにする。
+        """
+
+        # --- 1. 基本持続時間を短縮 ---------------------------------------
+        base_duration = 0.25  # 250 ms – percussive hit
+
+        # --- 2. 面積による微調整 ----------------------------------------
+        #   最大 40 % まで延長
+        area_factor = 1.0 + min(event.contact_area * 400, 0.4)
+
+        # --- 3. 衝突強度による微調整 ------------------------------------
+        intensity_factor = 0.8 + (event.intensity.value / CollisionIntensity.MAXIMUM.value) * 0.3
+
         duration = base_duration * area_factor * intensity_factor
-        return max(0.3, min(1.5, duration))  # 0.3-1.5秒の範囲に制限
+
+        # --- 4. 安全クランプ -------------------------------------------
+        return max(0.15, min(0.8, duration))
     
     def _select_instrument(self, event: CollisionEvent) -> InstrumentType:
         """楽器を選択"""
@@ -407,12 +422,29 @@ class AudioMapper:
         area_factor = min(event.contact_area * 1000, 2.0)
         release *= area_factor
         
+        # Sustain=0.0 を許可して完全なワンショットに
         return (
             max(0.001, attack),
-            max(0.01, decay), 
-            max(0.1, min(1.0, sustain)),
-            max(0.1, release)
+            max(0.01, decay),
+            max(0.0, min(1.0, sustain)),  # ← 0.0 OK
+            max(0.05, release)
         )
+
+    def _map_gain(self, instrument: InstrumentType) -> float:
+        """音色別に基準ゲインを設定（FM や Noise 系は出力が大きい）"""
+        loud_instruments = {
+            InstrumentType.MARIMBA,
+            InstrumentType.BELL,
+            InstrumentType.DRUM,
+            InstrumentType.CRYSTAL,
+        }
+
+        if instrument in loud_instruments:
+            return 0.35  # -9 dBFS 相当
+        elif instrument == InstrumentType.SYNTH_PAD:
+            return 0.6
+        else:
+            return 0.5
 
     def _initialize_scale_patterns(self) -> Dict[ScaleType, List[int]]:
         """音階パターンを初期化"""

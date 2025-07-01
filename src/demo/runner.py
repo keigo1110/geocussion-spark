@@ -111,53 +111,68 @@ class DemoRunner:
         return 0
     
     def _run_collision_detection(self) -> int:
-        """衝突検出デモを実行（レガシーモード）"""
-        self.logger.info("Running collision detection demo (legacy mode)")
+        """衝突検出デモを実行（統合ビューワーモード）"""
+        self.logger.info("Running collision detection demo (integrated viewer mode)")
         
-        # レガシーFullPipelineViewerを使用
         try:
-            # 動的インポート（循環参照回避）
-            import sys
-            import os
-            project_root = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
+            # IntegratedGeocussionViewerを使用（最新の統合版）
+            from .integrated_viewer import IntegratedGeocussionViewer, HandledPipelineConfig
             
-            # demo_collision_detectionを直接インポート
-            demo_path = os.path.join(project_root, 'demo_collision_detection.py')
-            spec = self._import_file_as_module('demo_collision_detection', demo_path)
+            # 設定をHandledPipelineConfigに変換
+            pipeline_config = HandledPipelineConfig(
+                enable_filter=self.config.enable_filter,
+                enable_hand_detection=self.config.enable_hand_detection,
+                enable_tracking=self.config.enable_tracking,
+                min_detection_confidence=self.config.min_detection_confidence,
+                use_gpu_mediapipe=self.config.use_gpu_mediapipe,
+                
+                enable_mesh_generation=self.config.enable_mesh_generation,
+                mesh_update_interval=self.config.mesh_update_interval,
+                max_mesh_skip_frames=self.config.max_mesh_skip_frames,
+                mesh_resolution=0.01,
+                mesh_quality_threshold=0.3,
+                mesh_reduction=0.7,
+                
+                enable_collision_detection=self.config.enable_collision_detection,
+                enable_collision_visualization=self.config.enable_collision_visualization,
+                sphere_radius=self.config.sphere_radius,
+                
+                enable_audio_synthesis=self.config.enable_audio_synthesis,
+                audio_scale=self.config.audio_scale,
+                audio_instrument=self.config.audio_instrument,
+                audio_polyphony=self.config.audio_polyphony,
+                audio_master_volume=self.config.audio_master_volume,
+                
+                enable_voxel_downsampling=True,
+                voxel_size=0.005,
+                enable_gpu_acceleration=True
+            )
             
-            if spec and spec.loader:
-                demo_module = spec.loader.load_module(spec)
-                
-                # FullPipelineViewerを作成
-                from demo_collision_detection import FullPipelineViewer
-                
-                self.viewer = FullPipelineViewer(
-                    enable_mesh_generation=self.config.enable_mesh_generation,
-                    enable_collision_detection=self.config.enable_collision_detection,
-                    enable_collision_visualization=self.config.enable_collision_visualization,
-                    sphere_radius=self.config.sphere_radius,
-                    mesh_update_interval=self.config.mesh_update_interval,
-                    max_mesh_skip_frames=self.config.max_mesh_skip_frames,
-                    enable_audio_synthesis=self.config.enable_audio_synthesis,
-                    audio_scale=self.config.audio_scale,
-                    audio_instrument=self.config.audio_instrument,
-                    audio_polyphony=self.config.audio_polyphony,
-                    audio_master_volume=self.config.audio_master_volume
-                )
-                
-                self._print_collision_controls()
-                self.viewer.run()
-                return 0
-                
-            else:
-                self.logger.error("Failed to load collision detection module")
+            # IntegratedGeocussionViewerを作成
+            self.viewer = IntegratedGeocussionViewer(
+                config=pipeline_config,
+                depth_width=getattr(self.config, 'depth_width', None),
+                depth_height=getattr(self.config, 'depth_height', None),
+                rgb_window_size=(self.config.window_width, self.config.window_height),
+                point_size=self.config.point_size,
+                headless_mode=getattr(self.config, 'headless_mode', False),
+                headless_duration=getattr(self.config, 'headless_duration', 30),
+                pure_headless_mode=getattr(self.config, 'pure_headless_mode', False)
+            )
+            
+            self._print_collision_controls()
+            
+            # 実行（initialize()は内部で実行される）
+            if not self.viewer.run():
+                self.logger.error("Failed to run integrated viewer")
                 return 1
+            
+            return 0
                 
         except Exception as e:
             self.logger.error(f"Error running collision detection: {e}")
-            # フォールバックとしてClean Architectureモードを実行
-            self.logger.info("Falling back to clean architecture mode")
-            return self._run_clean_architecture()
+            traceback.print_exc()
+            return 1
     
     def _run_clean_architecture(self) -> int:
         """Clean Architectureデモを実行"""

@@ -13,10 +13,12 @@ Level of Detail (LOD) メッシュ生成システム
 """
 
 import time
+import gc
 from typing import Optional, Tuple, List, Dict, Any
 from dataclasses import dataclass
 import numpy as np
 import logging
+from concurrent.futures import Future
 
 from ..detection.tracker import TrackedHand, TrackingState
 from .delaunay import DelaunayTriangulator, TriangleMesh
@@ -86,6 +88,9 @@ class LODMeshGenerator:
         self.cache_timestamp = 0.0
         self.mesh_update_regions = []
         
+        # Async triangulation future (CPU heavy) – P-PERF-002
+        self._pending_future: Optional[Future] = None
+        
         # パフォーマンス統計
         self.stats = {
             'total_updates': 0,
@@ -140,13 +145,43 @@ class LODMeshGenerator:
             logger.warning(f"Insufficient points after LOD filtering: {len(filtered_points)}")
             return self.cached_mesh
         
+        # ---- Global cap to avoid CPU overload (P-PERF-002) ----
+        global_cap = self.config.max_points_per_lod * 3  # high+medium+low approx.
+        if len(filtered_points) > global_cap:
+            # Random uniform subsample – reproducible using default_rng
+            rng = np.random.default_rng(12345)
+            idx = rng.choice(filtered_points.shape[0], size=global_cap, replace=False)
+            filtered_points = filtered_points[idx]
+            logger.debug("LODMeshGenerator: Downsampled to %d points (cap)", global_cap)
+        
         # 三角分割実行
         tri_start = time.perf_counter()
         try:
+            # Heavy CPU path: use async if GPU unavailable and many points
+            if (
+                not self.triangulator.use_gpu
+                and len(filtered_points) > self.config.max_points_per_lod * 2
+            ):
+                if self._pending_future is None:
+                    self._pending_future = self.triangulator.triangulate_points_async(filtered_points)
+                    logger.debug("LODMeshGenerator: Triangulation offloaded async (%d pts)", len(filtered_points))
+                # Return last cached mesh until future ready
+                return self.cached_mesh
+
             mesh = self.triangulator.triangulate_points(filtered_points)
+
             tri_time = (time.perf_counter() - tri_start) * 1000
             
-            # キャッシュ更新
+            # キャッシュ更新 (旧メッシュを確実に解放) – T-MESH-104
+            if self.cached_mesh is not None:
+                try:
+                    del self.cached_mesh  # remove strong ref
+                except Exception:
+                    pass
+                # 不要参照クリア
+                self.mesh_update_regions.clear()
+                gc.collect()
+
             self.cached_mesh = mesh
             self.cache_timestamp = current_time
             self.last_hand_positions = [hand.position.copy() for hand in tracked_hands]

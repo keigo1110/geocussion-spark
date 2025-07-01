@@ -230,11 +230,17 @@ class DelaunayTriangulator:
         if len(rows) == 0:
             return np.empty((0, 3), dtype=np.float32)
 
-        # グリッド座標から世界座標 (X, Y) へ一括変換
+        # グリッド座標から世界座標 (X, Y/Z) へ一括変換 – plane に応じて反転方法を切替
         min_x, _, min_y, _ = heightmap.bounds
         world_x = min_x + cols * heightmap.resolution
-        world_y = min_y + (height - 1 - rows) * heightmap.resolution # Y軸の向きを考慮
-        
+
+        if getattr(heightmap, "plane", "xy") == "xy":
+            # 上下反転: 行0が max_y
+            world_y = min_y + (height - 1 - rows) * heightmap.resolution
+        else:
+            # xz / yz 投影の場合は反転不要（行は奥行方向 or 高さ方向）
+            world_y = min_y + rows * heightmap.resolution
+
         # Z座標（高さ）を取得
         world_z = heightmap.heights[rows, cols]
         
@@ -479,6 +485,22 @@ class DelaunayTriangulator:
             'last_num_triangles': 0,
             'last_quality_score': 0.0
         }
+
+    # ------------------------------------------------------------------
+    # Async helper (P-PERF-002)
+    # ------------------------------------------------------------------
+
+    _EXECUTOR = None  # class-level ThreadPoolExecutor
+
+    def triangulate_points_async(self, points: np.ndarray):  # type: ignore[return-value]
+        """非同期に triangulate_points() を実行し Future を返す。"""
+        from concurrent.futures import ThreadPoolExecutor
+
+        if DelaunayTriangulator._EXECUTOR is None:
+            # Lazy init – limit to 2 workers to avoid CPU thrash
+            DelaunayTriangulator._EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="triangulator")
+
+        return DelaunayTriangulator._EXECUTOR.submit(self.triangulate_points, points)
 
 
 # 便利関数

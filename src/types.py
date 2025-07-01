@@ -70,16 +70,38 @@ class OBFormat(Enum):
 
 @dataclass
 class FrameData:
-    """フレームデータ構造"""
-    depth_image: np.ndarray
-    color_data: Optional[np.ndarray] = None
-    timestamp: float = 0.0
+    """フレームデータ構造（Orbbec SDK互換）"""
+    depth_frame: Optional[Any] = None
+    color_frame: Optional[Any] = None
+    timestamp_ms: float = 0.0
     frame_number: int = 0
+    points: Optional[np.ndarray] = None  # 点群データ
     
     @property
     def has_color(self) -> bool:
         """カラーデータが存在するか"""
-        return self.color_data is not None
+        return self.color_frame is not None
+    
+    # 後方互換性のためのプロパティ
+    @property
+    def depth_image(self) -> Optional[np.ndarray]:
+        """深度画像データ（後方互換性）"""
+        if self.depth_frame is None:
+            return None
+        # OrbbecフレームからNumPy配列を取得する処理を想定
+        return getattr(self.depth_frame, 'get_data', lambda: None)()
+    
+    @property
+    def color_data(self) -> Optional[np.ndarray]:
+        """カラーデータ（後方互換性）"""
+        if self.color_frame is None:
+            return None
+        return getattr(self.color_frame, 'get_data', lambda: None)()
+    
+    @property
+    def timestamp(self) -> float:
+        """タイムスタンプ（秒）"""
+        return self.timestamp_ms / 1000.0
 
 
 @dataclass
@@ -112,22 +134,114 @@ class CameraIntrinsics:
 
 class HandednessType(Enum):
     """手の種類"""
-    LEFT = "left"
-    RIGHT = "right"
-    UNKNOWN = "unknown"
+    LEFT = "Left"
+    RIGHT = "Right"
+    UNKNOWN = "Unknown"
 
 
 class TrackingState(Enum):
     """トラッキング状態"""
-    DETECTING = "detecting"
+    INITIALIZING = "initializing"
     TRACKING = "tracking"
     LOST = "lost"
-    STABLE = "stable"
+    TERMINATED = "terminated"
+
+
+@dataclass
+class HandLandmark:
+    """手のランドマーク座標"""
+    x: float  # 0-1の正規化座標
+    y: float  # 0-1の正規化座標
+    z: float  # 深度情報（相対値）
+    visibility: float = 1.0  # 可視性スコア
+
+
+@dataclass
+class HandROI:
+    """手領域の矩形情報"""
+    x: int
+    y: int
+    width: int
+    height: int
+    confidence: float = 1.0
+    last_updated_frame: int = 0
+    hand_id: str = ""
+    
+    @property
+    def bbox(self) -> Tuple[int, int, int, int]:
+        """OpenCV tracker用のバウンディングボックス (x, y, w, h)"""
+        return (self.x, self.y, self.width, self.height)
+    
+    @property
+    def center(self) -> Tuple[int, int]:
+        """矩形の中心座標"""
+        return (self.x + self.width // 2, self.y + self.height // 2)
+    
+    def area(self) -> int:
+        """矩形の面積"""
+        return self.width * self.height
+
+
+@dataclass
+class HandDetectionResult:
+    """手検出結果"""
+    id: str  # 手のID（トラッキング用）
+    landmarks: List[HandLandmark]
+    handedness: HandednessType
+    confidence: float
+    bounding_box: Tuple[int, int, int, int]  # (x, y, width, height)
+    timestamp_ms: float
+    is_tracked: bool = False  # ROIトラッキングで生成されたかどうか
+    
+    @property
+    def center_point(self) -> Tuple[float, float]:
+        """手の中心点を計算"""
+        if not self.landmarks:
+            return (0.0, 0.0)
+        avg_x = sum(lm.x for lm in self.landmarks) / len(self.landmarks)
+        avg_y = sum(lm.y for lm in self.landmarks) / len(self.landmarks)
+        return (avg_x, avg_y)
+    
+    @property
+    def palm_center(self) -> Tuple[float, float]:
+        """手のひら中心を計算（ランドマーク0, 5, 9, 13, 17の平均）"""
+        if len(self.landmarks) < 21:
+            return self.center_point
+        palm_indices = [0, 5, 9, 13, 17]  # 手首・各指の付け根
+        avg_x = sum(self.landmarks[i].x for i in palm_indices) / len(palm_indices)
+        avg_y = sum(self.landmarks[i].y for i in palm_indices) / len(palm_indices)
+        return (avg_x, avg_y)
+
+
+@dataclass
+class ROITrackingStats:
+    """ROIトラッキング統計情報"""
+    total_frames: int = 0
+    mediapipe_executions: int = 0
+    tracking_successes: int = 0
+    tracking_failures: int = 0
+    total_tracking_time_ms: float = 0.0
+    total_mediapipe_time_ms: float = 0.0
+    
+    @property
+    def skip_ratio(self) -> float:
+        """MediaPipe スキップ率"""
+        if self.total_frames == 0:
+            return 0.0
+        return 1.0 - (self.mediapipe_executions / self.total_frames)
+    
+    @property
+    def success_rate(self) -> float:
+        """トラッキング成功率"""
+        total_attempts = self.tracking_successes + self.tracking_failures
+        if total_attempts == 0:
+            return 0.0
+        return self.tracking_successes / total_attempts
 
 
 @dataclass
 class Hand2D:
-    """2D手検出結果"""
+    """2D手検出結果（レガシー互換）"""
     landmarks: np.ndarray  # (21, 2) MediaPipe landmarks
     handedness: HandednessType
     confidence: float
@@ -136,7 +250,7 @@ class Hand2D:
 
 @dataclass
 class Hand3D:
-    """3D手情報"""
+    """3D手情報（レガシー互換）"""
     landmarks_3d: np.ndarray  # (21, 3) 3D landmarks
     position: np.ndarray      # (3,) 手の中心位置
     velocity: np.ndarray      # (3,) 速度ベクトル

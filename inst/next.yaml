@@ -1,0 +1,44 @@
+- id: P-MEM-001
+  title: "長時間実行でのフリーズ／メモリリーク疑惑"
+  module: ["demo_collision_detection.py", "src/mesh/pipeline.py", "src/input/pointcloud.py", "src/debug/profiler.py"]
+  severity: "Critical"
+  description: |
+    30 分以上連続稼働させると RSS が 3.5 GB 以上に増加し GUI がフリーズする。
+    GPU 無し環境でも再現。gc.collect() では回収されず、Python レベルの
+    オブジェクト参照が残っている可能性が高い。
+  symptoms:
+    • top / htop でメモリ使用量がフレームごとに徐々に増大。
+    • Open3D ビューワーの remove_geometry 直後でも Geometry 数が増え続ける。
+    • event_queue や hand position history が上限なく蓄積。
+  hypothesis:
+    • PointCloudConverter が ArrayPool に確保した ndarray を解放せず運用。
+    • MeshPipeline で cached_mesh の世代がリスト参照で残り続ける。
+    • CollisionEventQueue / _last_contact_trigger_time dict が肥大化 (キー永続)。
+    • Open3D TriangleMesh インスタンスが vis から削除後も Python 側参照が残り GC されない。
+  investigation_plan: |
+    1) tracemalloc で 10k フレーム分スナップショット比較しリーク箇所特定。
+    2) objgraph.show_growth(top=20) を 1000 フレームごとにログに出力。
+    3) Debug buildで resource.getrusage(RUSAGE_SELF).ru_maxrss を時系列記録。
+  fix_suggestion: |
+    • PointCloudConverter: ArrayPool に maxlen=4 の deque を導入し再利用バッファを上書き式に。
+    • MeshPipeline: _cached_mesh を weakref、世代管理リストを削除。
+    • CollisionEventQueue: pop_processed() を毎フレーム呼び FIFO 長さ <=256 に。 
+    • _last_contact_trigger_time を LRUDict(size=500) に変更。
+    • Open3D geometry は add/remove ではなく update_geometry_in_place を使用しインスタンス数一定化。
+  status: "TODO"
+
+- id: T-MEM-001
+  description: "Memory leak root-cause isolation & mitigation"
+  depends_on: [P-MEM-001]
+  steps:
+    - "1. src/debug/profiler.py に tracemalloc_logger(enable=True, interval=1000) を実装しリーク出力。"
+    - "2. PointCloudConverter.ArrayPool を capacity=4 の deque に置換し古いバッファを再利用。"
+    - "3. MeshPipeline.cached_mesh を weakref.ref に変更し世代リストを撤廃。"
+    - "4. CollisionEventQueue.pop_processed() を _process_collision_pipeline 後に必ず呼び出し。"
+    - "5. _last_contact_trigger_time を collections.OrderedDict + size guard 500 件で truncate。"
+    - "6. Open3D: vis.update_geometry(o3d_mesh, write=True) で Geometry 再利用し remove_geometry を廃止。"
+  acceptance_criteria:
+    - "1 時間連続稼働で RSS 上昇 < 150 MB。"
+    - "tracemalloc top diff に大幅な未解放 ndarray/mesh が無いこと。"
+    - "FPS 低下なし（±5% 以内）。"
+  status: "TODO"

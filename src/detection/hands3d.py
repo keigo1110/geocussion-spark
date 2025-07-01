@@ -13,13 +13,10 @@ import cv2
 from scipy import ndimage
 from scipy.interpolate import griddata
 
-# 入力フェーズからインポート
-import sys
-import os
-sys.path.append(os.path.join(os.path.dirname(__file__), '..', '..'))
+from ..types import CameraIntrinsics, HandDetectionResult, HandLandmark, HandednessType
+from src import get_logger
 
-from src.input.stream import CameraIntrinsics
-from .hands2d import HandDetectionResult, HandLandmark, HandednessType
+logger = get_logger(__name__)
 
 
 @dataclass
@@ -191,7 +188,7 @@ class Hand3DProjector:
             return result
             
         except Exception as e:
-            print(f"3D projection error: {e}")
+            logger.warning(f"3D projection error: {e}")
             return None
     
     def _preprocess_depth(self, depth_image: np.ndarray) -> np.ndarray:
@@ -393,8 +390,8 @@ class Hand3DProjector:
         
         batch_time = (time.perf_counter() - batch_start_time) * 1000
         if hands_2d:
-            print(f"Batch 3D projection: {len(hands_2d)} hands in {batch_time:.1f}ms "
-                  f"({batch_time/len(hands_2d):.1f}ms/hand) -> {len(results)} successful")
+            logger.debug(f"Batch 3D projection: {len(hands_2d)} hands in {batch_time:.1f}ms "
+                        f"({batch_time/len(hands_2d):.1f}ms/hand) -> {len(results)} successful")
         
         return results
     
@@ -482,5 +479,7 @@ def create_mock_hand_3d_result() -> Hand3DResult:
         landmarks_3d=[tuple(lm.position) for lm in landmarks_3d],
         palm_center_3d=(0.1, 0.0, 0.8),
         handedness=HandednessType.RIGHT,
-        confidence=0.85
+        confidence=0.85,
+        confidence_2d=0.85,
+        confidence_3d=0.85
     ) 

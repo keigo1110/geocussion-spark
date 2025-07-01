@@ -13,12 +13,6 @@ from typing import Dict, List, Optional, Callable, Any
 from enum import Enum
 import numpy as np
 
-try:
-    import pyo
-except ImportError:
-    print("Warning: pyo not available. Audio synthesis will be disabled.")
-    pyo = None
-
 # 他フェーズとの連携
 from .mapping import AudioParameters, InstrumentType
 from ..config import get_config, AudioConfig as GlobalAudioConfig
@@ -26,6 +20,13 @@ from ..resource_manager import ManagedResource, get_resource_manager
 from .. import get_logger
 
 logger = get_logger(__name__)
+
+try:
+    import pyo
+    from pyo import Biquadx, ButLP
+except ImportError:
+    logger.warning("pyo not available. Audio synthesis will be disabled.")
+    pyo = None
 
 
 class EngineState(Enum):
@@ -144,7 +145,7 @@ class AudioSynthesizer(ManagedResource):
             成功したかどうか
         """
         if pyo is None:
-            print("Error: pyo is not available")
+            logger.error("pyo is not available")
             self.state = EngineState.ERROR
             return False
         
@@ -169,11 +170,11 @@ class AudioSynthesizer(ManagedResource):
             self._initialize_effects()
             
             self.state = EngineState.RUNNING
-            print(f"Audio engine started successfully. Latency: {self.config.latency_ms:.1f}ms")
+            logger.info(f"Audio engine started successfully. Latency: {self.config.latency_ms:.1f}ms")
             return True
             
         except Exception as e:
-            print(f"Failed to start audio engine: {e}")
+            logger.exception(f"Failed to start audio engine: {e}")
             self.state = EngineState.ERROR
             return False
     
@@ -281,7 +282,7 @@ class AudioSynthesizer(ManagedResource):
                 return voice_id
                 
             except Exception as e:
-                print(f"Error playing audio: {e}")
+                logger.exception(f"Error playing audio: {e}")
                 return None
     
     def stop_voice(self, voice_id: str):
@@ -303,14 +304,14 @@ class AudioSynthesizer(ManagedResource):
                         if hasattr(voice, 'out'):
                             voice.out(0)  # 出力を停止
                     except Exception as e:
-                        print(f"[VOICE-STOP] Error stopping pyo voice: {e}")
+                        logger.error(f"Error stopping pyo voice: {e}")
                 
                 # 管理から削除
                 del self.active_voices[voice_id]
                 self.stats['active_voices_count'] = len(self.active_voices)
                 
             except Exception as e:
-                print(f"[VOICE-STOP] Error stopping voice {voice_id}: {e}")
+                logger.exception(f"Error stopping voice {voice_id}: {e}")
                 # エラーでも削除を試行
                 try:
                     if voice_id in self.active_voices:
@@ -347,19 +348,21 @@ class AudioSynthesizer(ManagedResource):
             return
         
         try:
-            # リバーブエフェクト (後で入力を渡すファクトリとして保持)
-            self.reverb = lambda inp: pyo.Freeverb(
-                inp,
-                size=0.8,
-                damp=0.6,
-                bal=self.config.reverb_level
-            )
+            # Pre-EQ (high-shelf −6 dB @ 8 kHz) then Freeverb
+            def _reverb_chain(inp):
+                try:
+                    eq = pyo.Biquadx(inp, freq=8000, q=0.707, type=5, gain=-6)
+                except Exception:
+                    eq = inp
+                return pyo.Freeverb(eq, size=0.8, damp=0.6, bal=self.config.reverb_level)
+
+            self.reverb = _reverb_chain
             
             # サーバーのマスターボリュームを設定
             self.server.setAmp(self.config.master_volume)
             
         except Exception as e:
-            print(f"Error initializing effects: {e}")
+            logger.exception(f"Error initializing effects: {e}")
     
     def _create_instrument_template(self, instrument_type: InstrumentType) -> Dict:
         """楽器テンプレートを作成"""
@@ -369,7 +372,7 @@ class AudioSynthesizer(ManagedResource):
                 'oscillator_type': 'fm',
                 'carrier_ratio': 1.0,
                 'modulator_ratio': 4.0,
-                'modulation_index': 2.5,
+                'modulation_index': 1.2,
                 'decay_curve': 'exponential'
             },
             
@@ -385,7 +388,7 @@ class AudioSynthesizer(ManagedResource):
                 'oscillator_type': 'fm',
                 'carrier_ratio': 1.0,
                 'modulator_ratio': 3.14,
-                'modulation_index': 2.0,
+                'modulation_index': 1.0,
                 'decay_curve': 'exponential'
             },
             
@@ -455,8 +458,8 @@ class AudioSynthesizer(ManagedResource):
             # 楽器に応じたオシレーター生成
             oscillator = self._create_oscillator(params, instrument_template, freq)
             
-            # 音量適用（型変換確実に）
-            voice = oscillator * envelope * float(params.velocity)
+            # 音量適用 + 基準ゲイン
+            voice = oscillator * envelope * float(params.velocity) * float(getattr(params, "gain", 1.0))
             
             # パンニング適用（型変換を確実に）
             if self.enable_spatial_audio and self.config.channels == 2:
@@ -465,6 +468,13 @@ class AudioSynthesizer(ManagedResource):
             # エフェクト適用（型変換確実に）
             if self.enable_effects and self.reverb:
                 reverb_send = voice * float(params.reverb)
+
+                # Alias reduction: low-pass reverb send at 10 kHz
+                try:
+                    reverb_send = pyo.Biquadx(reverb_send, freq=10000, q=0.707, type=0, stages=2)
+                except Exception:
+                    pass
+
                 reverb_out = self.reverb(reverb_send)
                 voice = voice + reverb_out
             
@@ -472,10 +482,20 @@ class AudioSynthesizer(ManagedResource):
             voice.out()
             envelope.play()
             
+            # --- Global Limiter (simple hard clip) ------------------------
+            try:
+                if not hasattr(self, "_global_limiter"):
+                    # Create a compressor/limiter on server out when first voice created
+                    self._global_limiter = pyo.Clip(
+                        self.server.getOutput(), min=-0.95, max=0.95
+                    ).out()
+            except Exception:
+                pass
+            
             return voice
             
         except Exception as e:
-            print(f"Error creating voice: {e}")
+            logger.exception(f"Error creating voice: {e}")
             return None
     
     def _create_oscillator(self, params: AudioParameters, template: Dict, freq: float) -> Any:
@@ -487,7 +507,8 @@ class AudioSynthesizer(ManagedResource):
             return pyo.Sine(freq=freq)
             
         elif osc_type == 'saw':
-            return pyo.Saw(freq=freq)
+            saw = pyo.Saw(freq=freq)
+            return ButLP(saw, freq=8000)
             
         elif osc_type == 'fm':
             carrier_ratio = template.get('carrier_ratio', 1.0)
@@ -495,10 +516,13 @@ class AudioSynthesizer(ManagedResource):
             mod_index = template.get('modulation_index', 1.0)
             
             modulator = pyo.Sine(freq=freq * modulator_ratio)
-            return pyo.Sine(freq=freq * carrier_ratio + modulator * mod_index)
+            fm = pyo.Sine(freq=freq * carrier_ratio + modulator * mod_index)
+            # Anti-alias: low-pass at 8 kHz
+            return Biquadx(fm, freq=8000, q=0.707, type=0)
             
         elif osc_type == 'noise':
-            return pyo.Noise()
+            noi = pyo.Noise()
+            return ButLP(noi, freq=8000)
             
         elif osc_type == 'karplus_strong':
             return pyo.Pluck(
@@ -536,16 +560,28 @@ class AudioSynthesizer(ManagedResource):
                         # 時間計算エラーの場合も削除
                         finished_voices.append(voice_id)
             except Exception as e:
-                print(f"[SYNTH-CLEANUP] Error during voice scan: {e}")
-                return
+                logger.debug(f"Error during voice scan: {e}")
+                voices_to_remove = []
+                for voice_id, voice_data in list(self.active_voices.items()):
+                    if voice_data is None:
+                        voices_to_remove.append(voice_id)
+                        continue
+                    
+                    try:
+                        elapsed = time.perf_counter() - voice_data['start_time']
+                        duration = voice_data.get('duration', 1.0)
+                        if elapsed >= duration + 0.1:  # 100ms余裕
+                            voices_to_remove.append(voice_id)
+                    except Exception:
+                        # 時間計算エラーの場合も削除
+                        voices_to_remove.append(voice_id)
         
-        # 2. ロック外で安全に停止
-        if finished_voices:
-            for voice_id in finished_voices:
-                try:
-                    self.stop_voice(voice_id)
-                except Exception as e:
-                    print(f"[SYNTH-CLEANUP] Error stopping voice {voice_id}: {e}")
+        # 問題のあるボイスを削除
+        for voice_id in voices_to_remove:
+            try:
+                self.stop_voice(voice_id)
+            except Exception as e:
+                logger.error(f"Error stopping voice {voice_id}: {e}")
     
     def get_performance_stats(self) -> dict:
         """パフォーマンス統計取得"""

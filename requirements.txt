@@ -54,8 +54,9 @@ types-setuptools>=69.0.0
 # For GPU mesh generation acceleration (20-40x speedup)
 
 # Orbbec Camera SDK
-# Note: pyorbbecsdk requires manual installation from the included directory
-# Run: pip install ./pyorbbecsdk/install/lib/
+# Note: Using vendor version to avoid name conflicts
+# Future: migrate to official pyorbbecsdk==2.0.10 package
+pyorbbecsdk==2.0.10  # Placeholder for future external dependency
 
 # ===================================================================
 # Python Version Requirement

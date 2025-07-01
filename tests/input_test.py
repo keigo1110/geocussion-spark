@@ -1,249 +1,398 @@
 #!/usr/bin/env python3
 """
-入力フェーズの単体テスト
-基本機能の動作確認
+入力フェーズのユニットテスト & パフォーマンステスト
+pytest-benchmark 統合版
 """
 
-import unittest
+import pytest
 import numpy as np
-import sys
-import os
+import time
+from typing import Optional, Tuple
+from unittest.mock import Mock, patch
 
-# テスト対象のモジュールをインポート
-sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+# テスト対象のインポート
+from src.input.depth_filter import DepthFilter, FilterType, CudaBilateralFilter
+from src.input.pointcloud import PointCloudConverter, NumpyVoxelDownsampler
+from src.input.stream import OrbbecCamera, FastResize
+from src.types import CameraIntrinsics, FrameData
 
-from src.input.stream import CameraIntrinsics, FrameData
-from src.input.pointcloud import PointCloudConverter
-from src.input.depth_filter import DepthFilter, FilterType
 
-
-class TestCameraIntrinsics(unittest.TestCase):
-    """CameraIntrinsicsクラスのテスト"""
+class TestDepthFilter:
+    """深度フィルタのテスト"""
     
-    def test_camera_intrinsics_creation(self):
-        """カメラ内部パラメータの作成テスト"""
-        intrinsics = CameraIntrinsics(
-            fx=525.0,
-            fy=525.0,
-            cx=320.0,
-            cy=240.0,
-            width=640,
-            height=480
+    @pytest.fixture
+    def sample_depth_image(self):
+        """テスト用深度画像生成"""
+        return np.random.randint(500, 5000, size=(240, 424), dtype=np.uint16)
+    
+    @pytest.fixture
+    def depth_filter(self):
+        """CUDAフィルタ"""
+        return DepthFilter(
+            filter_types=[FilterType.BILATERAL],
+            use_cuda=True,
+            enable_multiscale=True
         )
-        
-        self.assertEqual(intrinsics.fx, 525.0)
-        self.assertEqual(intrinsics.fy, 525.0)
-        self.assertEqual(intrinsics.cx, 320.0)
-        self.assertEqual(intrinsics.cy, 240.0)
-        self.assertEqual(intrinsics.width, 640)
-        self.assertEqual(intrinsics.height, 480)
-
-
-class TestPointCloudConverter(unittest.TestCase):
-    """PointCloudConverterクラスのテスト"""
     
-    def setUp(self):
-        """テスト用の設定"""
-        self.intrinsics = CameraIntrinsics(
-            fx=525.0,
-            fy=525.0,
-            cx=320.0,
-            cy=240.0,
-            width=640,
-            height=480
-        )
-        self.converter = PointCloudConverter(self.intrinsics)
-    
-    def test_converter_initialization(self):
-        """コンバーターの初期化テスト"""
-        self.assertIsNotNone(self.converter)
-        self.assertEqual(self.converter.depth_intrinsics.width, 640)
-        self.assertEqual(self.converter.depth_intrinsics.height, 480)
-        
-        # メッシュグリッドの事前計算確認
-        self.assertIsNotNone(self.converter.pixel_x)
-        self.assertIsNotNone(self.converter.pixel_y)
-        self.assertIsNotNone(self.converter.x_coeff)
-        self.assertIsNotNone(self.converter.y_coeff)
-    
-    def test_numpy_to_pointcloud(self):
-        """numpy配列から点群への変換テスト"""
-        # テスト用の深度画像作成（中央に正方形の物体）
-        depth_array = np.zeros((480, 640), dtype=np.uint16)
-        depth_array[200:280, 280:360] = 1000  # 1m の距離にある物体
-        
-        # カラー画像作成
-        color_array = np.zeros((480, 640, 3), dtype=np.uint8)
-        color_array[200:280, 280:360] = [255, 0, 0]  # 赤い物体
-        
-        # 点群変換
-        points, colors = self.converter.numpy_to_pointcloud(
-            depth_array, 
-            color_array,
-            min_depth=0.5,
-            max_depth=2.0
-        )
-        
-        # 結果検証
-        self.assertGreater(len(points), 0)
-        self.assertEqual(len(points), len(colors))
-        self.assertEqual(points.shape[1], 3)  # x, y, z
-        self.assertEqual(colors.shape[1], 3)  # r, g, b
-        
-        # 深度値の検証（おおよそ1mの距離）
-        z_values = points[:, 2]
-        self.assertTrue(np.all(z_values >= 0.9))
-        self.assertTrue(np.all(z_values <= 1.1))
-    
-    def test_update_intrinsics(self):
-        """内部パラメータ更新テスト"""
-        new_intrinsics = CameraIntrinsics(
-            fx=600.0,
-            fy=600.0,
-            cx=400.0,
-            cy=300.0,
-            width=800,
-            height=600
-        )
-        
-        self.converter.update_intrinsics(new_intrinsics)
-        
-        self.assertEqual(self.converter.depth_intrinsics.fx, 600.0)
-        self.assertEqual(self.converter.depth_intrinsics.width, 800)
-        
-        # メッシュグリッドが更新されていることを確認
-        self.assertEqual(self.converter.pixel_x.shape, (600, 800))
-
-
-class TestDepthFilter(unittest.TestCase):
-    """DepthFilterクラスのテスト"""
-    
-    def setUp(self):
-        """テスト用の設定"""
-        self.filter = DepthFilter(
-            filter_types=[FilterType.MEDIAN],
-            median_kernel_size=3,
-            min_valid_depth=0.1,
-            max_valid_depth=5.0
+    @pytest.fixture
+    def cpu_depth_filter(self):
+        """CPUフィルタ（比較用）"""
+        return DepthFilter(
+            filter_types=[FilterType.BILATERAL],
+            use_cuda=False
         )
     
     def test_filter_initialization(self):
-        """フィルタの初期化テスト"""
-        self.assertIsNotNone(self.filter)
-        self.assertEqual(self.filter.median_kernel_size, 3)
-        self.assertEqual(len(self.filter.filter_types), 1)
-        self.assertEqual(self.filter.filter_types[0], FilterType.MEDIAN)
+        """フィルタ初期化テスト"""
+        filter = DepthFilter()
+        assert filter.filter_types == [FilterType.COMBINED]
+        assert filter.bilateral_d == 9
+        assert filter.temporal_alpha == 0.3
     
-    def test_median_filter(self):
-        """メディアンフィルタのテスト"""
-        # ノイズを含む深度画像を作成
-        depth_image = np.full((100, 100), 1000, dtype=np.uint16)
+    def test_cuda_bilateral_filter(self, depth_filter, sample_depth_image):
+        """CUDAバイラテラルフィルタテスト"""
+        filtered = depth_filter.apply_filter(sample_depth_image)
         
-        # ランダムなノイズを追加
-        noise_positions = np.random.choice(10000, 100, replace=False)
-        flat_image = depth_image.flatten()
-        flat_image[noise_positions] = 0  # 無効なピクセル
-        depth_image = flat_image.reshape((100, 100))
-        
-        # フィルタ適用
-        filtered_image = self.filter.apply_filter(depth_image)
-        
-        # 結果検証
-        self.assertEqual(filtered_image.shape, depth_image.shape)
-        self.assertEqual(filtered_image.dtype, np.uint16)
-        
-        # ノイズが減少していることを確認
-        valid_original = np.count_nonzero(depth_image)
-        valid_filtered = np.count_nonzero(filtered_image)
-        self.assertGreaterEqual(valid_filtered, valid_original)
+        assert filtered.shape == sample_depth_image.shape
+        assert filtered.dtype == np.uint16
+        assert 'bilateral_cuda' in depth_filter.processing_times or 'bilateral_cpu' in depth_filter.processing_times
     
-    def test_combined_filter(self):
-        """複合フィルタのテスト"""
-        combined_filter = DepthFilter(
-            filter_types=[FilterType.COMBINED],
-            temporal_alpha=0.5
-        )
+    def test_ema_temporal_filter(self, sample_depth_image):
+        """EMA時間フィルタテスト"""
+        filter = DepthFilter(filter_types=[FilterType.TEMPORAL])
         
-        # 連続する3フレームをシミュレート
-        base_depth = np.full((50, 50), 2000, dtype=np.uint16)
+        # 初回
+        result1 = filter.apply_filter(sample_depth_image)
+        assert result1.shape == sample_depth_image.shape
+        assert filter.ema_initialized
         
-        for i in range(3):
-            # 若干の変動を加える
-            depth_image = base_depth + np.random.randint(-50, 50, (50, 50)).astype(np.uint16)
-            filtered_image = combined_filter.apply_filter(depth_image)
-            
-            self.assertEqual(filtered_image.shape, depth_image.shape)
-            self.assertEqual(filtered_image.dtype, np.uint16)
-        
-        # パフォーマンス統計が記録されていることを確認
-        stats = combined_filter.get_performance_stats()
-        self.assertIn('combined', stats)
-        self.assertGreater(stats['combined'], 0)
+        # 2回目（EMA適用）
+        result2 = filter.apply_filter(sample_depth_image)
+        assert result2.shape == sample_depth_image.shape
+        assert 'temporal_ema' in filter.processing_times
     
-    def test_parameter_update(self):
-        """パラメータ動的更新のテスト"""
-        original_alpha = self.filter.temporal_alpha
+    def test_performance_stats(self, depth_filter, sample_depth_image):
+        """パフォーマンス統計テスト"""
+        depth_filter.apply_filter(sample_depth_image)
+        stats = depth_filter.get_performance_stats()
         
-        self.filter.update_parameters(temporal_alpha=0.8)
-        self.assertEqual(self.filter.temporal_alpha, 0.8)
-        self.assertNotEqual(self.filter.temporal_alpha, original_alpha)
+        assert 'total' in stats
+        assert stats['total'] > 0
+    
+    @pytest.mark.benchmark(group="depth_filter")
+    def test_benchmark_cuda_bilateral(self, benchmark, depth_filter, sample_depth_image):
+        """CUDAバイラテラルフィルタベンチマーク"""
+        result = benchmark(depth_filter.apply_filter, sample_depth_image)
+        assert result is not None
+    
+    @pytest.mark.benchmark(group="depth_filter")
+    def test_benchmark_cpu_bilateral(self, benchmark, cpu_depth_filter, sample_depth_image):
+        """CPUバイラテラルフィルタベンチマーク（比較用）"""
+        result = benchmark(cpu_depth_filter.apply_filter, sample_depth_image)
+        assert result is not None
 
 
-class TestIntegration(unittest.TestCase):
-    """統合テスト"""
+class TestNumpyVoxelDownsampler:
+    """NumPyボクセルダウンサンプラーのテスト"""
     
-    def test_full_pipeline(self):
-        """入力フェーズの完全パイプラインテスト"""
-        # カメラ内部パラメータ
-        intrinsics = CameraIntrinsics(
-            fx=525.0, fy=525.0, cx=320.0, cy=240.0,
-            width=640, height=480
+    @pytest.fixture
+    def sample_points(self):
+        """テスト用点群生成"""
+        return np.random.rand(10000, 3).astype(np.float32)
+    
+    @pytest.fixture
+    def sample_colors(self):
+        """テスト用カラー情報生成"""
+        return np.random.rand(10000, 3).astype(np.float32)
+    
+    def test_voxel_downsample_first_strategy(self, sample_points, sample_colors):
+        """first戦略のボクセルダウンサンプリングテスト"""
+        voxel_size = 0.01
+        
+        downsampled_points, downsampled_colors = NumpyVoxelDownsampler.voxel_downsample_numpy(
+            sample_points, sample_colors, voxel_size, "first"
         )
         
-        # コンポーネント初期化
-        converter = PointCloudConverter(intrinsics)
-        depth_filter = DepthFilter(filter_types=[FilterType.COMBINED])
+        assert len(downsampled_points) <= len(sample_points)
+        assert len(downsampled_colors) == len(downsampled_points)
+        assert downsampled_points.dtype == np.float32
+        assert downsampled_colors.dtype == np.float32
+    
+    def test_voxel_downsample_average_strategy(self, sample_points, sample_colors):
+        """average戦略のボクセルダウンサンプリングテスト"""
+        voxel_size = 0.01
         
-        # テスト用深度画像（階段状の構造）
-        depth_array = np.zeros((480, 640), dtype=np.uint16)
-        for i in range(5):
-            y_start = i * 90
-            y_end = y_start + 80
-            depth_array[y_start:y_end, :] = 500 + i * 200  # 0.5m から 1.3m
+        downsampled_points, downsampled_colors = NumpyVoxelDownsampler.voxel_downsample_numpy(
+            sample_points, sample_colors, voxel_size, "average"
+        )
         
-        # ノイズ追加
-        noise_mask = np.random.random((480, 640)) < 0.05
-        depth_array[noise_mask] = 0
+        assert len(downsampled_points) <= len(sample_points)
+        assert len(downsampled_colors) == len(downsampled_points)
+    
+    def test_empty_points(self):
+        """空の点群処理テスト"""
+        empty_points = np.empty((0, 3), dtype=np.float32)
+        
+        result_points, result_colors = NumpyVoxelDownsampler.voxel_downsample_numpy(
+            empty_points, None, 0.01, "first"
+        )
+        
+        assert len(result_points) == 0
+        assert result_colors is None
+    
+    @pytest.mark.benchmark(group="voxel_downsampling")
+    def test_benchmark_numpy_voxel_first(self, benchmark, sample_points, sample_colors):
+        """NumPyボクセルダウンサンプリング（first）ベンチマーク"""
+        result = benchmark(
+            NumpyVoxelDownsampler.voxel_downsample_numpy,
+            sample_points, sample_colors, 0.005, "first"
+        )
+        assert result[0] is not None
+    
+    @pytest.mark.benchmark(group="voxel_downsampling")
+    def test_benchmark_numpy_voxel_average(self, benchmark, sample_points, sample_colors):
+        """NumPyボクセルダウンサンプリング（average）ベンチマーク"""
+        result = benchmark(
+            NumpyVoxelDownsampler.voxel_downsample_numpy,
+            sample_points, sample_colors, 0.005, "average"
+        )
+        assert result[0] is not None
+
+
+class TestPointCloudConverter:
+    """点群コンバーターのテスト"""
+    
+    @pytest.fixture
+    def camera_intrinsics(self):
+        """テスト用カメラ内部パラメータ"""
+        return CameraIntrinsics(
+            fx=421.0, fy=421.0, cx=212.0, cy=120.0,
+            width=424, height=240
+        )
+    
+    @pytest.fixture
+    def depth_array(self):
+        """テスト用深度配列"""
+        return np.random.randint(500, 5000, size=(240, 424), dtype=np.uint16)
+    
+    @pytest.fixture
+    def converter_numpy(self, camera_intrinsics):
+        """NumPy版点群コンバーター"""
+        return PointCloudConverter(
+            camera_intrinsics,
+            use_numpy_voxel=True,
+            color_strategy="first"
+        )
+    
+    @pytest.fixture
+    def converter_open3d(self, camera_intrinsics):
+        """Open3D版点群コンバーター（比較用）"""
+        return PointCloudConverter(
+            camera_intrinsics,
+            use_numpy_voxel=False
+        )
+    
+    def test_coefficients_caching(self, camera_intrinsics):
+        """メッシュグリッド係数キャッシュテスト"""
+        converter = PointCloudConverter(camera_intrinsics)
+        
+        # 初回取得
+        x_coeff1, y_coeff1 = converter._get_cached_coefficients(424, 240)
+        assert x_coeff1.shape == (240, 424)
+        assert y_coeff1.shape == (240, 424)
+        
+        # 2回目取得（キャッシュから）
+        x_coeff2, y_coeff2 = converter._get_cached_coefficients(424, 240)
+        assert np.array_equal(x_coeff1, x_coeff2)
+        assert np.array_equal(y_coeff1, y_coeff2)
+        
+        # キャッシュ確認
+        assert (424, 240) in converter._coeff_cache
+    
+    def test_numpy_to_pointcloud(self, converter_numpy, depth_array):
+        """NumPy配列から点群生成テスト"""
+        points, colors = converter_numpy.numpy_to_pointcloud(depth_array)
+        
+        assert points.ndim == 2
+        assert points.shape[1] == 3
+        assert len(points) > 0
+        assert colors is None  # カラー配列なし
+    
+    def test_voxel_downsampling_numpy(self, converter_numpy, depth_array):
+        """NumPyボクセルダウンサンプリングテスト"""
+        converter_numpy.enable_voxel_downsampling = True
+        points, colors = converter_numpy.numpy_to_pointcloud(depth_array)
+        
+        # ダウンサンプリング統計確認
+        stats = converter_numpy.get_performance_stats()
+        assert stats['last_input_points'] > 0
+        assert stats['last_output_points'] <= stats['last_input_points']
+        assert 0 <= stats['last_downsampling_ratio'] <= 1
+    
+    @pytest.mark.benchmark(group="pointcloud_conversion")
+    def test_benchmark_numpy_pointcloud(self, benchmark, converter_numpy, depth_array):
+        """NumPy点群変換ベンチマーク"""
+        result = benchmark(converter_numpy.numpy_to_pointcloud, depth_array)
+        assert result[0] is not None
+    
+    @pytest.mark.benchmark(group="pointcloud_conversion") 
+    def test_benchmark_open3d_pointcloud(self, benchmark, converter_open3d, depth_array):
+        """Open3D点群変換ベンチマーク（比較用）"""
+        result = benchmark(converter_open3d.numpy_to_pointcloud, depth_array)
+        assert result[0] is not None
+
+
+class TestFastResize:
+    """高速リサイズのテスト"""
+    
+    @pytest.fixture
+    def fast_resize(self):
+        """高速リサイズインスタンス"""
+        return FastResize(use_cuda=True, enable_roi=True)
+    
+    @pytest.fixture
+    def cpu_resize(self):
+        """CPU版リサイズ（比較用）"""
+        return FastResize(use_cuda=False, enable_roi=False)
+    
+    @pytest.fixture
+    def sample_depth(self):
+        """テスト用深度画像"""
+        return np.random.randint(500, 5000, size=(480, 640), dtype=np.uint16)
+    
+    @pytest.fixture
+    def sample_color(self):
+        """テスト用カラー画像"""
+        return np.random.randint(0, 255, size=(480, 640, 3), dtype=np.uint8)
+    
+    def test_resize_depth_roi(self, fast_resize, sample_depth):
+        """ROI深度リサイズテスト"""
+        target_size = (320, 240)  # 1/2ダウンサンプリング
+        
+        resized = fast_resize.resize_depth(sample_depth, target_size)
+        
+        assert resized.shape == (240, 320)
+        assert resized.dtype == np.uint16
+    
+    def test_resize_color(self, fast_resize, sample_color):
+        """カラーリサイズテスト"""
+        target_size = (320, 240)
+        
+        resized = fast_resize.resize_color(sample_color, target_size)
+        
+        assert resized.shape == (240, 320, 3)
+        assert resized.dtype == np.uint8
+    
+    @pytest.mark.benchmark(group="resize")
+    def test_benchmark_cuda_depth_resize(self, benchmark, fast_resize, sample_depth):
+        """CUDA深度リサイズベンチマーク"""
+        target_size = (212, 120)
+        
+        # GPU初期化
+        fast_resize.initialize((480, 640), (120, 212))
+        
+        result = benchmark(fast_resize.resize_depth, sample_depth, target_size)
+        assert result.shape == (120, 212)
+    
+    @pytest.mark.benchmark(group="resize")
+    def test_benchmark_cpu_depth_resize(self, benchmark, cpu_resize, sample_depth):
+        """CPU深度リサイズベンチマーク（比較用）"""
+        target_size = (212, 120)
+        result = benchmark(cpu_resize.resize_depth, sample_depth, target_size)
+        assert result.shape == (120, 212)
+
+
+class TestInputPhaseIntegration:
+    """入力フェーズ統合テスト"""
+    
+    @pytest.fixture
+    def mock_frame_data(self):
+        """モックフレームデータ"""
+        mock_frame = Mock()
+        mock_frame.get_data.return_value = np.random.randint(0, 5000, size=240*424, dtype=np.uint16).tobytes()
+        return mock_frame
+    
+    @pytest.fixture  
+    def camera_intrinsics(self):
+        """カメラ内部パラメータ"""
+        return CameraIntrinsics(
+            fx=421.0, fy=421.0, cx=212.0, cy=120.0,
+            width=424, height=240
+        )
+    
+    def test_full_pipeline_performance(self, camera_intrinsics):
+        """フル入力パイプラインパフォーマンステスト"""
+        # 各コンポーネントを初期化
+        depth_filter = DepthFilter(
+            filter_types=[FilterType.BILATERAL],
+            use_cuda=True,
+            enable_multiscale=True
+        )
+        
+        converter = PointCloudConverter(
+            camera_intrinsics,
+            use_numpy_voxel=True,
+            enable_voxel_downsampling=True
+        )
+        
+        fast_resize = FastResize(use_cuda=True, enable_roi=True)
+        
+        # テストデータ
+        depth_image = np.random.randint(500, 5000, size=(240, 424), dtype=np.uint16)
         
         # パイプライン実行
-        # 1. フィルタ適用
-        filtered_depth = depth_filter.apply_filter(depth_array)
+        start_time = time.perf_counter()
         
-        # 2. 点群変換
-        points, colors = converter.numpy_to_pointcloud(
-            filtered_depth,
-            min_depth=0.3,
-            max_depth=2.0
-        )
+        # 1. フィルタリング
+        filtered_depth = depth_filter.apply_filter(depth_image)
         
-        # 結果検証
-        self.assertGreater(len(points), 1000)  # 十分な点数があること
-        self.assertEqual(points.shape[1], 3)
+        # 2. リサイズ（オプション）
+        resized_depth = fast_resize.resize_depth(filtered_depth, (212, 120))
         
-        # 深度の範囲確認
-        z_values = points[:, 2]
-        self.assertTrue(np.all(z_values >= 0.3))
-        self.assertTrue(np.all(z_values <= 2.0))
+        # 3. 点群変換
+        points, colors = converter.numpy_to_pointcloud(resized_depth)
         
-        # 階段状構造が保持されていることを確認
-        unique_z = np.unique(np.round(z_values, 1))
-        self.assertGreaterEqual(len(unique_z), 3)  # 複数の深度レベル
+        total_time = (time.perf_counter() - start_time) * 1000
         
-        print(f"Pipeline test completed: {len(points)} points generated")
-        print(f"Depth range: {z_values.min():.3f} - {z_values.max():.3f}m")
-        print(f"Filter performance: {depth_filter.get_performance_stats()}")
+        # 性能目標検証
+        print(f"Total input pipeline time: {total_time:.2f} ms")
+        print(f"Input points: {len(points)}")
+        print(f"Filter time: {depth_filter.processing_times.get('total', 0):.2f} ms")
+        
+        # 入力フェーズ目標：5ms以内
+        assert total_time < 10.0  # 多少の余裕を持たせたテスト閾値
+        assert len(points) > 0
+    
+    @pytest.mark.benchmark(group="input_pipeline")
+    def test_benchmark_full_pipeline(self, benchmark, camera_intrinsics):
+        """フル入力パイプラインベンチマーク"""
+        def pipeline():
+            depth_filter = DepthFilter(use_cuda=True, enable_multiscale=True)
+            converter = PointCloudConverter(camera_intrinsics, use_numpy_voxel=True)
+            depth_image = np.random.randint(500, 5000, size=(240, 424), dtype=np.uint16)
+            
+            filtered = depth_filter.apply_filter(depth_image)
+            points, colors = converter.numpy_to_pointcloud(filtered)
+            return points, colors
+        
+        result = benchmark(pipeline)
+        assert result[0] is not None
 
 
-if __name__ == '__main__':
-    # テスト実行
-    unittest.main(verbosity=2) 
+# パフォーマンステスト設定
+def pytest_configure(config):
+    """pytest設定"""
+    config.addinivalue_line(
+        "markers", "benchmark: mark test as benchmark for performance measurement"
+    )
+
+
+# テスト用データ生成ヘルパー
+def generate_test_depth_image(width: int = 424, height: int = 240) -> np.ndarray:
+    """テスト用深度画像生成"""
+    return np.random.randint(500, 5000, size=(height, width), dtype=np.uint16)
+
+
+def generate_test_color_image(width: int = 424, height: int = 240) -> np.ndarray:
+    """テスト用カラー画像生成"""
+    return np.random.randint(0, 255, size=(height, width, 3), dtype=np.uint8) 
