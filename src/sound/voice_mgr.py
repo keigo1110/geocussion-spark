@@ -152,8 +152,8 @@ class VoiceManager:
             'spatial_processing_time_ms': 0.0
         }
         
-        # スレッド安全性
-        self._lock = threading.Lock()
+        # スレッド安全性 (再入可能ロックでデッドロック回避)
+        self._lock = threading.RLock()
         
         logger.info(f"VoiceManager initialized: max_polyphony={max_polyphony}, strategy={steal_strategy.value}")
     

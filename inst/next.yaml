@@ -1,32 +1,48 @@
-version: "1.1"
+version: "1.2"
 last_updated: "2025-07-01"
-subject: "demo_collision_detection.py Issue Backlog"
+subject: "Audio layer – Buzzing noise instead of clean percussive taps"
 
 overview:
   summary: |
-    Consolidated backlog of defects / improvement items for Geocussion-SP demo.
-    Added new entry DEMO-010 addressing missed collision on brief taps (percussion-like interactions).
+    Tapping collisions still produce a sand-storm / buzzing sound instead of a single
+    percussive note.  The quick ADSR tweak (DEMO-011) improved duration but did not
+    eliminate the noise.  Investigation below isolates three technical causes and
+    proposes targeted fixes.
 
 issues:
-  - id: DEMO-010-TAP-MISSED
-    title: "Brief Tap Gestures Not Registered as Collisions"
+  - id: DEMO-012-BUZZ-NOISE
+    title: "Stacked voices & envelope misuse cause continuous buzzing"
     root_cause: |
-      Current collision pipeline requires the hand-sphere to overlap at least two consecutive frames.
-      For fast taps (≈50-100 ms contact) the sequence often becomes:
-        1. Frame-n: hand above mesh, distance > radius
-        2. Frame-n+1: hand penetrates mesh but mesh update or BVH query still uses old terrain (due to
-           `mesh_update_interval` & `max_mesh_skip_frames`) or `search_result.distances` > 2×radius filter
-        3. Frame-n+2: hand already left contact zone
-      Additionally, sphere radius (default 5 cm) may be too small relative to single-frame noise, and
-      temporal filtering on hand position can lag behind rapid movement, causing the sphere to "jump over"
-      narrow peaks.
-    impact: "Percussive interactions feel unresponsive; user must linger to trigger sound."
+      Field tests show every video frame that reports a collision emits a new note.
+      With ~20 fps this piles up >200 overlapping FM/Noise voices within one second,
+      saturating the output bus and driving Freeverb into distortion → perceived
+      "ジリジリ" static.
+
+      Detailed findings:
+        1. _audio_cooldown_time is 150 ms but predictive-history loop often creates
+           unique CollisionEvent IDs for the *same* physical tap every frame →
+           cooldown bypassed → frame-by-frame re-trigger.
+        2. VoiceManager.cleanup_finished_voices() is called only every 10 frames and
+           relies on estimated_remaining_time.  When sustain=0 the internal ADSR
+           envelope still keeps the voice object alive until `release` finishes,
+           so for a 0.6 s release tens of voices overlap.
+        3. Instrument templates (FM, Noise) have no per-voice gain scaling; raw
+           oscillator level × velocity can exceed 0 dBFS, and the sum of many such
+           voices clips even before reverb.
+    impact: "Audio output is dominated by clipping noise; clean percussion is masked."
     proposed_action: |
-      • Insert predictive/lag compensation: extrapolate hand trajectory and test both current & previous
-        positions within collision stage (mini motion buffer of last 3 frames).
-      • Reduce mesh update latency when no hands present by forcing update if vertical velocity > threshold.
-      • Parameter tweak: allow single-frame collision by removing `search_result.distances > radius*2` early
-        exit and lowering `collision_tolerance`.
-      • Adaptive sphere radius: expand radius for high-speed hands (based on |velocity|) to account for
-        motion blur between frames.
-      • Add unit test in `tests/collision_test.py` simulating 90 ms tap with synthetic point cloud.
+      • Collision de-bounce
+        – Store last_event_hash per hand; suppress new audio if same contact triangle
+          within 120 ms (configurable).
+      • ADSR auto-stop
+        – After allocating a voice, schedule VoiceManager.deallocate_voice() with
+          delay=(attack+decay+release)+50 ms when sustain==0 to guarantee voice
+          cleanup even if cleanup_finished_voices() is skipped.
+      • Gain staging
+        – Add `gain` field to AudioParameters; default 0.3 for high-energy FM/Noise.
+        – Scale oscillator output (e.g., pyo.Sine.mul) by gain, NOT velocity.
+        – Implement global limiter (pyo.Compress or pyo.Clip) after mix bus to
+          cap peaks at −3 dBFS.
+      • Tests
+        – tests/sound_test.py::test_percussive_tap ensures RMS stays < −6 dBFS and
+          voice count < 16 after a single tap burst.
