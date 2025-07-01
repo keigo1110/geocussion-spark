@@ -2186,6 +2186,10 @@ class FullPipelineViewer(DualViewer):
                            f"Simplification: {simplification_time:.1f}ms "
                            f"(Total: {total_mesh_time:.1f}ms)")
             
+            # 法線・属性再計算 (T-MESH-103)
+            from src.mesh.utils import rebuild_mesh_postprocess
+            simplified_mesh = rebuild_mesh_postprocess(simplified_mesh)
+            
             return simplified_mesh
             
         except Exception as e:
