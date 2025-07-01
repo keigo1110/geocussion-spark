@@ -380,7 +380,9 @@ class FullPipelineViewer(DualViewer):
         # 音響クールダウン管理
         self.audio_cooldown_time = DEFAULT_AUDIO_COOLDOWN_TIME
         self.last_audio_trigger_time = {}
-        
+        # 衝突デバウンス用: (hand_id, triangle_idx) -> last trigger time
+        self._last_contact_trigger_time: Dict[Tuple[str, int], float] = {}
+    
         # 手検出コンポーネント
         self.enable_hand_detection = True
         self.enable_hand_tracking = True
@@ -1701,6 +1703,10 @@ class FullPipelineViewer(DualViewer):
                 if not self._check_audio_cooldown(event.hand_id, current_time):
                     continue
                 
+                # デバウンス: 同じ手+三角形は 250ms 以内に再トリガしない
+                if not self._check_contact_debounce(event):
+                    continue
+                
                 # 音響パラメータマッピング
                 audio_params = self.audio_mapper.map_collision_event(event)
                 
@@ -1719,6 +1725,8 @@ class FullPipelineViewer(DualViewer):
                     notes_played += 1
                     self.last_audio_trigger_time[event.hand_id] = current_time
                     logger.debug(f"[AUDIO-TRIGGER] Hand {event.hand_id}: Note triggered")
+                    # 記録
+                    self._last_contact_trigger_time[(event.hand_id, event.triangle_index)] = current_time
             
             except Exception as e:
                 logger.error(f"音響生成エラー（イベント: {event.event_id}）: {e}")
@@ -1741,6 +1749,14 @@ class FullPipelineViewer(DualViewer):
             logger.debug(f"[AUDIO-COOLDOWN] Hand {hand_id}: {time_since_last*1000:.1f}ms since last trigger")
             return False
         
+        return True
+    
+    def _check_contact_debounce(self, event: Any) -> bool:
+        """手ID+三角形ID 単位で250msデバウンス"""
+        key = (event.hand_id, event.triangle_index)
+        last_t = self._last_contact_trigger_time.get(key, 0.0)
+        if (time.perf_counter() - last_t) < 0.25:  # 250 ms
+            return False
         return True
     
     def _get_spatial_position(self, event: Any) -> np.ndarray:

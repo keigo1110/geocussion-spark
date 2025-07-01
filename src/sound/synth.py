@@ -369,7 +369,7 @@ class AudioSynthesizer(ManagedResource):
                 'oscillator_type': 'fm',
                 'carrier_ratio': 1.0,
                 'modulator_ratio': 4.0,
-                'modulation_index': 2.5,
+                'modulation_index': 1.2,
                 'decay_curve': 'exponential'
             },
             
@@ -385,7 +385,7 @@ class AudioSynthesizer(ManagedResource):
                 'oscillator_type': 'fm',
                 'carrier_ratio': 1.0,
                 'modulator_ratio': 3.14,
-                'modulation_index': 2.0,
+                'modulation_index': 1.0,
                 'decay_curve': 'exponential'
             },
             
@@ -465,6 +465,13 @@ class AudioSynthesizer(ManagedResource):
             # エフェクト適用（型変換確実に）
             if self.enable_effects and self.reverb:
                 reverb_send = voice * float(params.reverb)
+
+                # Alias reduction: low-pass reverb send at 10 kHz
+                try:
+                    reverb_send = pyo.Biquadx(reverb_send, freq=10000, q=0.707, type=0, stages=2)
+                except Exception:
+                    pass
+
                 reverb_out = self.reverb(reverb_send)
                 voice = voice + reverb_out
             

@@ -187,7 +187,13 @@ class VoiceManager:
                     audio_params = self._apply_spatial_processing(audio_params, spatial_position)
                 
                 # ポリフォニー制限チェック
-                if len(self.active_voices) >= self.max_polyphony:
+                cur_poly = len(self.active_voices)
+
+                # Guard rail: if 80% polyphony and new note quiet, skip
+                if cur_poly >= int(self.max_polyphony * 0.8) and audio_params.velocity < 0.8:
+                    return None
+
+                if cur_poly >= self.max_polyphony:
                     stolen_voice_id = self._steal_voice(audio_params, priority)
                     if stolen_voice_id is None:
                         return None  # スティールに失敗
