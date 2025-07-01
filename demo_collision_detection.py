@@ -1422,11 +1422,36 @@ class FullPipelineViewer(DualViewer):
         """フレームデータから深度画像を抽出"""
         try:
             if self.camera is None or self.camera.depth_intrinsics is None:
+                # --------------------------------------------------------------
+                # Determine frame dimensions in a robust manner
+                # --------------------------------------------------------------
+                df = frame_data.depth_frame
+                width = None
+                height = None
+
+                # Newer pyorbbecsdk versions expose width/height attributes
+                if hasattr(df, "width") and hasattr(df, "height"):
+                    width = int(df.width)
+                    height = int(df.height)
+                # Older versions expose getter functions
+                elif hasattr(df, "get_width") and hasattr(df, "get_height"):
+                    try:
+                        width = int(df.get_width())
+                        height = int(df.get_height())
+                    except Exception:  # pragma: no cover – defensive
+                        width, height = None, None
+
+                if width is None or height is None:
+                    logger.warning("DepthFrame size unavailable – defaulting to 424x240")
+                    width, height = 424, 240
+
                 from src.input.pointcloud import _create_default_intrinsics  # local import
-                logger.warning("depth_intrinsics is None – using fallback intrinsics")
-                fallback_intr = _create_default_intrinsics(frame_data.depth_frame.shape[1], frame_data.depth_frame.shape[0]) if 'frame_data' in locals() else _create_default_intrinsics()
+                logger.warning("depth_intrinsics is None – using fallback intrinsics (%dx%d)", width, height)
+                fallback_intr = _create_default_intrinsics(width, height)
+
                 if self.camera is not None:
                     self.camera.depth_intrinsics = fallback_intr  # type: ignore[attr-defined]
+
                 intr = fallback_intr
             else:
                 intr = self.camera.depth_intrinsics
