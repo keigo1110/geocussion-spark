@@ -25,6 +25,11 @@ class ProjectionMethod(Enum):
     DENSITY = "density"         # 各グリッドセルの点密度
 
 
+# ---------------------------------------------------------------------------
+# Data structures
+# ---------------------------------------------------------------------------
+
+
 @dataclass
 class HeightMap:
     """ハイトマップデータ構造"""
@@ -33,6 +38,7 @@ class HeightMap:
     bounds: Tuple[float, float, float, float]  # (min_x, max_x, min_y, max_y)
     resolution: float            # グリッド解像度 (m/pixel)
     valid_mask: np.ndarray      # 有効ピクセルマスク (H, W)
+    plane: str = "xy"           # 投影平面 (xy/xz/yz)
     
     @property
     def shape(self) -> Tuple[int, int]:
@@ -187,7 +193,8 @@ class PointCloudProjector:
             densities=densities,
             bounds=bounds,
             resolution=self.resolution,
-            valid_mask=valid_pixels
+            valid_mask=valid_pixels,
+            plane=self.plane
         )
     
     def _create_heightmap(

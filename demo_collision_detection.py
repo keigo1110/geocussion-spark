@@ -48,7 +48,7 @@ logger = logging.getLogger(__name__)
 # OrbbecSDKの動的インポート
 HAS_ORBBEC_SDK = False
 try:
-    # type: ignore-next-line
+    # type: ignore[import]
     from pyorbbecsdk import Pipeline, FrameSet, Config, OBSensorType, OBError, OBFormat
     HAS_ORBBEC_SDK = True
     logger.info("OrbbecSDK is available")
@@ -151,7 +151,8 @@ from src.debug.dual_viewer import DualViewer
 from src.input.depth_filter import DepthFilter, FilterType
 from src.input.pointcloud import PointCloudConverter
 from src.config import get_config, InputConfig
-from src.mesh.pipeline import create_mesh_pipeline  # NEW unified mesh pipeline
+from src.mesh.pipeline import create_mesh_pipeline  # unified mesh pipeline
+from src.mesh.manager import PipelineManager  # NEW pipeline manager
 
 # GPU加速コンポーネントの動的インポート
 HAS_GPU_ACCELERATION = False
@@ -371,7 +372,7 @@ class FullPipelineViewer(DualViewer):
         self.spatial_index: Optional[SpatialIndex] = None
         self.collision_searcher: Optional[CollisionSearcher] = None
         self.collision_tester: Optional[SphereTriangleCollision] = None
-        self.event_queue = CollisionEventQueue()
+        self.event_queue: CollisionEventQueue = CollisionEventQueue()
         
         # 音響生成コンポーネント
         self.audio_mapper: Optional[AudioMapper] = None
@@ -383,7 +384,8 @@ class FullPipelineViewer(DualViewer):
         self.audio_cooldown_time = DEFAULT_AUDIO_COOLDOWN_TIME
         self.last_audio_trigger_time = {}
         # 衝突デバウンス用: (hand_id, triangle_idx) -> last trigger time
-        self._last_contact_trigger_time: Dict[Tuple[str, int], float] = {}
+        from typing import Tuple as _Tuple
+        self._last_contact_trigger_time: Dict[_Tuple[str, int, int, int], float] = {}
     
         # 手検出コンポーネント
         self.enable_hand_detection = True
@@ -417,6 +419,8 @@ class FullPipelineViewer(DualViewer):
 
         # 統合 MeshPipeline
         self.mesh_pipeline = create_mesh_pipeline(enable_incremental=False)
+        self.pipeline_manager = PipelineManager(self.mesh_pipeline)
+        self._mesh_version = -1  # track version for viewer refresh
     
     def _initialize_hand_detection(self):
         """手検出コンポーネントを初期化"""
@@ -448,6 +452,10 @@ class FullPipelineViewer(DualViewer):
         # メッシュとコリジョンの可視化オブジェクト
         self.mesh_geometries = []
         self.collision_geometries = []
+        
+        # 直近の点群 / 深度フレームを保持
+        self._last_points_3d: Optional[np.ndarray] = None
+        self._latest_depth_image: Optional[np.ndarray] = None
     
     def _initialize_performance_stats(self):
         """パフォーマンス統計を初期化"""
@@ -775,27 +783,27 @@ class FullPipelineViewer(DualViewer):
             start_t = time.perf_counter()
 
             # MeshPipeline に委譲
-            triangle_mesh = self.mesh_pipeline.generate_mesh(
+            mesh_res = self.mesh_pipeline.generate_mesh(
                 points_3d,
                 self.current_tracked_hands,
                 force_update=getattr(self, 'force_mesh_update_requested', False),
             )
 
-            if triangle_mesh is None:
+            if mesh_res.mesh is None:
                 return  # 生成失敗 / ポイント不足
 
-            simplified_mesh = triangle_mesh  # MeshPipeline 内で簡略化済み
+            simplified_mesh = mesh_res.mesh  # MeshPipeline 内で簡略化済み
 
             gen_ms = (time.perf_counter() - start_t) * 1000.0
             if self.frame_counter % 50 == 0:
                 logger.debug("[MESH-PIPELINE] %d points -> %d tris in %.1fms", len(points_3d), simplified_mesh.num_triangles, gen_ms)
 
-            # 空間インデックス構築
-            self.spatial_index = SpatialIndex(simplified_mesh, index_type=IndexType.BVH)
-            
-            # 衝突検出コンポーネント初期化
-            self.collision_searcher = CollisionSearcher(self.spatial_index)
-            self.collision_tester = SphereTriangleCollision(simplified_mesh)
+            # 空間インデックスは「メッシュが変わったとき」のみ再構築
+            if mesh_res.changed or self.spatial_index is None:
+                self.spatial_index = SpatialIndex(simplified_mesh, index_type=IndexType.BVH)
+                # 衝突検出コンポーネント初期化 / 更新
+                self.collision_searcher = CollisionSearcher(self.spatial_index)
+                self.collision_tester = SphereTriangleCollision(simplified_mesh)
             
             # メッシュ保存
             self.current_mesh = simplified_mesh
@@ -803,8 +811,9 @@ class FullPipelineViewer(DualViewer):
             # メッシュ範囲のログ出力
             self._log_mesh_info(simplified_mesh)
             
-            # 可視化更新
-            self._update_mesh_visualization(simplified_mesh)
+            # 可視化: mesh_res.needs_refresh または mesh_res.changed
+            if mesh_res.needs_refresh or mesh_res.changed:
+                self._update_mesh_visualization(simplified_mesh)
             
             # 強制更新フラグをリセット
             if hasattr(self, 'force_mesh_update_requested'):
@@ -1103,6 +1112,13 @@ class FullPipelineViewer(DualViewer):
             
             self.mesh_geometries.extend([o3d_mesh, wireframe])
             
+            # -- Open3D バッファ更新 (T-MESH-106) --
+            try:
+                self.vis.update_geometry(o3d_mesh)
+                self.vis.update_geometry(wireframe)
+            except Exception as _exc:  # pylint: disable=broad-except
+                logger.debug("Open3D update_geometry failed: %s", _exc)
+            
         except Exception as e:
             logger.error(f"メッシュ可視化エラー: {e}")
     
@@ -1289,6 +1305,9 @@ class FullPipelineViewer(DualViewer):
         # フィルタ適用
         depth_image = self._apply_depth_filter(depth_image)
         
+        # 最新深度をキャッシュ
+        self._latest_depth_image = depth_image
+        
         # 点群生成
         points_3d = self._generate_point_cloud_if_needed(depth_image)
         
@@ -1384,14 +1403,14 @@ class FullPipelineViewer(DualViewer):
     def _extract_depth_image(self, frame_data: Any) -> Optional[np.ndarray]:
         """フレームデータから深度画像を抽出"""
         try:
-            depth_data = np.frombuffer(frame_data.depth_frame.get_data(), dtype=np.uint16)
-            if self.camera.depth_intrinsics is not None:
-                return depth_data.reshape(
-                    (self.camera.depth_intrinsics.height, self.camera.depth_intrinsics.width)
-                )
-            else:
-                logger.warning("Depth intrinsics not available")
+            if self.camera is None or self.camera.depth_intrinsics is None:
+                logger.warning("Camera or depth intrinsics not available")
                 return None
+
+            depth_data = np.frombuffer(frame_data.depth_frame.get_data(), dtype=np.uint16)
+            return depth_data.reshape(
+                (self.camera.depth_intrinsics.height, self.camera.depth_intrinsics.width)
+            )
         except Exception as e:
             logger.error(f"Failed to extract depth image: {e}")
             return None
@@ -1399,7 +1418,7 @@ class FullPipelineViewer(DualViewer):
     def _extract_color_image(self, frame_data: Any) -> Optional[np.ndarray]:
         """フレームデータからカラー画像を抽出"""
         try:
-            if frame_data.color_frame is None or not self.camera.has_color:
+            if frame_data.color_frame is None or self.camera is None or not getattr(self.camera, "has_color", False):
                 return None
             
             color_data = np.frombuffer(frame_data.color_frame.get_data(), dtype=np.uint8)
@@ -1422,15 +1441,21 @@ class FullPipelineViewer(DualViewer):
             self.performance_stats['filter_time'] = 0.0
             return depth_image
     
-    def _generate_point_cloud_if_needed(self, depth_image: np.ndarray) -> Optional[np.ndarray]:
+    def _generate_point_cloud_if_needed(self, depth_image: np.ndarray, *, force: bool = False) -> Optional[np.ndarray]:
         """必要に応じて点群を生成"""
-        need_points_for_mesh = (self.enable_mesh_generation and 
-                               self.frame_count - self.last_mesh_update >= self.mesh_update_interval)
+        need_points_for_mesh = force or (
+            self.enable_mesh_generation and 
+            (self.frame_count - self.last_mesh_update >= self.mesh_update_interval)
+        )
         
         if self.pointcloud_converter and (self.frame_count % self.update_interval == 0 or need_points_for_mesh):
             pointcloud_start = time.perf_counter()
             points_3d, _ = self.pointcloud_converter.numpy_to_pointcloud(depth_image)
             self.performance_stats['pointcloud_time'] = (time.perf_counter() - pointcloud_start) * 1000
+            
+            # キャッシュ
+            if points_3d is not None:
+                self._last_points_3d = points_3d
             
             if need_points_for_mesh and points_3d is not None:
                 logger.info(f"[MESH-PREP] Frame {self.frame_count}: Generated {len(points_3d)} points for mesh update")
@@ -1530,9 +1555,23 @@ class FullPipelineViewer(DualViewer):
         self.frame_counter = self.frame_count
         collision_events = []
         
-        # メッシュ生成
-        if self._should_update_mesh(tracked_hands, points_3d):
-            self._perform_mesh_update(points_3d)
+        # Mesh update via PipelineManager (asynchronous-ready)
+        res = self.pipeline_manager.update_if_needed(points_3d, tracked_hands)
+
+        if res.mesh is not None and (
+            self._mesh_version != self.pipeline_manager.get_version()
+        ):
+            # Mesh changed or needs refresh
+            self.current_mesh = res.mesh
+            self._mesh_version = self.pipeline_manager.get_version()
+
+            # Rebuild index only when res.changed True
+            if res.changed or self.spatial_index is None:
+                self.spatial_index = SpatialIndex(res.mesh, index_type=IndexType.BVH)
+                self.collision_searcher = CollisionSearcher(self.spatial_index)
+                self.collision_tester = SphereTriangleCollision(res.mesh)
+
+            self._update_mesh_visualization(res.mesh)
         
         # 衝突検出
         if self.enable_collision_detection and self.current_mesh is not None and tracked_hands:
@@ -1559,7 +1598,10 @@ class FullPipelineViewer(DualViewer):
                 (frame_diff >= self.max_mesh_skip_frames) or
                 (self.current_mesh is None)
             ) and
-            points_3d is not None and len(points_3d) > 100
+            (
+                points_3d is not None
+                or self._last_points_3d is not None
+            )
         )
         
         # 診断ログ
@@ -1569,20 +1611,6 @@ class FullPipelineViewer(DualViewer):
                         f"condition={mesh_condition}")
         
         return mesh_condition
-    
-    def _perform_mesh_update(self, points_3d: np.ndarray) -> None:
-        """メッシュ更新を実行"""
-        mesh_start = time.perf_counter()
-        points_len = len(points_3d) if points_3d is not None else 0
-        logger.info(f"[MESH] Frame {self.frame_count}: *** UPDATING TERRAIN MESH *** with {points_len} points")
-        
-        self._update_terrain_mesh(points_3d)
-        self.last_mesh_update = self.frame_count
-        self.force_mesh_update_requested = False
-        
-        self.perf_stats['mesh_generation_time'] = (time.perf_counter() - mesh_start) * 1000
-        logger.info(f"[MESH] Frame {self.frame_count}: Mesh update completed in "
-                   f"{self.perf_stats['mesh_generation_time']:.1f}ms")
     
     def _perform_collision_detection(self, tracked_hands: List[TrackedHand]) -> List[Any]:
         """衝突検出を実行"""
@@ -1713,7 +1741,7 @@ class FullPipelineViewer(DualViewer):
                 if not self._check_audio_cooldown(event.hand_id, current_time):
                     continue
                 
-                # デバウンス: 同じ手+三角形は 250ms 以内に再トリガしない
+                # デバウンス
                 if not self._check_contact_debounce(event):
                     continue
                 
@@ -1735,8 +1763,11 @@ class FullPipelineViewer(DualViewer):
                     notes_played += 1
                     self.last_audio_trigger_time[event.hand_id] = current_time
                     logger.debug(f"[AUDIO-TRIGGER] Hand {event.hand_id}: Note triggered")
-                    # 記録
-                    self._last_contact_trigger_time[(event.hand_id, event.triangle_index)] = current_time
+                    # 記録 – debounce と同じキー形式 (hand_id, gx, gy, gz)
+                    gx = int(round(event.contact_position[0] * 50))
+                    gy = int(round(event.contact_position[1] * 50))
+                    gz = int(round(event.contact_position[2] * 50))
+                    self._last_contact_trigger_time[(event.hand_id, gx, gy, gz)] = current_time
             
             except Exception as e:
                 logger.error(f"音響生成エラー（イベント: {event.event_id}）: {e}")
@@ -1892,12 +1923,13 @@ class FullPipelineViewer(DualViewer):
     def _create_depth_visualization(self, depth_image: np.ndarray) -> np.ndarray:
         """深度画像の可視化を作成"""
         # Normalize depth to 0-255 and cast to 8-bit so that applyColorMap accepts it
+        assert depth_image is not None  # for mypy – guarded by caller
         depth_normalized = cv2.normalize(depth_image, None, 0, 255, cv2.NORM_MINMAX)
         depth_normalized = depth_normalized.astype(np.uint8)
         return cv2.applyColorMap(depth_normalized, cv2.COLORMAP_JET)
     
     def _process_color_image(self, frame_data: Any, hands_2d: List, hands_3d: List, 
-                           tracked_hands: List, collision_events: List) -> Optional[np.ndarray]:
+                           tracked_hands: List, collision_events: Optional[List[Any]]) -> Optional[np.ndarray]:
         """カラー画像を処理"""
         if frame_data.color_frame is None or not self.camera.has_color:
             return None
@@ -1969,7 +2001,7 @@ class FullPipelineViewer(DualViewer):
                        (10, image.shape[0] - 30),
                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
     
-    def _draw_collision_performance_info(self, image: np.ndarray, collision_events: List[Any]) -> None:
+    def _draw_collision_performance_info(self, image: np.ndarray, collision_events: Optional[List[Any]]) -> None:
         """衝突検出パフォーマンス情報を描画"""
         if not hasattr(self, 'perf_stats'):
             return
@@ -2100,14 +2132,14 @@ class FullPipelineViewer(DualViewer):
         print(f"🔊 音響ノート総数: {self.perf_stats.get('audio_notes_played', 0)}")
         
         # ROI トラッキング統計
-        if hasattr(self.hands_2d, 'get_roi_tracking_stats'):
+        if self.hands_2d is not None and hasattr(self.hands_2d, 'get_roi_tracking_stats'):
             self._display_roi_tracking_stats()
         
         print()
     
     def _display_roi_tracking_stats(self) -> None:
         """ROIトラッキング統計を表示"""
-        if hasattr(self.hands_2d, 'get_roi_tracking_stats'):
+        if self.hands_2d is not None and hasattr(self.hands_2d, 'get_roi_tracking_stats'):
             roi_stats = self.hands_2d.get_roi_tracking_stats()
             print(f"\n📊 ROI トラッキング統計:")
             print(f"   MediaPipe 実行: {roi_stats.mediapipe_executions}/{roi_stats.total_frames}")
@@ -2163,55 +2195,8 @@ class FullPipelineViewer(DualViewer):
         info_text = f"FPS: {fps:.1f} | Frame: {frame_time:.1f}ms"
         cv2.putText(image, info_text, (10, image.shape[0] - 10),
                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-        """点群表示処理（親クラスのメソッドをオーバーライド）"""
-        # 親クラスの実装を呼び出す（DualViewerで定義されているはず）
-        if hasattr(super(), '_process_pointcloud_display'):
-            return super()._process_pointcloud_display(frame_data)
-        
-        # 親クラスにメソッドがない場合はスキップ
-        return True
-        """従来方式でメッシュ生成（フォールバック用）"""
-        try:
-            import time
-            
-            # 点群投影
-            projection_start = time.perf_counter()
-            height_map = self.projector.project_points(points_3d)
-            projection_time = (time.perf_counter() - projection_start) * 1000
-            
-            # Delaunay三角分割
-            triangulation_start = time.perf_counter()
-            triangle_mesh = self.triangulator.triangulate_heightmap(height_map)
-            triangulation_time = (time.perf_counter() - triangulation_start) * 1000
-            
-            if triangle_mesh is None or triangle_mesh.num_triangles == 0:
-                return None
-            
-            # メッシュ簡略化
-            simplification_start = time.perf_counter()
-            simplified_mesh = self.simplifier.simplify_mesh(triangle_mesh)
-            simplification_time = (time.perf_counter() - simplification_start) * 1000
-            
-            if simplified_mesh is None:
-                simplified_mesh = triangle_mesh
-            
-            # 時間測定ログ
-            if hasattr(self, 'frame_counter') and self.frame_counter % 50 == 0:
-                total_mesh_time = projection_time + triangulation_time + simplification_time
-                logger.debug(f"[TRADITIONAL-MESH] Projection: {projection_time:.1f}ms, "
-                           f"Triangulation: {triangulation_time:.1f}ms, "
-                           f"Simplification: {simplification_time:.1f}ms "
-                           f"(Total: {total_mesh_time:.1f}ms)")
-            
-            # 法線・属性再計算 (T-MESH-103)
-            from src.mesh.utils import rebuild_mesh_postprocess
-            simplified_mesh = rebuild_mesh_postprocess(simplified_mesh)
-            
-            return simplified_mesh
-            
-        except Exception as e:
-            logger.error(f"従来方式メッシュ生成エラー: {e}")
-            return None
+        # ここで終了。追加の戻り値は不要 (-> None)
+        return
 
     # ---------------------------------------------------------------------
     # Fallback: traditional mesh generation (used when LOD generator fails)

@@ -15,7 +15,7 @@ can rely on a single entry point.
 """
 
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import List, Optional, Tuple
 import time
 import logging
 import numpy as np
@@ -52,6 +52,32 @@ class MeshPipelineStats:
         return self.total_time_ms / self.total_frames
 
 
+# ---------------------------------------------------------------------------
+# Public result container
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class MeshResult:
+    """Return type for MeshPipeline.generate_mesh().
+
+    Attributes
+    ----------
+    mesh : TriangleMesh | None
+        The triangle mesh returned by the pipeline.  *None* signals that
+        generation failed (e.g. not enough points).
+    changed : bool
+        True if a *new mesh* was generated during this call.  False when the
+        cached mesh was reused.
+    needs_refresh: bool
+        True if the mesh needs to be refreshed due to point cloud changes.
+    """
+
+    mesh: Optional[TriangleMesh]
+    changed: bool = False
+    needs_refresh: bool = False
+
+
 class MeshPipeline:  # pylint: disable=too-few-public-methods
     """Facade that hides mesh generation strategy details.
 
@@ -71,6 +97,14 @@ class MeshPipeline:  # pylint: disable=too-few-public-methods
         self._cached_mesh: Optional[TriangleMesh] = None
         self._stats = MeshPipelineStats()
 
+        # --- Point-cloud diff state (T-MESH-202 pre-work) ---
+        # Keep previous samples/hashes so that we can detect meaningful changes
+        # in successive calls.  All are initialised to *None* so that the first
+        # frame forces a regeneration and establishes the baseline state.
+        self._prev_sample: Optional[np.ndarray] = None
+        self._prev_vox_set: Optional[set[tuple[int, int, int]]] = None
+        self._prev_count: Optional[int] = None
+
     # ---------------------------------------------------------------------
     # Public API
     # ---------------------------------------------------------------------
@@ -79,7 +113,7 @@ class MeshPipeline:  # pylint: disable=too-few-public-methods
         points_3d: np.ndarray,
         tracked_hands: List[TrackedHand],
         force_update: bool = False,
-    ) -> Optional[TriangleMesh]:
+    ) -> MeshResult:
         """Return an up-to-date TriangleMesh or ``None`` if *points_3d* is empty.
 
         Parameters
@@ -92,7 +126,7 @@ class MeshPipeline:  # pylint: disable=too-few-public-methods
             Skip cache heuristics and recompute unconditionally.
         """
         if points_3d is None or len(points_3d) < 10:  # type: ignore[arg-type]
-            return self._cached_mesh
+            return MeshResult(self._cached_mesh, changed=False, needs_refresh=False)
 
         start = time.perf_counter()
 
@@ -100,12 +134,15 @@ class MeshPipeline:  # pylint: disable=too-few-public-methods
         selected_path = "cache"
         mesh: Optional[TriangleMesh] = None
 
+        refresh_due_to_diff = False
+
         if not force_update and self._cached_mesh is not None:
-            # 新アルゴリズム: 点群差分が小さい場合はキャッシュを返す (T-MESH-102)
-            if not self._is_significant_change(points_3d):
+            # 差分判定 (距離 + voxelHash + 点数変化)
+            significant, refresh_due_to_diff = self._evaluate_pointcloud_change(points_3d)
+            if not significant:
                 elapsed = (time.perf_counter() - start) * 1000.0
                 self._stats.record(elapsed, "cache")
-                return self._cached_mesh
+                return MeshResult(self._cached_mesh, changed=False, needs_refresh=refresh_due_to_diff)
 
         if force_update:
             # Explicit regeneration request
@@ -128,13 +165,17 @@ class MeshPipeline:  # pylint: disable=too-few-public-methods
 
         # Cache management
         if mesh is not None:
+            # Detect whether this mesh differs from cached one (object identity)
+            mesh_changed = mesh is not self._cached_mesh
             self._cached_mesh = mesh
         else:
             mesh = self._cached_mesh  # keep previous mesh if generation failed
+            mesh_changed = False
 
         elapsed = (time.perf_counter() - start) * 1000.0
         self._stats.record(elapsed, selected_path if selected_path else "cache")
-        return mesh
+
+        return MeshResult(mesh, changed=mesh_changed, needs_refresh=(refresh_due_to_diff or mesh_changed))
 
     # ------------------------------------------------------------------
     # Diagnostics helpers
@@ -148,36 +189,76 @@ class MeshPipeline:  # pylint: disable=too-few-public-methods
     # ------------------------------------------------------------------
 
     _SAMPLE_SIZE: int = 5000
-    _DIFF_THRESHOLD_M: float = 0.02  # 2 cm 平均距離で更新
+    _DIFF_THRESHOLD_M: float = 0.01  # stricter threshold (T-MESH-106)
 
-    _prev_sample: Optional[np.ndarray] = None
+    def _evaluate_pointcloud_change(self, points_3d: np.ndarray) -> Tuple[bool, bool]:
+        """Return (significant_change, needs_refresh_only).
 
-    def _is_significant_change(self, points_3d: np.ndarray) -> bool:
-        """Return *True* if *points_3d* is sufficiently different from last frame.
-
-        Implementation: take random sample (≤5k points) and compute mean Euclidean
-        distance to previous sample of equal size (aligned index-wise).  If the
-        mean exceeds ``_DIFF_THRESHOLD_M`` → deemed significant.
+        significant_change → mesh must be regenerated.
+        needs_refresh_only → cached mesh can stay but viewer should refresh.
         """
-        if points_3d.shape[0] < 10:
-            return False
 
-        # Sampling (repeatable within the same call not required)
+        # Metric A: mean distance on sampled points
+        significant = self._distance_based_change(points_3d)
+
+        # Metric B: voxel hash Jaccard distance
+        voxel_changed = self._voxel_hash_change(points_3d)
+
+        # Metric C: point count ratio
+        count_changed = self._count_change(points_3d)
+
+        # Decision
+        if significant or voxel_changed >= 0.05 or count_changed >= 0.10:
+            return True, False  # force regenerate
+
+        # If voxel hash changed moderately (>0.02) mark viewer refresh needed
+        needs_refresh = voxel_changed >= 0.02 or count_changed >= 0.05
+        return False, needs_refresh
+
+    def _distance_based_change(self, points_3d: np.ndarray) -> bool:
+        """Simple mean distance sample heuristic."""
         sample_size = min(self._SAMPLE_SIZE, len(points_3d))
         idx = np.random.choice(points_3d.shape[0], size=sample_size, replace=False)
         sample = points_3d[idx]
 
         if self._prev_sample is None or len(self._prev_sample) != sample_size:
             self._prev_sample = sample.copy()
-            return True  # first frame considered change
+            return True
 
-        # Compute mean distance between corresponding points (cheap heuristic)
         mean_dist = float(np.linalg.norm(sample - self._prev_sample, axis=1).mean())
-
-        # Update stored sample for next comparison
         self._prev_sample = sample.copy()
-
         return mean_dist > self._DIFF_THRESHOLD_M
+
+    def _voxel_hash_change(self, points_3d: np.ndarray) -> float:
+        try:
+            import numpy as _np
+        except ImportError:
+            return 0.0
+
+        vsz = 0.03
+        vox = _np.floor(points_3d / vsz).astype(_np.int32)
+        vox_set = { (int(x), int(y), int(z)) for x, y, z in vox }
+
+        if self._prev_vox_set is None:
+            self._prev_vox_set = vox_set
+            return 1.0  # treat as full change first time
+
+        inter = len(vox_set & self._prev_vox_set)
+        union = len(vox_set | self._prev_vox_set)
+        jaccard_dist = 1.0 - (inter / union) if union else 0.0
+
+        self._prev_vox_set = vox_set
+        return jaccard_dist
+
+    def _count_change(self, points_3d: np.ndarray) -> float:
+        curr = len(points_3d)
+        if self._prev_count is None or self._prev_count == 0:
+            self._prev_count = curr
+            return 1.0
+
+        diff_ratio = abs(curr - self._prev_count) / self._prev_count
+        self._prev_count = curr
+        return diff_ratio
 
 
 # ---------------------------------------------------------------------------
