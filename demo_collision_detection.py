@@ -1286,46 +1286,20 @@ class FullPipelineViewer(DualViewer):
         if self.camera is None:
             # ヘッドレスモード用モックデータ
             if self.headless_mode:
-                return self._create_mock_frame_data()
+                # 遅延でモックカメラを生成
+                from typing import cast, Any
+                from src.input.mock_camera import MockCamera
+
+                if not hasattr(self, "_mock_camera"):
+                    self._mock_camera = MockCamera(LOW_RESOLUTION[0], LOW_RESOLUTION[1])
+
+                # 型チェッカー対策で OrbbecCamera 互換として扱う
+                self.camera = cast(Any, self._mock_camera)
+                return self.camera.get_frame()
             logger.warning("Camera not available")
             return None
         
         return self.camera.get_frame(timeout_ms=100)
-    
-    def _create_mock_frame_data(self) -> Any:
-        """モックフレームデータを作成"""
-        from types import SimpleNamespace
-        
-        # モックカメラ内部パラメータを設定（初回のみ）
-        if not hasattr(self, '_mock_intrinsics_set'):
-            self.camera = SimpleNamespace()
-            self.camera.depth_intrinsics = SimpleNamespace()
-            self.camera.depth_intrinsics.width = LOW_RESOLUTION[0]
-            self.camera.depth_intrinsics.height = LOW_RESOLUTION[1]
-            self.camera.depth_intrinsics.fx = 364.0
-            self.camera.depth_intrinsics.fy = 364.0
-            self.camera.depth_intrinsics.cx = LOW_RESOLUTION[0] / 2
-            self.camera.depth_intrinsics.cy = LOW_RESOLUTION[1] / 2
-            self.camera.has_color = True
-            self._mock_intrinsics_set = True
-        
-        # モック深度フレーム
-        depth_frame = SimpleNamespace()
-        depth_data = np.random.randint(500, 2000, LOW_RESOLUTION[0] * LOW_RESOLUTION[1], dtype=np.uint16)
-        depth_frame.get_data = lambda: depth_data.tobytes()
-        
-        # モックカラーフレーム
-        color_frame = SimpleNamespace()
-        color_data = np.random.randint(0, 255, 480 * 640 * 3, dtype=np.uint8)
-        color_frame.get_data = lambda: color_data.tobytes()
-        color_frame.get_format = lambda: OBFormat.RGB
-        
-        # モックフレームデータ
-        frame_data = SimpleNamespace()
-        frame_data.depth_frame = depth_frame
-        frame_data.color_frame = color_frame
-        
-        return frame_data
     
     def _extract_images_from_frame(self, frame_data: Any) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
         """フレームデータから深度・カラー画像を抽出"""
@@ -1840,7 +1814,9 @@ class FullPipelineViewer(DualViewer):
     
     def _create_depth_visualization(self, depth_image: np.ndarray) -> np.ndarray:
         """深度画像の可視化を作成"""
-        depth_normalized = cv2.normalize(depth_image, None, 0, 255, cv2.NORM_MINMAX, dtype=cv2.CV_8U)
+        # Normalize depth to 0-255 and cast to 8-bit so that applyColorMap accepts it
+        depth_normalized = cv2.normalize(depth_image, None, 0, 255, cv2.NORM_MINMAX)
+        depth_normalized = depth_normalized.astype(np.uint8)
         return cv2.applyColorMap(depth_normalized, cv2.COLORMAP_JET)
     
     def _process_color_image(self, frame_data: Any, hands_2d: List, hands_3d: List, 
