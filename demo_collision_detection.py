@@ -1422,13 +1422,17 @@ class FullPipelineViewer(DualViewer):
         """フレームデータから深度画像を抽出"""
         try:
             if self.camera is None or self.camera.depth_intrinsics is None:
-                logger.warning("Camera or depth intrinsics not available")
-                return None
+                from src.input.pointcloud import _create_default_intrinsics  # local import
+                logger.warning("depth_intrinsics is None – using fallback intrinsics")
+                fallback_intr = _create_default_intrinsics(frame_data.depth_frame.shape[1], frame_data.depth_frame.shape[0]) if 'frame_data' in locals() else _create_default_intrinsics()
+                if self.camera is not None:
+                    self.camera.depth_intrinsics = fallback_intr  # type: ignore[attr-defined]
+                intr = fallback_intr
+            else:
+                intr = self.camera.depth_intrinsics
 
             depth_data = np.frombuffer(frame_data.depth_frame.get_data(), dtype=np.uint16)
-            return depth_data.reshape(
-                (self.camera.depth_intrinsics.height, self.camera.depth_intrinsics.width)
-            )
+            return depth_data.reshape((intr.height, intr.width))
         except Exception as e:
             logger.error(f"Failed to extract depth image: {e}")
             return None

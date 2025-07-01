@@ -23,6 +23,8 @@ class PipelineManager:
         self._cached_mesh: Optional[MeshResult] = None
         self._mesh_version: int = 0
         self._last_update_ts: float = 0.0
+        # Track whether hands were present in previous frame (P-HAND-003)
+        self._prev_hands_present: bool = False
 
     # ------------------------------------------------------------------
     def update_if_needed(
@@ -34,16 +36,19 @@ class PipelineManager:
     ) -> MeshResult:
         """Return up-to-date mesh (may be cached)."""
         now = time.perf_counter()
-        # ---------------- Hand gating (P-HAND-001) -----------------
-        if hands and self._cached_mesh is not None:
-            slow_hands = True
-            for h in hands:
-                vel = getattr(h, "velocity", None)
-                if vel is not None and np.linalg.norm(vel) > 0.05:
-                    slow_hands = False
-                    break
-            if slow_hands and not force:
+        # ---------------- Hand presence gating (P-HAND-003) ---------------
+        hands_present = bool(hands)
+
+        if hands_present:
+            # If any hand exists, postpone heavy regenerate to keep FPS high
+            self._prev_hands_present = True
+            if self._cached_mesh is not None and not force:
                 return self._cached_mesh
+        else:
+            # No hands this frame – if they were present before, force regenerate once
+            if self._prev_hands_present and not force:
+                force = True  # trigger one-shot update
+            self._prev_hands_present = False
 
         # Debounce heavy regenerate (<0.2 s)
         if not force and self._cached_mesh and (now - self._last_update_ts) < 0.2:
