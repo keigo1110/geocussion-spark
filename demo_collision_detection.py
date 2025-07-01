@@ -857,33 +857,47 @@ class FullPipelineViewer(DualViewer):
                 logger.debug(f"Hand {i} has no position")
                 continue
             
-            hand_pos_np = np.array(hand.position)
+            # Prepare list of positions to test: current + historical (predictive)
+            pos_history = self._hand_position_history.get(hand.id, [])
+            positions_to_test: List[np.ndarray] = [np.array(hand.position)] + [np.array(p) for p in pos_history]
+
+            # Remove duplicates while preserving order
+            seen = set()
+            unique_positions = []
+            for p in positions_to_test:
+                tup = tuple(np.round(p, 4))
+                if tup not in seen:
+                    seen.add(tup)
+                    unique_positions.append(p)
+
+            hand_pos_np = unique_positions[0]
+            
             logger.debug(f"Hand {i} position: ({hand_pos_np[0]:.3f}, {hand_pos_np[1]:.3f}, {hand_pos_np[2]:.3f})")
             
             try:
-                # 近傍三角形の検索
-                res = self.collision_searcher.search_near_hand(hand, override_radius=self.sphere_radius)
-                logger.debug(f"Hand {i} found {len(res.triangle_indices)} nearby triangles")
-                
-                if not res.triangle_indices:
-                    continue
-                
-                # 衝突テスト実行
-                info = self._perform_collision_test(
-                    hand_pos_np, self.sphere_radius, res, 
-                    use_gpu_distance, i
-                )
-                
-                logger.debug(f"Hand {i} collision test result: {info.has_collision}")
-                
-                # 衝突イベント生成
-                if info.has_collision:
-                    event = self._create_collision_event(hand, hand_pos_np, info)
-                    if event:
-                        events.append(event)
-                        self._update_collision_points(info)
-                        logger.debug(f"Hand {i} generated collision event with {len(info.contact_points)} contact points")
-                        
+                for ptest in unique_positions:
+                    # Adaptive radius: enlarge slightly based on velocity magnitude
+                    vel_mag = float(np.linalg.norm(getattr(hand, "velocity", np.zeros(3)))) if hasattr(hand, "velocity") else 0.0
+                    adaptive_radius = self.sphere_radius + min(0.03, vel_mag * 0.05)
+
+                    # Direct sphere query for the specific test point
+                    res = self.collision_searcher._search_point(ptest, adaptive_radius)
+
+                    if not res.triangle_indices:
+                        continue
+
+                    info = self._perform_collision_test(
+                        ptest, adaptive_radius, res, use_gpu_distance, i
+                    )
+
+                    if info and info.has_collision:
+                        event = self._create_collision_event(hand, ptest, info)
+                        if event:
+                            events.append(event)
+                            self._update_collision_points(info)
+                        # Found collision, break predictive loop
+                        break
+
             except Exception as e:
                 logger.error(f"Error processing hand {i}: {e}")
         
@@ -1474,6 +1488,28 @@ class FullPipelineViewer(DualViewer):
         self.current_hands_2d = hands_2d
         self.current_hands_3d = hands_3d
         self.current_tracked_hands = tracked_hands
+    
+        # --- Maintain short history for predictive collision (tap detection) ---
+        if not hasattr(self, "_hand_position_history"):
+            self._hand_position_history: Dict[str, List[np.ndarray]] = {}
+
+        # Update history per hand
+        active_ids = set()
+        for th in tracked_hands:
+            hid = th.id
+            active_ids.add(hid)
+            if hid not in self._hand_position_history:
+                self._hand_position_history[hid] = []
+            if th.position is not None:
+                self._hand_position_history[hid].append(np.array(th.position, dtype=float))
+            # Keep last 3 positions max
+            if len(self._hand_position_history[hid]) > 3:
+                self._hand_position_history[hid].pop(0)
+
+        # Remove stale hands from history
+        stale_ids = [hid for hid in self._hand_position_history.keys() if hid not in active_ids]
+        for hid in stale_ids:
+            del self._hand_position_history[hid]
     
     def _process_collision_pipeline(self, points_3d: Optional[np.ndarray], 
                                    tracked_hands: List[TrackedHand]) -> List[Any]:

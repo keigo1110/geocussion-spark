@@ -1,94 +1,32 @@
-version: "1.0"
+version: "1.1"
 last_updated: "2025-07-01"
-subject: "demo_collision_detection.py - Comprehensive Issue Report"
+subject: "demo_collision_detection.py Issue Backlog"
 
 overview:
   summary: |
-    This document captures all critical and non-critical defects currently present in demo_collision_detection.py.
-    The goal is to provide a consolidated, developer-friendly backlog that will guide the upcoming refactor/fix
-    phase.  Each entry contains a unique id, root cause description, impact, and suggested next action.
+    Consolidated backlog of defects / improvement items for Geocussion-SP demo.
+    Added new entry DEMO-010 addressing missed collision on brief taps (percussion-like interactions).
 
 issues:
-  # ──────────────────────────────────────────────────────────────────────────────
-  - id: DEMO-001-IMPORT-RESOLUTION
-    title: "Missing/Optional Dependencies – Import Errors"
+  - id: DEMO-010-TAP-MISSED
+    title: "Brief Tap Gestures Not Registered as Collisions"
     root_cause: |
-      Hard import of external modules (e.g. `pyorbbecsdk`, `open3d`, `pyo`) without
-      proper stub packages or type-ignores produces Mypy/IDE errors and makes static
-      analysis noisy. While runtime fallbacks exist, type checkers still flag them.
-    impact: "Pollutes CI (mypy/ruff) output, hides real issues, complicates IDE navigation."
+      Current collision pipeline requires the hand-sphere to overlap at least two consecutive frames.
+      For fast taps (≈50-100 ms contact) the sequence often becomes:
+        1. Frame-n: hand above mesh, distance > radius
+        2. Frame-n+1: hand penetrates mesh but mesh update or BVH query still uses old terrain (due to
+           `mesh_update_interval` & `max_mesh_skip_frames`) or `search_result.distances` > 2×radius filter
+        3. Frame-n+2: hand already left contact zone
+      Additionally, sphere radius (default 5 cm) may be too small relative to single-frame noise, and
+      temporal filtering on hand position can lag behind rapid movement, causing the sphere to "jump over"
+      narrow peaks.
+    impact: "Percussive interactions feel unresponsive; user must linger to trigger sound."
     proposed_action: |
-      • Introduce protocol interfaces + conditional imports guarded by `typing.TYPE_CHECKING`.
-      • Provide minimal stub packages in `src/stubs/` or add `# type: ignore` where appropriate.
-
-  - id: DEMO-002-NONE-GUARD
-    title: "Dereferencing Potentially-None Attributes"
-    root_cause: |
-      Numerous accesses assume GPU helpers or collision helpers are instantiated. Example lines
-      930–970 call `self.collision_tester.test_sphere_collision` even when `self.collision_tester`
-      is `None`, leading to AttributeError at runtime.
-    impact: "Crash during GPU fallback paths; unpredictable behaviour in headless mode."
-    proposed_action: |
-      • Audit all helper usages and add early returns or fallback implementations.
-      • Strengthen unit tests to cover None-case execution paths.
-
-  - id: DEMO-003-TYPE-MISMATCH-DATACLASSES
-    title: "Incorrect Constructor Signatures for CollisionInfo / ContactPoint"
-    root_cause: |
-      Code constructs `CollisionInfo` and `ContactPoint` with legacy parameter names
-      (`min_distance`, `penetration_depth`, `distance`) that no longer match the dataclass
-      definitions (expects `closest_point`, `total_penetration_depth`, etc.).
-    impact: "Raises TypeError at runtime; breaks collision pipeline and audio mapping."
-    proposed_action: |
-      • Update instantiation arguments to reflect current dataclass API.
-      • Add mypy strict checks on collision package to prevent regression.
-
-  - id: DEMO-004-VISUALIZER-NONE
-    title: "Open3D Visualizer Not Initialized Guard"
-    root_cause: "`self.vis` may be None in headless or failing GUI initialization yet code proceeds to call `add_geometry/remove_geometry`, causing crashes."
-    impact: "Viewer crashes in low-resource environments or headless CI."
-    proposed_action: "Add `if self.vis:` guards and provide no-op stubs for headless mode."
-
-  - id: DEMO-005-HEADLESS-CAMERA-MOCK
-    title: "Type Violations when Overwriting `self.camera` with SimpleNamespace"
-    root_cause: |
-      Headless mock rewrites `self.camera` (expected OrbbecCamera) to `SimpleNamespace`, breaking
-      typing expectations and leading to mypy errors on attribute access (e.g. `has_color`).
-    impact: "Hundreds of static errors; potential runtime bugs if camera object reused later."
-    proposed_action: |
-      • Extract `AbstractCamera` protocol with required attributes/methods.
-      • Implement `MockCamera` class conforming to protocol instead of monkey-patching.
-
-  - id: DEMO-006-CV2-NORMALIZE-NONE
-    title: "Incorrect cv2.normalize Usage"
-    root_cause: "`dst` argument is passed as `None`, but OpenCV stubs require concrete array if `dtype` specified, triggering type errors."
-    impact: "Mypy failure; potential runtime when OpenCV versions differ."
-    proposed_action: "Rewrite call as `cv2.normalize(depth_image, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)`."
-
-  - id: DEMO-007-UNREACHABLE-SUPER-CALLS
-    title: "`super()` Calls to Non-existent Methods"
-    root_cause: "Several `hasattr(super(), '_draw_hand_detections')` or `_process_pointcloud_display` checks reference methods not present in DualViewer base, leading to dead code and type errors."
-    impact: "Redundant branching, maintenance overhead."
-    proposed_action: "Remove unreachable branches; define proper abstract methods in base if genuinely needed."
-
-  - id: DEMO-008-MIXED-RETURN-TYPES
-    title: "Functions Annotated to Return `None` but Return `bool`"
-    root_cause: "Override methods from DualViewer expected to return `None`, yet demo returns booleans (e.g., `_process_pointcloud_display`)."
-    impact: "Violates LSP; propagates mypy errors and runtime confusion."
-    proposed_action: "Align signatures—return early bool to callers or change annotation in base class."
-
-  - id: DEMO-009-API-DESYNC-POINTCLOUDCONVERTER
-    title: "Missing/Outdated API on PointCloudConverter"
-    root_cause: "`get_performance_stats()` assumed to exist but not implemented in converter, causing AttributeError during stats print."
-    impact: "Breaks performance overlay; hampers debugging."
-    proposed_action: "Implement stats API or guard call."
-
-next_actions:
-  immediate:
-    - "Fix high-severity runtime crashers (DEMO-002, 003, 005)."
-    - "Introduce proper data contracts (protocols) to satisfy type checker."
-  mid_term:
-    - "Refactor visualization guards (DEMO-004) and remove dead code (DEMO-007)."
-    - "Stabilize API sync across collision, mesh and sound packages."
-  long_term:
-    - "Modularize demo_collision_detection.py (>2500 LOC) into smaller maintainable modules following SRP."
+      • Insert predictive/lag compensation: extrapolate hand trajectory and test both current & previous
+        positions within collision stage (mini motion buffer of last 3 frames).
+      • Reduce mesh update latency when no hands present by forcing update if vertical velocity > threshold.
+      • Parameter tweak: allow single-frame collision by removing `search_result.distances > radius*2` early
+        exit and lowering `collision_tolerance`.
+      • Adaptive sphere radius: expand radius for high-speed hands (based on |velocity|) to account for
+        motion blur between frames.
+      • Add unit test in `tests/collision_test.py` simulating 90 ms tap with synthetic point cloud.
