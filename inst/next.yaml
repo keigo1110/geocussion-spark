@@ -1,13 +1,192 @@
-- id: DEMO-014-MULTI-TRIGGER
-  title: "Remaining multi-trigger buzz when hand dwells on mesh"
-  root_cause: |
-    Although triangle-level debounce works, slight Z jitter causes new triangle
-    selections every few frames (contact spreads over adjacent triangles).
-    Each is treated as distinct contact_hash, so ~10–15 notes/sec still occur
-    while the hand is stationary, producing residual buzz.
-  impact: "Stationary hand produces low-level chatter instead of silence between taps."
-  proposed_action: |
-    • Expand debouncer key to include *triangle cluster* (nearest face within 2 cm)
-      or simply round centroid to 1 cm grid before hashing.
-    • Add per-hand voice quota: max 2 simultaneous voices; skip further notes.
-    • Velocity gate: if hand velocity <0.05 m/s, suppress new events.
+id: mesh_dynamic_update
+title: "地形メッシュ動的追従性の改善"
+description: |
+  現状の地形メッシュ生成システム (LODMeshGenerator) は、
+  1) 手の移動量
+  2) 経過時間 (既定 1.0s)
+  の 2 条件のみで再計算を判断しているため、
+  シーン自体が変化した場合 (カメラ移動・環境変化・深度値ドリフト等) にメッシュが即時更新されず、
+  最大 1 秒以上スタレる問題が発生している。
+  また、局所的な更新を行う IncrementalMeshUpdater 実装が存在するが、
+  現在の統合ビューワーには組み込まれておらず、モジュール重複・メモリ消費増加の要因になっている。
+  これらを解決し、深度フレームの動的変化にリアルタイムで追従するメッシュ更新パイプラインを構築する。
+implementation_summary: |
+  🔍 調査結果 (2025-07-01):
+  - LODMeshGenerator._should_update_mesh() は点群変化量を一切考慮していない。
+  - IncrementalMeshUpdater は HeightMap 差分を解析し局所更新を行うが、FullPipelineViewer からは未使用。
+  - Mesh 更新時に法線再計算や SpatialIndex 再構築を行わないケースがあり、衝突検出で古いデータを参照するバグが発生。
+  - cached_mesh を保持したまま新規メッシュへ置き換える際に頂点/三角形配列の参照がリークし、RAM が 200 MB/h で増加。
+  - 同等機能を持つ _generate_traditional_mesh() が存在し、コード重複が増大。
+problems:
+  - id: P-MESH-001
+    title: "メッシュ更新判定に点群変化が含まれていない"
+    module: ["src/mesh/lod_mesh.py"]
+    description: |
+      _should_update_mesh() は手移動・時間のみを条件にしており、
+      カメラを動かした場合やシーンが動的に変化した場合にメッシュが更新されない。
+      その結果、衝突判定が実環境と乖離し最大 1 s 遅延する。
+    severity: "High"
+    fix_suggestion: |
+      HeightMap 変化率や点群差分 (Hausdorff 距離/平均深度差) を導入し、
+      閾値を超えたら即時メッシュ再生成を行う。
+  - id: P-MESH-002
+    title: "IncrementalMeshUpdater が統合パイプラインで未使用"
+    module: ["src/mesh/incremental.py", "demo_collision_detection.py"]
+    description: |
+      境界領域のみ再計算する高効率アルゴリズムが実装済みだが、
+      FullPipelineViewer では generate_mesh() を毎回フル実行しており恩恵がない。
+    severity: "High"
+    fix_suggestion: |
+      LODMeshGenerator と IncrementalMeshUpdater を統合した MeshPipeline を新設し、
+      状況に応じて Full / Partial / Cache の 3 戦略を自動選択する。
+  - id: P-MESH-003
+    title: "SpatialIndex / 法線が更新後に再構築されないケースがある"
+    module: ["demo_collision_detection.py"]
+    description: |
+      _update_terrain_mesh() 内で simplified_mesh を current_mesh に代入する前に
+      compute_vertex_normals() や SpatialIndex(BVH) を再構築していないため、
+      衝突検出で旧メッシュの法線・バウンディングが残る場合がある。
+    severity: "Medium"
+    fix_suggestion: |
+      メッシュ生成完了後に必ず
+        - vertex / face 法線再計算
+        - SpatialIndex 再インスタンス化
+      を行うユーティリティを作成し、全呼び出し箇所で使用する。
+  - id: P-MESH-004
+    title: "cached_mesh の参照リークによるメモリ増加"
+    module: ["src/mesh/lod_mesh.py"]
+    description: |
+      cached_mesh を置き換えるたびに旧 TriangleMesh への参照が
+      stats.dict や mesh_update_regions に残り ガーベジコレクションが働かず、
+      長時間実行でメモリが徐々に増加する。
+    severity: "Medium"
+    fix_suggestion: |
+      置換前に明示的に del cached_mesh / mesh_update_regions[:] = [] を実行し、
+      gc.collect() で確実に解放する。キャッシュ有効時間超過時も同様。
+  - id: P-MESH-005
+    title: "従来メッシュ生成コードの重複"
+    module: ["demo_collision_detection.py", "src/mesh/lod_mesh.py"]
+    description: "_generate_traditional_mesh() が Triangulator と機能重複しており保守コストが高い。"
+    severity: "Low"
+    fix_suggestion: |
+      Triangulator API を直接使用し、冗長ラッパ実装を削除。
+
+tasks:
+  - id: T-MESH-101
+    description: "LOD + Incremental 統合 MeshPipeline を実装し FullPipelineViewer へ導入"
+    depends_on: [P-MESH-001, P-MESH-002, P-MESH-005]
+    steps:
+      - "1. src/mesh/pipeline.py を新規作成し、generate_mesh(points, hands, force) を提供。"
+      - "2. 内部で (a) インクリメンタル更新 (b) LOD 再生成 (c) キャッシュ の 3 ルートを選択。"
+      - "3. demo_collision_detection.py の _update_terrain_mesh() を MeshPipeline 経由にリファクタ。"
+    acceptance_criteria:
+      - "LOD ↔ Incremental の切替でメッシュ生成時間が最大 50% 短縮。"
+      - "動的環境変化に ≤200 ms で追従。"
+    status: "TODO"
+
+  - id: T-MESH-102
+    description: "点群差分に基づく更新判定を実装 (_should_update_mesh 改修)"
+    depends_on: [P-MESH-001]
+    steps:
+      - "1. 前フレーム pointcloud のサンプリング (≦5k pts) を保持。"
+      - "2. Hausdorff 距離または平均深度差を高速計算 (Numba/CuPy)。"
+      - "3. 閾値 (例: 2 cm) を超えたら force_update=True で MeshPipeline を呼び出す。"
+    acceptance_criteria:
+      - "カメラ移動時に即座にメッシュ更新が走り、遅延 <300 ms。"
+    status: "TODO"
+
+  - id: T-MESH-103
+    description: "メッシュ更新後の法線計算・SpatialIndex 再構築ユーティリティを追加"
+    depends_on: [P-MESH-003]
+    steps:
+      - "1. src/mesh/utils.py に rebuild_mesh_postprocess(mesh) を実装。"
+      - "2. TriangleMesh 内で compute_vertex_normals() を呼び出し、BVH/KDTree を再構築。"
+      - "3. FullPipelineViewer のメッシュ更新箇所 (_update_terrain_mesh) でユーティリティを利用。"
+    acceptance_criteria:
+      - "衝突検出時の法線ずれが再現テストで発生しない。"
+    status: "TODO"
+
+  - id: T-MESH-104
+    description: "メモリリーク防止: cached_mesh 解放と gc 呼出を追加"
+    depends_on: [P-MESH-004]
+    steps:
+      - "1. LODMeshGenerator.generate_mesh() で旧 cached_mesh を del した後 gc.collect()。"
+      - "2. mesh_update_regions など不要参照をクリア。"
+      - "3. pytest に長時間 (5 分) ループテストを追加し RSS 増加 <5 MB を検証。"
+    acceptance_criteria:
+      - "長時間実行でメモリ使用量が線形増加しない。"
+    status: "TODO"
+
+  - id: T-MESH-105
+    description: "_generate_traditional_mesh() を削除し Triangulator API に統一"
+    depends_on: [P-MESH-005]
+    steps:
+      - "1. demo_collision_detection.py の _generate_traditional_mesh() を削除。"
+      - "2. 該当呼び出しを triangulator.triangulate_points() へ置換。"
+    acceptance_criteria:
+      - "重複コードが無くなり、ユニットテストが pass。"
+    status: "TODO"
+
+requirements:
+  functional:
+    - シーンやカメラが動いた際に ≤200 ms 以内で Terrain Mesh が最新状態へ更新されること。
+    - メッシュ更新後は必ず SpatialIndex(BVH) と法線が再計算され、衝突検出に反映されること。
+    - LOD・Incremental・キャッシュ戦略は自動選択され、開発者が切替を意識せずに利用できること。
+    - MeshPipeline API は `generate_mesh(points: np.ndarray, hands: List[TrackedHand], force: bool=False) -> TriangleMesh | None` を提供し、既存呼び出し側を崩さないこと。
+  performance:
+    - 424×240 深度入力時: メッシュ生成時間 平均 ≤10 ms（95 パーセンタイル ≤15 ms）。
+    - 848×480 深度入力時: メッシュ生成時間 平均 ≤25 ms。
+    - 長時間実行（≥30 分）で常駐メモリ増加 ≤5 MB。
+  non_functional:
+    - mypy strict で型エラーゼロ。
+    - black + isort で整形済み。
+    - 既存ユニットテストが全て pass し、新規テストが追加されること。
+
+deliverables:
+  - src/mesh/pipeline.py  # 統合 MeshPipeline 実装
+  - src/mesh/utils.py     # rebuild_mesh_postprocess など補助関数
+  - tests/mesh_dynamic_update_test.py  # ユニット + 回帰テスト
+  - docs/mesh_pipeline.md # 設計ドキュメント & API 仕様
+  - benchmark/mesh_update_bench.py # 性能ベンチマークスクリプト
+
+milestones:
+  - id: MS1
+    title: "MeshPipeline 基盤実装 + 既存コード差し替え"
+    due: "2025-07-05"
+    tasks: [T-MESH-101, T-MESH-105]
+  - id: MS2
+    title: "点群差分判定 & メモリリーク対処"
+    due: "2025-07-07"
+    tasks: [T-MESH-102, T-MESH-104]
+  - id: MS3
+    title: "法線・SpatialIndex 再構築ユーティリティ + 最終調整"
+    due: "2025-07-09"
+    tasks: [T-MESH-103]
+
+test_plan:
+  unit_tests:
+    - test_mesh_pipeline_api: MeshPipeline が None を返さず TriangleMesh.typing を満たすか確認。
+    - test_dynamic_update_latency: モック点群を 10 cm 並進させた際に generate_mesh() が ≤0.2 s で更新するか測定。
+    - test_memory_leak: 5 分ループ後の RSS 増加が 5 MB 以内か確認。
+  integration_tests:
+    - test_viewer_mesh_refresh: FullPipelineViewer でカメラモック移動時に current_mesh.num_triangles が変化するか。
+    - test_collision_consistency: メッシュ更新直後に球-三角衝突判定が最新メッシュで行われるか。
+  performance_benchmarks:
+    - bench_mesh_generation_lowres
+    - bench_mesh_generation_highres
+
+risks:
+  - id: R-MESH-01
+    description: "点群差分の高速計算が CPU ボトルネックになる可能性"
+    mitigation: "先に NumPy 実装→必要に応じて Numba/CuPy へ落とし込み、ベンチを自動化"
+  - id: R-MESH-02
+    description: "MeshPipeline 置換で既存デモの API 互換性が崩れる可能性"
+    mitigation: "Facade パターンで旧メソッド署名を保持し DeprecationWarning を出す"
+  - id: R-MESH-03
+    description: "メモリリーク修正による予期せぬ GC コスト増"
+    mitigation: "gc.disable → 手動 gc.collect() をタイミング指定して呼び出し、プロファイルで確認"
+
+timeline:
+  kickoff: "2025-07-02"
+  final_review: "2025-07-10"
+  buffer_days: 1  # バッファ

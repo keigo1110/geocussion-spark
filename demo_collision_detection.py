@@ -151,6 +151,7 @@ from src.debug.dual_viewer import DualViewer
 from src.input.depth_filter import DepthFilter, FilterType
 from src.input.pointcloud import PointCloudConverter
 from src.config import get_config, InputConfig
+from src.mesh.pipeline import create_mesh_pipeline  # NEW unified mesh pipeline
 
 # GPU加速コンポーネントの動的インポート
 HAS_GPU_ACCELERATION = False
@@ -395,22 +396,26 @@ class FullPipelineViewer(DualViewer):
         self.tracker = None
     
     def _initialize_mesh_generators(self):
-        """メッシュ生成器を初期化"""
-        # LODメッシュ生成器
-        from src.mesh.lod_mesh import create_lod_mesh_generator
+        """メッシュ生成器を初期化 (T-MESH-101)"""
+
+        # LOD メッシュ生成器（MeshPipeline 内部でも使用）
+        from src.mesh.lod_mesh import create_lod_mesh_generator  # 遅延 import で循環回避
         self.lod_mesh_generator = create_lod_mesh_generator(
-            high_radius=0.20,      # ハンド周辺20cm以内は高解像度
-            medium_radius=0.50,    # 50cm以内は中解像度  
-            enable_gpu=True        # GPU使用（可能な場合）
+            high_radius=0.20,
+            medium_radius=0.50,
+            enable_gpu=True,
         )
-        
-        # 従来の三角分割器（フォールバック用）
+
+        # 従来 Triangulator – 直接呼び出し箇所残存のため保持
         self.triangulator = DelaunayTriangulator(
             adaptive_sampling=True,
             boundary_points=True,
             quality_threshold=0.3,
-            use_gpu=True
+            use_gpu=True,
         )
+
+        # 統合 MeshPipeline
+        self.mesh_pipeline = create_mesh_pipeline(enable_incremental=False)
     
     def _initialize_hand_detection(self):
         """手検出コンポーネントを初期化"""
@@ -759,43 +764,31 @@ class FullPipelineViewer(DualViewer):
         return True
     
     def _update_terrain_mesh(self, points_3d: np.ndarray) -> None:
-        """地形メッシュを更新（LOD最適化版）"""
+        """地形メッシュを更新 – MeshPipeline 版 (T-MESH-101)"""
         if points_3d is None or len(points_3d) < 100:
             return
-        
+
         try:
             import time
-            
-            # LODメッシュ生成器を使用
-            if hasattr(self, 'lod_mesh_generator') and self.lod_mesh_generator is not None:
-                lod_start = time.perf_counter()
-                
-                # LODベースメッシュ生成
-                triangle_mesh = self.lod_mesh_generator.generate_mesh(
-                    points_3d, 
-                    self.current_tracked_hands,
-                    force_update=getattr(self, 'force_mesh_update_requested', False)
-                )
-                
-                total_lod_time = (time.perf_counter() - lod_start) * 1000
-                
-                if triangle_mesh is not None:
-                    simplified_mesh = triangle_mesh
-                    self._log_lod_mesh_generation(points_3d, triangle_mesh, total_lod_time)
-                else:
-                    # LOD生成失敗時は従来方式へフォールバック
-                    logger.info("[LOD-FALLBACK] Using traditional mesh generation")
-                    triangle_mesh = self._generate_traditional_mesh(points_3d)
-                    if triangle_mesh is None:
-                        return
-                    simplified_mesh = triangle_mesh
-            else:
-                # LODメッシュ生成器が無効の場合は従来方式
-                triangle_mesh = self._generate_traditional_mesh(points_3d)
-                if triangle_mesh is None:
-                    return
-                simplified_mesh = triangle_mesh
-            
+
+            start_t = time.perf_counter()
+
+            # MeshPipeline に委譲
+            triangle_mesh = self.mesh_pipeline.generate_mesh(
+                points_3d,
+                self.current_tracked_hands,
+                force_update=getattr(self, 'force_mesh_update_requested', False),
+            )
+
+            if triangle_mesh is None:
+                return  # 生成失敗 / ポイント不足
+
+            simplified_mesh = triangle_mesh  # MeshPipeline 内で簡略化済み
+
+            gen_ms = (time.perf_counter() - start_t) * 1000.0
+            if self.frame_counter % 50 == 0:
+                logger.debug("[MESH-PIPELINE] %d points -> %d tris in %.1fms", len(points_3d), simplified_mesh.num_triangles, gen_ms)
+
             # 空間インデックス構築
             self.spatial_index = SpatialIndex(simplified_mesh, index_type=IndexType.BVH)
             
