@@ -23,6 +23,7 @@ logger = get_logger(__name__)
 
 try:
     import pyo
+    from pyo import Biquadx, ButLP
 except ImportError:
     logger.warning("pyo not available. Audio synthesis will be disabled.")
     pyo = None
@@ -347,13 +348,15 @@ class AudioSynthesizer(ManagedResource):
             return
         
         try:
-            # リバーブエフェクト (後で入力を渡すファクトリとして保持)
-            self.reverb = lambda inp: pyo.Freeverb(
-                inp,
-                size=0.8,
-                damp=0.6,
-                bal=self.config.reverb_level
-            )
+            # Pre-EQ (high-shelf −6 dB @ 8 kHz) then Freeverb
+            def _reverb_chain(inp):
+                try:
+                    eq = pyo.Biquadx(inp, freq=8000, q=0.707, type=5, gain=-6)
+                except Exception:
+                    eq = inp
+                return pyo.Freeverb(eq, size=0.8, damp=0.6, bal=self.config.reverb_level)
+
+            self.reverb = _reverb_chain
             
             # サーバーのマスターボリュームを設定
             self.server.setAmp(self.config.master_volume)
@@ -504,7 +507,8 @@ class AudioSynthesizer(ManagedResource):
             return pyo.Sine(freq=freq)
             
         elif osc_type == 'saw':
-            return pyo.Saw(freq=freq)
+            saw = pyo.Saw(freq=freq)
+            return ButLP(saw, freq=8000)
             
         elif osc_type == 'fm':
             carrier_ratio = template.get('carrier_ratio', 1.0)
@@ -512,10 +516,13 @@ class AudioSynthesizer(ManagedResource):
             mod_index = template.get('modulation_index', 1.0)
             
             modulator = pyo.Sine(freq=freq * modulator_ratio)
-            return pyo.Sine(freq=freq * carrier_ratio + modulator * mod_index)
+            fm = pyo.Sine(freq=freq * carrier_ratio + modulator * mod_index)
+            # Anti-alias: low-pass at 8 kHz
+            return Biquadx(fm, freq=8000, q=0.707, type=0)
             
         elif osc_type == 'noise':
-            return pyo.Noise()
+            noi = pyo.Noise()
+            return ButLP(noi, freq=8000)
             
         elif osc_type == 'karplus_strong':
             return pyo.Pluck(
