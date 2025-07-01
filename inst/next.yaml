@@ -1,74 +1,13 @@
-version: "1.2"
-last_updated: "2025-07-01"
-subject: "Audio layer – Buzzing noise instead of clean percussive taps"
-
-overview:
-  summary: |
-    Tapping collisions still produce a sand-storm / buzzing sound instead of a single
-    percussive note.  The quick ADSR tweak (DEMO-011) improved duration but did not
-    eliminate the noise.  Investigation below isolates three technical causes and
-    proposes targeted fixes.
-
-issues:
-  - id: DEMO-012-BUZZ-NOISE
-    title: "Stacked voices & envelope misuse cause continuous buzzing"
-    root_cause: |
-      Field tests show every video frame that reports a collision emits a new note.
-      With ~20 fps this piles up >200 overlapping FM/Noise voices within one second,
-      saturating the output bus and driving Freeverb into distortion → perceived
-      "ジリジリ" static.
-
-      Detailed findings:
-        1. _audio_cooldown_time is 150 ms but predictive-history loop often creates
-           unique CollisionEvent IDs for the *same* physical tap every frame →
-           cooldown bypassed → frame-by-frame re-trigger.
-        2. VoiceManager.cleanup_finished_voices() is called only every 10 frames and
-           relies on estimated_remaining_time.  When sustain=0 the internal ADSR
-           envelope still keeps the voice object alive until `release` finishes,
-           so for a 0.6 s release tens of voices overlap.
-        3. Instrument templates (FM, Noise) have no per-voice gain scaling; raw
-           oscillator level × velocity can exceed 0 dBFS, and the sum of many such
-           voices clips even before reverb.
-    impact: "Audio output is dominated by clipping noise; clean percussion is masked."
-    proposed_action: |
-      • Collision de-bounce
-        – Store last_event_hash per hand; suppress new audio if same contact triangle
-          within 120 ms (configurable).
-      • ADSR auto-stop
-        – After allocating a voice, schedule VoiceManager.deallocate_voice() with
-          delay=(attack+decay+release)+50 ms when sustain==0 to guarantee voice
-          cleanup even if cleanup_finished_voices() is skipped.
-      • Gain staging
-        – Add `gain` field to AudioParameters; default 0.3 for high-energy FM/Noise.
-        – Scale oscillator output (e.g., pyo.Sine.mul) by gain, NOT velocity.
-        – Implement global limiter (pyo.Compress or pyo.Clip) after mix bus to
-          cap peaks at −3 dBFS.
-      • Tests
-        – tests/sound_test.py::test_percussive_tap ensures RMS stays < −6 dBFS and
-          voice count < 16 after a single tap burst.
-  - id: DEMO-013-REMAINING-BUZZ
-    title: "Residual buzz – frame-wise re-trigger and FM aliasing still accumulate"
-    root_cause: |
-      After DEMO-012 fixes, voices are now short and gain-scaled, but logs show
-      40–60 notes/sec when the hand rests on the surface due to:
-        • Predictive collision loop keeps searching _hand_position_history and
-          returns slightly different centroids each frame → different triangle
-          index → new CollisionEvent ID → debouncer miss.
-        • _audio_cooldown_time is per-hand, not per-triangle contact; multiple
-          fingers/hands still sum to >16 voices.
-        • FM templates use high modulation_index=2.5; at low frequencies the
-          side-bands exceed Nyquist causing audible noise, perceived as "ジリジリ".
-        • Freeverb input is not low-passed; accumulating high-freq FM content
-          excites reverb tail producing sustained hiss.
-    impact: "Shorter but numerous notes plus FM alias components still mask the intended percussive tone."
-    proposed_action: |
-      1. Spatial contact hash
-         – Build contact_hash = (triangle_index, hand_id) and store last_time.
-           Suppress new audio if same hash <250 ms ago (independent from cooldown).
-      2. FM alias filter
-         – Before pyo.Clip, apply pyo.LPF at 10 kHz to each FM/Noise voice.
-         – Reduce modulation_index to 1.2 for MARIMBA/BELL presets.
-      3. Reverb pre-EQ
-         – Insert high-shelf −6 dB @ 8 kHz before Freeverb to tame hiss.
-      4. Polyphony guardrail
-         – If active_voices ≥ polyphony*0.8, skip new note unless velocity>0.8.
+- id: DEMO-014-MULTI-TRIGGER
+  title: "Remaining multi-trigger buzz when hand dwells on mesh"
+  root_cause: |
+    Although triangle-level debounce works, slight Z jitter causes new triangle
+    selections every few frames (contact spreads over adjacent triangles).
+    Each is treated as distinct contact_hash, so ~10–15 notes/sec still occur
+    while the hand is stationary, producing residual buzz.
+  impact: "Stationary hand produces low-level chatter instead of silence between taps."
+  proposed_action: |
+    • Expand debouncer key to include *triangle cluster* (nearest face within 2 cm)
+      or simply round centroid to 1 cm grid before hashing.
+    • Add per-hand voice quota: max 2 simultaneous voices; skip further notes.
+    • Velocity gate: if hand velocity <0.05 m/s, suppress new events.

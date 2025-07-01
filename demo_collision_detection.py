@@ -1752,8 +1752,11 @@ class FullPipelineViewer(DualViewer):
         return True
     
     def _check_contact_debounce(self, event: Any) -> bool:
-        """手ID+三角形ID 単位で250msデバウンス"""
-        key = (event.hand_id, event.triangle_index)
+        """手ID + 接触位置グリッド (≈2 cm) で 250 ms デバウンス"""
+        gx = int(round(event.contact_position[0] * 50))  # 1/50 m = 2 cm
+        gy = int(round(event.contact_position[1] * 50))
+        gz = int(round(event.contact_position[2] * 50))
+        key = (event.hand_id, gx, gy, gz)
         last_t = self._last_contact_trigger_time.get(key, 0.0)
         if (time.perf_counter() - last_t) < 0.25:  # 250 ms
             return False
