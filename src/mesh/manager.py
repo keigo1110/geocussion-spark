@@ -34,8 +34,8 @@ class PipelineManager:
     ) -> MeshResult:
         """Return up-to-date mesh (may be cached)."""
         now = time.perf_counter()
-        if not force and self._cached_mesh and (now - self._last_update_ts) < 0.05:
-            # recent enough
+        # Debounce heavy regenerate (<0.2 s)
+        if not force and self._cached_mesh and (now - self._last_update_ts) < 0.2:
             return self._cached_mesh
 
         if points is None or len(points) < 100:
@@ -52,6 +52,19 @@ class PipelineManager:
             self._mesh_version += 1
         else:
             self._cached_mesh = res
+
+        # If mesh not changed but generator might have async future, call again quickly
+        if res.mesh is None and getattr(self._pipe, "_lod", None) is not None:
+            # check if async completed
+            async_mesh = getattr(self._pipe._lod, "_pending_future", None)  # type: ignore[attr-defined]
+            if async_mesh is not None and async_mesh.done():
+                try:
+                    mesh_val = async_mesh.result()
+                    self._pipe._lod._pending_future = None  # type: ignore[attr-defined]
+                    res = MeshResult(mesh_val, changed=True, needs_refresh=True)
+                except Exception:  # pragma: no cover
+                    pass
+
         return res
 
     # ------------------------------------------------------------------

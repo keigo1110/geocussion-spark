@@ -1418,7 +1418,11 @@ class FullPipelineViewer(DualViewer):
     def _extract_color_image(self, frame_data: Any) -> Optional[np.ndarray]:
         """フレームデータからカラー画像を抽出"""
         try:
-            if frame_data.color_frame is None or self.camera is None or not getattr(self.camera, "has_color", False):
+            if (
+                frame_data.color_frame is None
+                or self.camera is None
+                or not getattr(self.camera, "has_color", False)
+            ):
                 return None
             
             color_data = np.frombuffer(frame_data.color_frame.get_data(), dtype=np.uint8)
@@ -1922,16 +1926,21 @@ class FullPipelineViewer(DualViewer):
     
     def _create_depth_visualization(self, depth_image: np.ndarray) -> np.ndarray:
         """深度画像の可視化を作成"""
-        # Normalize depth to 0-255 and cast to 8-bit so that applyColorMap accepts it
-        assert depth_image is not None  # for mypy – guarded by caller
-        depth_normalized = cv2.normalize(depth_image, None, 0, 255, cv2.NORM_MINMAX)
-        depth_normalized = depth_normalized.astype(np.uint8)
+        # Manual normalization to avoid cv2 stub type issues
+        assert depth_image is not None
+        d_min = float(depth_image.min())
+        d_ptp = float(depth_image.ptp()) if depth_image.ptp() > 0 else 1.0
+        depth_normalized = ((depth_image.astype(np.float32) - d_min) / d_ptp * 255.0).astype(np.uint8)
         return cv2.applyColorMap(depth_normalized, cv2.COLORMAP_JET)
     
     def _process_color_image(self, frame_data: Any, hands_2d: List, hands_3d: List, 
                            tracked_hands: List, collision_events: Optional[List[Any]]) -> Optional[np.ndarray]:
         """カラー画像を処理"""
-        if frame_data.color_frame is None or not self.camera.has_color:
+        if (
+            frame_data.color_frame is None
+            or self.camera is None
+            or not getattr(self.camera, "has_color", False)
+        ):
             return None
         
         color_data = np.frombuffer(frame_data.color_frame.get_data(), dtype=np.uint8)

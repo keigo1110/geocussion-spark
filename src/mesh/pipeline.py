@@ -97,13 +97,28 @@ class MeshPipeline:  # pylint: disable=too-few-public-methods
         self._cached_mesh: Optional[TriangleMesh] = None
         self._stats = MeshPipelineStats()
 
-        # --- Point-cloud diff state (T-MESH-202 pre-work) ---
+        # --- Point-cloud diff state (T-PERF-001) --------------------------
         # Keep previous samples/hashes so that we can detect meaningful changes
-        # in successive calls.  All are initialised to *None* so that the first
-        # frame forces a regeneration and establishes the baseline state.
+        # across successive frames without incurring heavy computations.
         self._prev_sample: Optional[np.ndarray] = None
         self._prev_vox_set: Optional[set[tuple[int, int, int]]] = None
         self._prev_count: Optional[int] = None
+
+        # Fixed RNG for reproducible sampling (avoid every-frame diff jitter)
+        import numpy as _np  # local import to avoid top-level requirement in modules missing NumPy
+        self._rng = _np.random.default_rng(1234)
+
+        # EWMA smoothers for voxel hash distance & count ratio
+        from .utils import EWMASmoother
+
+        self._ewma_voxel = EWMASmoother(alpha=0.3)
+        self._ewma_count = EWMASmoother(alpha=0.3)
+
+        # Debounce timer for expensive regeneration
+        self._last_regen_ts: float = 0.0
+
+        # Sample indices used for fixed subsampling
+        self._sample_idx: Optional[np.ndarray] = None
 
     # ---------------------------------------------------------------------
     # Public API
@@ -137,12 +152,11 @@ class MeshPipeline:  # pylint: disable=too-few-public-methods
         refresh_due_to_diff = False
 
         if not force_update and self._cached_mesh is not None:
-            # 差分判定 (距離 + voxelHash + 点数変化)
-            significant, refresh_due_to_diff = self._evaluate_pointcloud_change(points_3d)
-            if not significant:
+            # Debounce: if last regeneration happened <0.2s ago use cache directly
+            if (time.perf_counter() - self._last_regen_ts) < 0.2:
                 elapsed = (time.perf_counter() - start) * 1000.0
                 self._stats.record(elapsed, "cache")
-                return MeshResult(self._cached_mesh, changed=False, needs_refresh=refresh_due_to_diff)
+                return MeshResult(self._cached_mesh, changed=False, needs_refresh=False)
 
         if force_update:
             # Explicit regeneration request
@@ -175,6 +189,10 @@ class MeshPipeline:  # pylint: disable=too-few-public-methods
         elapsed = (time.perf_counter() - start) * 1000.0
         self._stats.record(elapsed, selected_path if selected_path else "cache")
 
+        if selected_path != "cache":
+            # remember last heavy regeneration ts
+            self._last_regen_ts = time.perf_counter()
+
         return MeshResult(mesh, changed=mesh_changed, needs_refresh=(refresh_due_to_diff or mesh_changed))
 
     # ------------------------------------------------------------------
@@ -189,7 +207,7 @@ class MeshPipeline:  # pylint: disable=too-few-public-methods
     # ------------------------------------------------------------------
 
     _SAMPLE_SIZE: int = 5000
-    _DIFF_THRESHOLD_M: float = 0.01  # stricter threshold (T-MESH-106)
+    _DIFF_THRESHOLD_M: float = 0.03  # relaxed threshold (T-PERF-001)
 
     def _evaluate_pointcloud_change(self, points_3d: np.ndarray) -> Tuple[bool, bool]:
         """Return (significant_change, needs_refresh_only).
@@ -218,16 +236,21 @@ class MeshPipeline:  # pylint: disable=too-few-public-methods
     def _distance_based_change(self, points_3d: np.ndarray) -> bool:
         """Simple mean distance sample heuristic."""
         sample_size = min(self._SAMPLE_SIZE, len(points_3d))
-        idx = np.random.choice(points_3d.shape[0], size=sample_size, replace=False)
-        sample = points_3d[idx]
 
-        if self._prev_sample is None or len(self._prev_sample) != sample_size:
+        if self._sample_idx is None or len(self._sample_idx) != sample_size:
+            # (re)initialise fixed sample indices for current point cloud size
+            self._sample_idx = self._rng.choice(points_3d.shape[0], size=sample_size, replace=False)
+
+        sample = points_3d[self._sample_idx]
+
+        if self._prev_sample is None:
             self._prev_sample = sample.copy()
             return True
 
-        mean_dist = float(np.linalg.norm(sample - self._prev_sample, axis=1).mean())
+        # Use median distance which is more robust to outliers
+        median_dist = float(np.median(np.linalg.norm(sample - self._prev_sample, axis=1)))
         self._prev_sample = sample.copy()
-        return mean_dist > self._DIFF_THRESHOLD_M
+        return median_dist > self._DIFF_THRESHOLD_M
 
     def _voxel_hash_change(self, points_3d: np.ndarray) -> float:
         try:
@@ -247,8 +270,11 @@ class MeshPipeline:  # pylint: disable=too-few-public-methods
         union = len(vox_set | self._prev_vox_set)
         jaccard_dist = 1.0 - (inter / union) if union else 0.0
 
+        # EWMA smoothing
+        smoothed = self._ewma_voxel.update(jaccard_dist)
+
         self._prev_vox_set = vox_set
-        return jaccard_dist
+        return smoothed
 
     def _count_change(self, points_3d: np.ndarray) -> float:
         curr = len(points_3d)
@@ -258,7 +284,8 @@ class MeshPipeline:  # pylint: disable=too-few-public-methods
 
         diff_ratio = abs(curr - self._prev_count) / self._prev_count
         self._prev_count = curr
-        return diff_ratio
+
+        return self._ewma_count.update(diff_ratio)
 
 
 # ---------------------------------------------------------------------------

@@ -486,6 +486,22 @@ class DelaunayTriangulator:
             'last_quality_score': 0.0
         }
 
+    # ------------------------------------------------------------------
+    # Async helper (P-PERF-002)
+    # ------------------------------------------------------------------
+
+    _EXECUTOR = None  # class-level ThreadPoolExecutor
+
+    def triangulate_points_async(self, points: np.ndarray):  # type: ignore[return-value]
+        """非同期に triangulate_points() を実行し Future を返す。"""
+        from concurrent.futures import ThreadPoolExecutor
+
+        if DelaunayTriangulator._EXECUTOR is None:
+            # Lazy init – limit to 2 workers to avoid CPU thrash
+            DelaunayTriangulator._EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="triangulator")
+
+        return DelaunayTriangulator._EXECUTOR.submit(self.triangulate_points, points)
+
 
 # 便利関数
 

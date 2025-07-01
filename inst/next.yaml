@@ -1,98 +1,60 @@
-- id: P-MESH-009
-  title: "メッシュ更新パイプラインの設計不整合 (根本見直し)"
-  module: ["src/mesh/pipeline.py", "demo_collision_detection.py", "src/mesh/lod_mesh.py", "src/mesh/incremental.py"]
+- id: P-PERF-001
+  title: "MeshPipeline 差分判定の過敏化による極端な FPS 低下"
+  module: ["src/mesh/pipeline.py", "src/mesh/manager.py"]
+  severity: "High"
   description: |
-    これまで部分的にパッチを当ててきたが、依然として以下の構造的欠陥が原因で
-    メッシュがリアルタイムに点群へ追従しない。
-      A. Viewer/Pipeline/Generator 間の責務分離が曖昧
-         • generate_mesh() が副作用でキャッシュを書き換えつつ Viewer 側でも状態を持つ。
-      B. 更新トリガ箇所が複数に散在し条件が複雑化
-         • frame_diff, hand_presence, force_flag, diff_distance 等を多重評価。
-      C. 点群取得 → HeightMap → Triangulation のパスが同期ブロッキングで 40-60 ms 停止
-         • 点群取得をスレッド内で待機している間に Update 窓を逃す。
-      D. Open3D Visualizer がメインスレッドで動き，remove/add が多発するとレイテンシが発生。
-  severity: "Critical"
+    _prev_sample を正しく初期化したことで距離ベースの差分判定が毎フレーム true となり、
+    LODMeshGenerator が常にフル再生成を行うようになった。その結果 GPU なし環境で
+    120→2 FPS まで低下。
+  cause: |
+    • ランダムサンプリングがフレーム毎に変わるため平均距離が常に閾値 0.01m を超過。
+    • Jaccard voxelHash や pointCountRatio を EWMA 集約せず raw 判定している。
   fix_suggestion: |
-    ✔ アーキテクチャ再設計案
-    1) Reactive MeshPipeline
-       • MeshPipeline を Stateless にし、入力(PointCloud, HandInfo)→出力(TriangleMesh) の純関数へ。
-       • 内部で LOD/Incremental 戦略を選択するがキャッシュは外側 (PipelineManager) が保持。
-    2) PipelineManager (新規クラス)
-       • PointCloudProducer スレッドから push される最新点群を保持 (lock-free queue)。
-       • フレームループ毎に "dirty" フラグ判定 (タイムスタンプ差 & voxelHash) を 0.1 ms で評価。
-       • dirty==True なら MeshPipeline に同期呼び出ししてメッシュを生成。
-    3) PointCloudProducer (背景スレッド)
-       • Depth→PointCloud 変換を別スレッドで常駐実行、最新 numpy array を ring-buffer に publish。
-    4) ViewerRefresher
-       • メッシュが更新されたら `version_id` をインクリメント。Viewer は version が変わるたびに
-         remove/add せず `update_geometry()` のみに切替。
-    5) Metrics-Driven Threshold
-       • diffDistance, voxelHash, pointCount など複数指標を EWMA でスコア化し 0-1 スケールへ正規化。
-        0.6 以上で dirty 判定とし誤検知と取りこぼしをバランスさせる。
-
-- id: T-MESH-200
-  description: "非同期 PointCloudProducer & PipelineManager 実装"
-  depends_on: [P-MESH-009]
-  steps:
-    - "1. src/mesh/producer.py に PointCloudProducer (threading.Thread) を実装。"
-    - "2. src/mesh/manager.py に PipelineManager を実装 (ring-buffer で最新点群を保持)。"
-    - "3. MeshPipeline を pure 関数 `generate_mesh(points, hands)` にリファクタし副作用除去。"
-    - "4. FullPipelineViewer から PointCloudProducer/PipelineManager を制御。"
-  acceptance_criteria:
-    - "連続 60 秒テストで点群→メッシュ遅延平均 ≤120 ms (p95 ≤180 ms)。"
-
-- id: T-MESH-201
-  description: "Viewer update_geometry ベース高速リフレッシュ"
-  depends_on: [P-MESH-200]
-  steps:
-    - "1. _update_mesh_visualization() を remove/add でなく update_geometry に変更。"
-    - "2. version_id が変わったときのみ `vis.update_geometry()` を呼び、poll_events → update_renderer。"
-  acceptance_criteria:
-    - "Open3D UI 操作時にも FPS ≥20 を維持。"
-
-- id: T-MESH-202
-  description: "Dirty-score EWMA 判定実装"
-  depends_on: [P-MESH-200]
-  steps:
-    - "1. diffDistance, voxelHashDist, pointCountRatio を 0-1 に正規化。"
-    - "2. `score = 0.4*dist + 0.4*voxel + 0.2*count` を EWMA(alpha=0.3)。"
-    - "3. score>0.6 で dirty。"
-  acceptance_criteria:
-    - "移動/撤去/追加の各シナリオで false skip ≤2%, false trigger ≤10%。"
-
+    1) サンプル点インデックスを初回生成後に固定 (np.random.default_rng(seed).choice)。
+    2) _DIFF_THRESHOLD_M を 0.03m に緩和し、距離 metric = median とする。
+    3) voxelHash & countRatio を EWMA(alpha=0.3) で平滑化し、スコア >0.6 で dirty。
+    4) 前回 LOD 生成後 200ms 未満なら強制キャッシュヒット (regeneration debounce)。
+  related_tasks: [T-MESH-202]
   status: "TODO"
 
-- id: T-MESH-203
-  description: "型エラーとガード整理 (mypy/pylint 0 エラー)"
-  depends_on: [P-MESH-009]
+- id: T-PERF-001
+  description: "MeshPipeline 差分ヒューリスティック最適化 & デバウンス"
+  depends_on: [P-PERF-001]
   steps:
-    - "1. camera None ガードを self.camera and ... 形式に統一。"
-    - "2. depth_image None ケースでゼロ配列を返し cv2.normalize 安全化。"
-    - "3. _last_contact_trigger_time のキーを 4-tuple に統一。"
-    - "4. Optional[List] 型シグネチャへ合わせ各呼び出しを修正。"
-    - "5. ROI tracking 統計呼び出しを self.hands_2d ガードで保護。"
-    - "6. DualViewer 親呼び出しの戻り値を無視 (None 型)。"
+    - "1. 固定 RNG でサンプリング ID を初期化 (_rng = np.random.default_rng(1234))。"
+    - "2. _distance_based_change: median(|p_i - prev_i|) > threshold 判定。"
+    - "3. EWMA スコア計算 util を src/mesh/utils.py に実装し diff メトリクスへ適用。"
+    - "4. PipelineManager.update_if_needed で 前回 regenerate からの経過時間を見て最小 0.2s 間隔を保証。"
   acceptance_criteria:
-    - "mypy strict と pylint が demo_collision_detection.py でエラー 0。"
+    - "手無しシーンで FPS ≥100、手移動時 regenerate で 30–60 FPS を維持。"
   status: "TODO"
 
-- id: T-MESH-204
-  description: "PointCloudProducer 起動と PipelineManager 統合"
-  depends_on: [T-MESH-200]
-  steps:
-    - "1. FullPipelineViewer.__init__ で PointCloudProducer を生成し start()。"
-    - "2. cleanup()/__del__ で stop_and_join()。"
-    - "3. フレームループで producer.get_latest() → PipelineManager.update_if_needed()。"
-  acceptance_criteria:
-    - "Depth→PointCloud スレッドが独立し GUI FPS 低下 <5%。"
+- id: P-PERF-002
+  title: "CPU Delaunay 100k+ pts がメインスレッドをブロックし GUI タイムアウト"
+  module: ["src/mesh/pipeline.py", "src/mesh/lod_mesh.py", "src/mesh/delaunay.py"]
+  severity: "Critical"
+  description: |
+    LODMeshGenerator が高密度点群 (≒70k~100k points) をそのまま CPU DelaunayTriangulator
+    に渡し、30ms 以上ブロック。Open3D/UI のイベントポンプが遅れ "強制終了" 扱いで
+    ターミナル SIGINT が送出される（ユーザが強制終了と誤解）。
+  fix_suggestion: |
+    • LODMeshGenerator.generate_mesh 内で adaptive_sampling=True の場合、
+      max_points を 12,000 に制限し八分木 subsample を行う。
+    • MeshPipeline.generate_mesh で CPU fallback 検知時 (triangulator.use_gpu=False)
+      に sampling_ratio=0.15 を強制し再実行。
+    • Triangulator を background ThreadPoolExecutor.submit() で非同期化し、
+      進行中は cached_mesh を返して UI がフリーズしないようにする。
   status: "TODO"
 
-- id: T-MESH-205
-  description: "Viewer 可視化 update_geometry 最適化"
-  depends_on: [T-MESH-201]
+- id: T-PERF-002
+  description: "LODMeshGenerator adaptive_sampling + 非同期三角分割"
+  depends_on: [P-PERF-002]
   steps:
-    - "1. _update_mesh_visualization() を remove/add せず vis.update_geometry() へ変更。"
-    - "2. mesh_version 変化時のみ update_geometry → poll_events → update_renderer。"
+    - "1. lod_mesh.py: max_points 引数を追加し default=12000。pointcloud が多い場合 subsample。"
+    - "2. delaunay.py: triangulate_heightmap_async(height_map) を実装 (ThreadPoolExecutor)。"
+    - "3. MeshPipeline.generate_mesh: GPU なし & points>max ⇒ async call, 旧 mesh を返却。"
+    - "4. PipelineManager.update_if_needed: async future 完了時に結果を swap-in。"
   acceptance_criteria:
-    - "Viewer で常時 25 FPS 以上を維持 (RTX3060 環境)。"
+    - "常時 GUI 応答あり (Open3D 10 FPS 以上)。"
+    - "手動 SIGINT なしで 3 分連続動作確認。"
   status: "TODO"

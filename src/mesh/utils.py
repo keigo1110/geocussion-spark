@@ -48,4 +48,38 @@ def rebuild_mesh_postprocess(mesh: TriangleMesh) -> TriangleMesh:  # noqa: D401 
     vert_normals = compute_vertex_normals(mesh.vertices, mesh.triangles, tri_normals)
     mesh.triangle_normals = tri_normals
     mesh.vertex_normals = vert_normals
-    return mesh 
+    return mesh
+
+
+# ---------------------------------------------------------------------------
+# Statistics helpers
+# ---------------------------------------------------------------------------
+
+
+class EWMASmoother:  # pylint: disable=too-few-public-methods
+    """Simple exponential weighted moving average smoother.
+
+    Parameters
+    ----------
+    alpha
+        Smoothing factor in range (0, 1]. Higher values = less smoothing.
+    """
+
+    def __init__(self, alpha: float = 0.3) -> None:
+        if not (0.0 < alpha <= 1.0):  # pragma: no cover – invalid conf
+            raise ValueError("alpha must be in (0,1]")
+        self._alpha = alpha
+        self._value: float | None = None
+
+    def update(self, new_value: float) -> float:
+        """Update the smoothed value and return it."""
+        if self._value is None:
+            self._value = new_value
+        else:
+            self._value = self._alpha * new_value + (1.0 - self._alpha) * self._value
+        return self._value
+
+    @property
+    def value(self) -> float:
+        """Return the latest smoothed value (or 0.0 before first update)."""
+        return self._value if self._value is not None else 0.0 
