@@ -929,7 +929,18 @@ class FullPipelineViewer(DualViewer):
             # 三角形データを抽出
             if not hasattr(self.current_mesh, 'vertices') or not hasattr(self.current_mesh, 'triangles'):
                 # GPU処理失敗時はCPU処理にフォールバック
-                return self.collision_tester.test_sphere_collision(hand_pos, radius, search_result)
+                if self.collision_tester is not None:
+                    return self.collision_tester.test_sphere_collision(hand_pos, radius, search_result)
+                from src.collision.sphere_tri import CollisionInfo
+                import numpy as _np
+                return CollisionInfo(
+                    has_collision=False,
+                    contact_points=[],
+                    closest_point=None,
+                    total_penetration_depth=0.0,
+                    collision_normal=_np.array([0.0, 0.0, 1.0]),
+                    collision_time_ms=0.0,
+                )
             
             vertices = np.asarray(self.current_mesh.vertices)
             triangles = np.asarray(self.current_mesh.triangles)
@@ -951,16 +962,19 @@ class FullPipelineViewer(DualViewer):
             if distances is not None and distances.size > 0:
                 # 衝突結果を生成
                 return self._create_collision_info_from_distances(
-                    distances, hand_pos, radius, vertices, triangles, search_result
+                    distances, hand_pos, radius, vertices, triangles, search_result, elapsed
                 )
             
             # 衝突なしの場合
             from src.collision.sphere_tri import CollisionInfo
+            import numpy as _np
             return CollisionInfo(
                 has_collision=False,
                 contact_points=[],
-                min_distance=float('inf'),
-                penetration_depth=0.0
+                closest_point=None,
+                total_penetration_depth=0.0,
+                collision_normal=_np.array([0.0, 0.0, 1.0]),
+                collision_time_ms=elapsed,
             )
             
         except Exception as e:
@@ -970,9 +984,11 @@ class FullPipelineViewer(DualViewer):
     
     def _create_collision_info_from_distances(self, distances: np.ndarray, hand_pos: np.ndarray, 
                                             radius: float, vertices: np.ndarray, 
-                                            triangles: np.ndarray, search_result: Any) -> Any:
+                                            triangles: np.ndarray, search_result: Any,
+                                            computation_time_ms: float) -> Any:
         """距離情報から衝突情報を生成"""
         from src.collision.sphere_tri import CollisionInfo, ContactPoint
+        from src.types import CollisionType
         
         # 衝突判定（半径内の距離）
         collision_mask = distances[0] <= radius
@@ -992,19 +1008,42 @@ class FullPipelineViewer(DualViewer):
                 normal = np.cross(v1, v2)
                 normal = normal / (np.linalg.norm(normal) + 1e-8)
                 
+                from numpy import array as _arr
                 contact_point = ContactPoint(
                     position=centroid,
                     normal=normal,
-                    distance=float(collision_distances[i]),
-                    triangle_index=int(tri_idx)
+                    depth=float(radius - collision_distances[i]),
+                    triangle_index=int(tri_idx),
+                    barycentric=_arr([1.0 / 3, 1.0 / 3, 1.0 / 3]),
+                    collision_type=CollisionType.FACE_COLLISION,
                 )
                 contact_points.append(contact_point)
         
+        if not contact_points:
+            import numpy as _np
+            return CollisionInfo(
+                has_collision=False,
+                contact_points=[],
+                closest_point=None,
+                total_penetration_depth=0.0,
+                collision_normal=_np.array([0.0, 0.0, 1.0]),
+                collision_time_ms=computation_time_ms,
+            )
+
+        # Determine aggregate metrics
+        closest_point = max(contact_points, key=lambda cp: cp.depth)
+        total_penetration = sum(cp.depth for cp in contact_points)
+        import numpy as _np
+        avg_normal = _np.mean([cp.normal for cp in contact_points], axis=0)
+        avg_normal = avg_normal / (_np.linalg.norm(avg_normal) + 1e-8)
+
         return CollisionInfo(
-            has_collision=len(contact_points) > 0,
+            has_collision=True,
             contact_points=contact_points,
-            min_distance=float(np.min(collision_distances)) if len(collision_distances) > 0 else float('inf'),
-            penetration_depth=float(np.max(radius - collision_distances[collision_distances <= radius])) if len(collision_distances[collision_distances <= radius]) > 0 else 0.0
+            closest_point=closest_point,
+            total_penetration_depth=total_penetration,
+            collision_normal=avg_normal,
+            collision_time_ms=computation_time_ms,
         )
     
     def _update_mesh_visualization(self, mesh: Any) -> None:
