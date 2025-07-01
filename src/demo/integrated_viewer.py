@@ -11,7 +11,7 @@ import numpy as np
 import cv2
 
 # パイプライン処理
-from .pipeline import HandledPipeline, HandledPipelineConfig, PipelineResults
+from .pipeline_wrapper import HandledPipeline, HandledPipelineConfig, PipelineResults
 
 # UI表示（Open3D）
 try:
@@ -24,10 +24,28 @@ except ImportError:
 # 音響設定
 from ..sound.mapping import ScaleType, InstrumentType
 from ..input.stream import OrbbecCamera
-from ..types import FrameData, OBFormat
+from ..types import FrameData, OBFormat, CameraIntrinsics
+
+# イベントシステム
+from .events import (
+    get_event_dispatcher,
+    EventHandler,
+    EventType,
+    KeyPressedEvent,
+    WindowResizedEvent,
+    ViewportChangedEvent,
+    FrameProcessedEvent,
+    MeshUpdatedEvent,
+    CollisionDetectedEvent,
+    StageCompletedEvent,
+    ErrorEvent
+)
+from .events.pipeline_events import MeshUpdatedEvent as MeshEvent
+from .events.pipeline_events import CollisionDetectedEvent as CollisionEvent
+from .events.config_handler import ConfigurationEventHandler
 
 
-class IntegratedGeocussionViewer:
+class IntegratedGeocussionViewer(EventHandler):
     """
     統合Geocussionビューワー
     HandledPipelineとUI表示を組み合わせた統合システム
@@ -104,6 +122,7 @@ class IntegratedGeocussionViewer:
         
         # 状態管理
         self.is_running = False
+        self.is_initialized = False
         self.current_results: Optional[PipelineResults] = None
         
         # パフォーマンス表示
@@ -111,6 +130,14 @@ class IntegratedGeocussionViewer:
         
         # ヘルプテキスト
         self.help_text = self._build_help_text()
+        
+        # イベントシステム初期化
+        self.event_dispatcher = get_event_dispatcher()
+        self._subscribe_to_events()
+        
+        # 設定変更ハンドラー初期化
+        self.config_handler = ConfigurationEventHandler(self.pipeline_config, self.pipeline)
+        self.event_dispatcher.subscribe(EventType.KEY_PRESSED, self.config_handler)
         
         print("統合ビューワー初期化完了")
         print(f"  - メッシュ生成: {'有効' if self.pipeline_config.enable_mesh_generation else '無効'}")
@@ -139,6 +166,100 @@ class IntegratedGeocussionViewer:
             help_text += "1/2: 音量調整\n"
         
         return help_text
+    
+    def _subscribe_to_events(self) -> None:
+        """イベントサブスクリプション設定"""
+        # パイプラインイベント
+        self.event_dispatcher.subscribe(EventType.FRAME_PROCESSED, self)
+        self.event_dispatcher.subscribe(EventType.MESH_UPDATED, self)
+        self.event_dispatcher.subscribe(EventType.COLLISION_DETECTED, self)
+        self.event_dispatcher.subscribe(EventType.STAGE_COMPLETED, self)
+        self.event_dispatcher.subscribe(EventType.PIPELINE_ERROR, self)
+    
+    def handle_event(self, event) -> None:
+        """
+        イベントハンドラー実装
+        
+        Args:
+            event: 処理するイベント
+        """
+        try:
+            if event.event_type == EventType.FRAME_PROCESSED:
+                # フレーム処理完了イベント
+                # 現在は_process_frameで直接処理しているので、必要に応じて実装
+                pass
+                
+            elif event.event_type == EventType.MESH_UPDATED:
+                # メッシュ更新イベント
+                if self.vis and not self.headless_mode:
+                    # メッシュ可視化を更新
+                    self._update_mesh_from_event(event)
+                    
+            elif event.event_type == EventType.COLLISION_DETECTED:
+                # 衝突検出イベント
+                if self.vis and not self.headless_mode:
+                    # 衝突可視化を更新
+                    self._update_collision_from_event(event)
+                    
+            elif event.event_type == EventType.STAGE_COMPLETED:
+                # ステージ完了イベント（パフォーマンス統計など）
+                if self.show_performance:
+                    print(f"Stage {event.stage_name} completed in {event.processing_time_ms:.1f}ms")
+                    
+            elif event.event_type == EventType.PIPELINE_ERROR:
+                # エラーイベント
+                print(f"Pipeline error in {event.stage_name}: {event.error_message}")
+                
+        except Exception as e:
+            print(f"Event handling error: {e}")
+    
+    def _update_mesh_from_event(self, event: MeshEvent) -> None:
+        """メッシュ更新イベントからメッシュを更新"""
+        try:
+            # 既存メッシュ削除
+            for geom in self.mesh_geometries:
+                self.vis.remove_geometry(geom, reset_bounding_box=False)
+            self.mesh_geometries.clear()
+            
+            # 新しいメッシュ作成
+            o3d_mesh = o3d.geometry.TriangleMesh()
+            o3d_mesh.vertices = o3d.utility.Vector3dVector(event.vertices)
+            o3d_mesh.triangles = o3d.utility.Vector3iVector(event.triangles)
+            
+            # メッシュ色設定
+            if event.colors is not None:
+                o3d_mesh.vertex_colors = o3d.utility.Vector3dVector(event.colors)
+            else:
+                o3d_mesh.paint_uniform_color([0.7, 0.7, 0.7])
+            
+            o3d_mesh.compute_vertex_normals()
+            
+            # ビューワーに追加
+            self.vis.add_geometry(o3d_mesh, reset_bounding_box=False)
+            self.mesh_geometries.append(o3d_mesh)
+            
+        except Exception as e:
+            print(f"Mesh update from event error: {e}")
+    
+    def _update_collision_from_event(self, event: CollisionEvent) -> None:
+        """衝突検出イベントから衝突可視化を更新"""
+        try:
+            # 既存衝突ジオメトリ削除
+            for geom in self.collision_geometries:
+                self.vis.remove_geometry(geom, reset_bounding_box=False)
+            self.collision_geometries.clear()
+            
+            # 新しい衝突点を表示
+            for collision in event.collision_events:
+                sphere = o3d.geometry.TriangleMesh.create_sphere(radius=0.02)
+                sphere.translate(collision.position)
+                sphere.paint_uniform_color([1.0, 0.0, 0.0])  # 赤色
+                
+                self.vis.add_geometry(sphere, reset_bounding_box=False)
+                self.collision_geometries.append(sphere)
+                
+        except Exception as e:
+            print(f"Collision update from event error: {e}")
     
     def initialize(self) -> bool:
         """
@@ -177,6 +298,7 @@ class IntegratedGeocussionViewer:
                     print("Warning: 3D viewer initialization failed")
             
             print("統合ビューワー初期化完了")
+            self.is_initialized = True
             return True
             
         except Exception as e:
@@ -207,23 +329,47 @@ class IntegratedGeocussionViewer:
     
     def run(self) -> bool:
         """メインループ実行"""
-        if not self.initialize():
-            print("Failed to initialize integrated viewer")
-            return False
+        # ヘッドレスモードの場合は初期化をスキップ
+        if self.headless_mode:
+            print("\n🖥️  ヘッドレスモード: カメラ初期化をスキップ")
+            # パイプラインのみ初期化（カメラなし）
+            if not self.pipeline.initialize(None):
+                print("Failed to initialize pipeline for headless mode")
+                return False
+            self.is_running = True
+            self._run_headless_mode()
+            return True
+        
+        # 通常モード（GUIモード）では既に初期化済みのはず
+        if not self.is_initialized:
+            print("⚠️  ビューワーが初期化されていません - 再初期化を試行")
+            if not self.initialize():
+                print("Failed to initialize integrated viewer")
+                return False
         
         self.is_running = True
         print("\n統合Geocussionビューワー開始!")
         
-        # ヘッドレスモード実行
-        if self.headless_mode:
-            self._run_headless_mode()
-            return True
-        
         # 通常モード実行
         try:
+            import cv2
+            
             while self.is_running:
                 if not self._process_frame():
                     break
+                
+                # キーボード入力チェック（OpenCV）
+                key = cv2.waitKey(1) & 0xFF
+                if key == ord('q') or key == 27:  # 'q' または ESC
+                    print("終了キーが押されました")
+                    break
+                elif key != 255:  # 何かキーが押された
+                    self._handle_key_event(key)
+                
+                # Open3Dビューワーのイベント処理
+                if HAS_OPEN3D and self.vis:
+                    self.vis.poll_events()
+                    self.vis.update_renderer()
                     
             return True
                     
@@ -242,7 +388,7 @@ class IntegratedGeocussionViewer:
         """ヘッドレスモード実行"""
         import time
         
-        print(f"\\n🖥️  ヘッドレスモード開始 - GUI無効化によるFPS最適化")
+        print(f"\n🖥️  ヘッドレスモード開始 - GUI無効化によるFPS最適化")
         print(f"⏱️  実行時間: {self.headless_duration}秒")
         print("=" * 50)
         
@@ -276,9 +422,9 @@ class IntegratedGeocussionViewer:
                     break
             
         except KeyboardInterrupt:
-            print("\\n⏹️  ユーザーによる中断")
+            print("\n⏹️  ユーザーによる中断")
         except Exception as e:
-            print(f"\\n❌ ヘッドレスモード実行エラー: {e}")
+            print(f"\n❌ ヘッドレスモード実行エラー: {e}")
         
         # 統計計算
         execution_time = time.time() - start_time
@@ -287,7 +433,7 @@ class IntegratedGeocussionViewer:
         min_fps = min(fps_samples) if fps_samples else 0
         
         # 結果表示
-        print("\\n" + "=" * 50)
+        print("\n" + "=" * 50)
         print("🏁 ヘッドレスモード 実行結果")
         print("=" * 50)
         print(f"⏱️  実行時間: {execution_time:.1f}秒")
@@ -299,9 +445,68 @@ class IntegratedGeocussionViewer:
     
     def _process_frame_headless(self) -> bool:
         """ヘッドレス専用フレーム処理（GUI描画なし）"""
+        import time
         try:
-            # パイプライン処理実行
-            results = self.pipeline.process_frame()
+            # ヘッドレスモード用モックデータ生成
+            if not self.camera:
+                # モック深度・カラー画像生成
+                import numpy as np
+                from ..types import FrameData, CameraIntrinsics
+                
+                depth_image = np.random.randint(500, 2000, (240, 424), dtype=np.uint16)
+                color_image = np.random.randint(0, 255, (480, 640, 3), dtype=np.uint8)
+                
+                # モックIntrinsics
+                intrinsics = CameraIntrinsics(
+                    fx=209.2152099609375,
+                    fy=209.2152099609375,
+                    cx=212.3312530517578,
+                    cy=119.83750915527344,
+                    width=424,
+                    height=240
+                )
+                
+                # モックフレームオブジェクト
+                class MockFrame:
+                    def __init__(self, data):
+                        self.data = data
+                    def get_data(self):
+                        return self.data
+                
+                # FrameData作成（正しいフィールド名を使用）
+                frame_data = FrameData(
+                    depth_frame=MockFrame(depth_image),
+                    color_frame=MockFrame(color_image),
+                    timestamp_ms=time.time() * 1000,
+                    frame_number=getattr(self, '_mock_frame_number', 0)
+                )
+                
+                # モックカメラのintrinsicsを設定（InputStageで使用）
+                if not hasattr(self, '_mock_camera_initialized'):
+                    # InputStageにモックカメラを設定
+                    class MockCamera:
+                        def __init__(self, intrinsics):
+                            self.depth_intrinsics = intrinsics
+                    
+                    mock_camera = MockCamera(intrinsics)
+                    self.pipeline._orchestrator.input_stage.camera = mock_camera
+                    
+                    # DetectionStageにもintrinsicsを設定
+                    self.pipeline._orchestrator.detection_stage.camera_intrinsics = intrinsics
+                    self._mock_camera_initialized = True
+                
+                # フレーム番号をインクリメント
+                self._mock_frame_number = getattr(self, '_mock_frame_number', 0) + 1
+                
+                # パイプライン処理実行（モックデータ付き）
+                results = self.pipeline.process_frame(frame_data)
+                
+                # モックデータの場合は処理遅延をシミュレート
+                time.sleep(0.015)  # 15ms
+            else:
+                # 実カメラからフレーム取得
+                results = self.pipeline.process_frame()
+            
             if not results:
                 return True  # フレーム取得失敗は継続
             
@@ -328,18 +533,15 @@ class IntegratedGeocussionViewer:
     def _process_frame(self) -> bool:
         """フレーム処理（通常モード）"""
         try:
-            # フレーム取得
-            frame_data = self.camera.get_frame()
-            if frame_data is None:
-                return False
-        
-            # パイプライン処理実行（正しいメソッド名を使用）
+            # パイプライン処理実行（ヘッドレスと同じロジック）
             results = self.pipeline.process_frame()
-            if results is None:
+            if not results:
                 return True  # フレーム取得失敗は継続
+            
+            self.current_results = results
         
             # カラー画像抽出（修正版メソッドを使用）
-            color_image = self._extract_color_image(results.frame_data if results.frame_data else frame_data)
+            color_image = self._extract_color_image(results.frame_data if hasattr(results, 'frame_data') and results.frame_data else None)
             
             # 可視化更新
             self._update_visualization(results, color_image)
@@ -560,6 +762,13 @@ class IntegratedGeocussionViewer:
     
     def _handle_key_event(self, key: int) -> None:
         """キーイベント処理"""
+        # キー押下イベントを発行
+        self.event_dispatcher.publish(KeyPressedEvent(
+            key_code=key,
+            shift=False,  # TODO: 修飾キーの検出
+            ctrl=False,
+            alt=False
+        ))
         if key == ord('h') or key == ord('H'):
             print(self.help_text)
         
@@ -629,7 +838,7 @@ class IntegratedGeocussionViewer:
         current_index = scales.index(self.pipeline_config.audio_scale)
         next_index = (current_index + 1) % len(scales)
         self.pipeline_config.audio_scale = scales[next_index]
-        self.pipeline.update_config(self.pipeline_config)
+        self.pipeline.update_config({'audio_scale': self.pipeline_config.audio_scale})
         print(f"音階: {self.pipeline_config.audio_scale.value}")
     
     def _cycle_audio_instrument(self) -> None:
@@ -638,7 +847,7 @@ class IntegratedGeocussionViewer:
         current_index = instruments.index(self.pipeline_config.audio_instrument)
         next_index = (current_index + 1) % len(instruments)
         self.pipeline_config.audio_instrument = instruments[next_index]
-        self.pipeline.update_config(self.pipeline_config)
+        self.pipeline.update_config({'audio_instrument': self.pipeline_config.audio_instrument})
         print(f"楽器: {self.pipeline_config.audio_instrument.value}")
     
     def _extract_color_image(self, frame_data):
@@ -849,6 +1058,7 @@ class IntegratedGeocussionViewer:
         """クリーンアップ処理"""
         try:
             self.is_running = False
+            self.is_initialized = False
             
             # パイプラインクリーンアップ
             if self.pipeline:

@@ -110,15 +110,20 @@ class DualViewer:
             成功した場合True
         """
         try:
-            # カメラ初期化
-            self.camera = OrbbecCamera(enable_color=True)
-            if not self.camera.initialize():
-                print("Failed to initialize camera")
-                return False
-            
-            if not self.camera.start():
-                print("Failed to start camera")
-                return False
+            # 既に外部からカメラが注入されている場合は再利用する
+            if self.camera is None:
+                # カメラをまだ持っていない場合のみ新規生成
+                self.camera = OrbbecCamera(enable_color=True)
+
+            # カメラが未初期化・未スタートならここで起動する
+            if not getattr(self.camera, "is_started", False):
+                if not self.camera.initialize():
+                    print("Failed to initialize camera")
+                    return False
+
+                if not self.camera.start():
+                    print("Failed to start camera")
+                    return False
             
             # 点群コンバーター初期化
             if self.camera.depth_intrinsics:
@@ -332,42 +337,21 @@ class DualViewer:
                        (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
             display_images.append(depth_resized)
             
-            # RGB画像
-            if frame_data.color_frame is not None and self.camera.has_color:
-                color_data = np.frombuffer(frame_data.color_frame.get_data(), dtype=np.uint8)
-                color_format = frame_data.color_frame.get_format()
-                
-                # フォーマットに応じた変換
-                if hasattr(frame_data.color_frame, 'get_format'):
-                    color_format = frame_data.color_frame.get_format()
-                    try:
-                        from pyorbbecsdk import OBFormat
-                    except ImportError:
-                        pass  # Use the imported OBFormat from src.types
-                    
-                    if color_format == OBFormat.RGB:
-                        color_image = color_data.reshape((self.camera.depth_intrinsics.height, self.camera.depth_intrinsics.width, 3))
-                    elif color_format == OBFormat.BGR:
-                        color_image = color_data.reshape((self.camera.depth_intrinsics.height, self.camera.depth_intrinsics.width, 3))
-                        color_image = cv2.cvtColor(color_image, cv2.COLOR_BGR2RGB)
-                    elif color_format == OBFormat.MJPG:
-                        color_image = cv2.imdecode(color_data, cv2.IMREAD_COLOR)
-                        if color_image is not None:
-                            color_image = cv2.cvtColor(color_image, cv2.COLOR_BGR2RGB)
-                    else:
-                        color_image = None
-                        
-                    if color_image is not None:
-                        color_resized = cv2.resize(color_image, self.rgb_window_size)
-                        color_bgr = cv2.cvtColor(color_resized, cv2.COLOR_RGB2BGR)
-                        
-                        # 手検出結果を描画
-                        if self.enable_hand_detection and hands_2d:
-                            color_bgr = self._draw_hand_detections(color_bgr, hands_2d, hands_3d, tracked_hands)
-                        
-                        cv2.putText(color_bgr, f"RGB (FPS: {self.performance_stats['fps']:.1f})", 
-                                   (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-                        display_images.append(color_bgr)
+            # RGB画像処理（手検出結果はキャッシュを使用）
+            color_bgr = self._process_color_image(frame_data, hands_2d, hands_3d, tracked_hands)
+
+            # 画面チラつきを防ぐため、カラーが取得できないフレームは前フレームを使い回す
+            if color_bgr is None:
+                if hasattr(self, "_last_color_bgr") and self._last_color_bgr is not None:
+                    color_bgr = self._last_color_bgr
+                else:
+                    # プレースホルダ（黒）
+                    color_bgr = np.zeros((self.rgb_window_size[1], self.rgb_window_size[0], 3), dtype=np.uint8)
+
+            # キャッシュ更新
+            self._last_color_bgr = color_bgr
+
+            display_images.append(color_bgr)
             
             # 画像を横に並べて表示
             if len(display_images) > 1:
@@ -607,12 +591,12 @@ class DualViewer:
         
         return hands_2d, hands_3d, tracked_hands
     
-    def _draw_hand_detections(self, image: np.ndarray, hands_2d: list, hands_3d: list, tracked_hands: list) -> np.ndarray:
+    def _process_color_image(self, frame_data: FrameData, hands_2d: list, hands_3d: list, tracked_hands: list) -> np.ndarray:
         """
         RGB画像に手検出結果を描画
         
         Args:
-            image: 描画対象画像
+            frame_data: フレームデータ
             hands_2d: 2D手検出結果
             hands_3d: 3D手検出結果
             tracked_hands: トラッキング結果
@@ -620,7 +604,7 @@ class DualViewer:
         Returns:
             描画済み画像
         """
-        height, width = image.shape[:2]
+        height, width = frame_data.color_frame.get_data().shape[:2]
         
         # 2D手検出結果描画
         for hand_2d in hands_2d:
@@ -637,12 +621,12 @@ class DualViewer:
                 int(bbox[3] * scale_y)
             )
             
-            cv2.rectangle(image, (bbox_scaled[0], bbox_scaled[1]), 
+            cv2.rectangle(frame_data.color_frame.get_data(), (bbox_scaled[0], bbox_scaled[1]), 
                          (bbox_scaled[0] + bbox_scaled[2], bbox_scaled[1] + bbox_scaled[3]), 
                          (0, 255, 255), 2)
             
             # 手の情報
-            cv2.putText(image, f"{hand_2d.handedness.value} ({hand_2d.confidence:.2f})",
+            cv2.putText(frame_data.color_frame.get_data(), f"{hand_2d.handedness.value} ({hand_2d.confidence:.2f})",
                        (bbox_scaled[0], bbox_scaled[1] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
             
             # 主要ランドマーク描画
@@ -650,32 +634,32 @@ class DualViewer:
                 if i in [0, 4, 8, 12, 16, 20]:  # 主要ランドマークのみ
                     x = int(landmark.x * width)
                     y = int(landmark.y * height)
-                    cv2.circle(image, (x, y), 3, (0, 255, 0), -1)
+                    cv2.circle(frame_data.color_frame.get_data(), (x, y), 3, (0, 255, 0), -1)
         
         # 3D投影結果情報表示
         info_y = 60
         if hands_3d:
-            cv2.putText(image, f"3D Hands: {len(hands_3d)}", (10, info_y), 
+            cv2.putText(frame_data.color_frame.get_data(), f"3D Hands: {len(hands_3d)}", (10, info_y), 
                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 0), 2)
             
             for i, hand_3d in enumerate(hands_3d):
                 palm_x, palm_y, palm_z = hand_3d.palm_center_3d
-                cv2.putText(image, f"  Hand {i+1}: ({palm_x:.2f}, {palm_y:.2f}, {palm_z:.2f}m)",
+                cv2.putText(frame_data.color_frame.get_data(), f"  Hand {i+1}: ({palm_x:.2f}, {palm_y:.2f}, {palm_z:.2f}m)",
                            (10, info_y + 25 * (i + 1)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 1)
         
         # トラッキング結果表示
         if tracked_hands:
             track_y = info_y + 25 * (len(hands_3d) + 2) if hands_3d else info_y + 25
-            cv2.putText(image, f"Tracked: {len(tracked_hands)}", (10, track_y), 
+            cv2.putText(frame_data.color_frame.get_data(), f"Tracked: {len(tracked_hands)}", (10, track_y), 
                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
             
             for i, tracked_hand in enumerate(tracked_hands):
                 speed = tracked_hand.speed
-                cv2.putText(image, 
+                cv2.putText(frame_data.color_frame.get_data(), 
                            f"  ID: {tracked_hand.id[:8]} Speed: {speed:.2f}m/s",
                            (10, track_y + 25 * (i + 1)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
         
-        return image
+        return frame_data.color_frame.get_data()
     
     def _update_hand_markers(self) -> None:
         """3D点群ビューワーの手マーカーを更新"""

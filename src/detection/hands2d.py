@@ -114,30 +114,43 @@ class MediaPipeHandsWrapper:
             self.mp_hands = mp.solutions.hands
             self.mp_drawing = mp.solutions.drawing_utils
             
-            # GPU/CPU設定
-            if self.use_gpu:
-                # GPU使用時の設定
-                self.hands = self.mp_hands.Hands(
+            def _create_hands_instance(use_gpu: bool):
+                return self.mp_hands.Hands(
                     static_image_mode=False,
                     max_num_hands=self.max_num_hands,
                     min_detection_confidence=self.min_detection_confidence,
                     min_tracking_confidence=self.min_tracking_confidence,
-                    model_complexity=self.model_complexity
+                    model_complexity=self.model_complexity if use_gpu else 0  # CPU時は lite
                 )
+
+            # 1) GPU でトライ
+            init_success = False
+            try:
+                self.hands = _create_hands_instance(use_gpu=self.use_gpu)
+                init_success = True
+            except (RuntimeError, ValueError, Exception) as e:
+                if self.use_gpu:
+                    logger.warning(f"MediaPipe GPU initialization failed: {e}. Falling back to CPU mode.")
+                else:
+                    logger.warning(f"MediaPipe CPU initialization error: {e}")
+
+            # 2) CPU フォールバック
+            if not init_success:
+                try:
+                    self.hands = _create_hands_instance(use_gpu=False)
+                    self.use_gpu = False  # 状態を更新
+                    init_success = True
+                except Exception as e:
+                    logger.error(f"MediaPipe CPU fallback also failed: {e}")
+                    init_success = False
+
+            if init_success:
+                self.is_initialized = True
+                roi_status = f" (ROI tracking: {'enabled' if self.enable_roi_tracking else 'disabled'})"
+                logger.info(f"MediaPipe Hands initialized ({'GPU' if self.use_gpu else 'CPU'} mode){roi_status}")
+                return True
             else:
-                # CPU使用時の設定
-                self.hands = self.mp_hands.Hands(
-                    static_image_mode=False,
-                    max_num_hands=self.max_num_hands,
-                    min_detection_confidence=self.min_detection_confidence,
-                    min_tracking_confidence=self.min_tracking_confidence,
-                    model_complexity=0  # CPU時はliteモデル使用
-                )
-            
-            self.is_initialized = True
-            roi_status = f" (ROI tracking: {'enabled' if self.enable_roi_tracking else 'disabled'})"
-            logger.info(f"MediaPipe Hands initialized ({'GPU' if self.use_gpu else 'CPU'} mode){roi_status}")
-            return True
+                return False
             
         except ImportError as e:
             # MediaPipeモジュールのインポートエラー
@@ -531,52 +544,47 @@ class MediaPipeHandsWrapper:
         draw_connections: bool = True
     ) -> np.ndarray:
         """ランドマーク描画"""
-        if not self.is_initialized or not self.mp_drawing:
+        if not self.is_initialized:
             return image
-        
+
         try:
-            if hand_result.is_tracked:
-                # ROI トラッキング結果の場合は矩形のみ描画
-                x, y, w, h = hand_result.bounding_box
-                cv2.rectangle(image, (x, y), (x + w, y + h), (0, 255, 255), 2)  # 黄色の矩形
-                cv2.putText(image, f"Tracked: {hand_result.confidence:.2f}", 
-                           (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
-                return image
-            
-            # MediaPipe ランドマークの描画
-            # landmark list を MediaPipe format に変換
             height, width = image.shape[:2]
-            mp_landmarks = []
-            
-            for landmark in hand_result.landmarks:
-                mp_landmark = type('', (), {})()
-                mp_landmark.x = landmark.x
-                mp_landmark.y = landmark.y
-                mp_landmark.z = landmark.z
-                mp_landmarks.append(mp_landmark)
-            
-            # MediaPipe format の landmark list
-            landmarks_container = type('', (), {})()
-            landmarks_container.landmark = mp_landmarks
-            
-            # 描画
-            self.mp_drawing.draw_landmarks(
-                image, 
-                landmarks_container,
-                self.mp_hands.HAND_CONNECTIONS if draw_connections else None
-            )
-            
-            # 手の種類とID表示
-            x, y, w, h = hand_result.bounding_box
+
+            # ROI トラッキング結果: バウンディングボックスのみ
+            if hand_result.is_tracked:
+                x, y, w, h = hand_result.bounding_box
+                cv2.rectangle(image, (x, y), (x + w, y + h), (0, 255, 255), 2)
+                cv2.putText(image, f"Tracked {hand_result.confidence:.2f}",
+                            (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+                return image
+
+            # --- 軽量 OpenCV 描画 ---
+            pts = []
+            for lm in hand_result.landmarks:
+                cx, cy = int(lm.x * width), int(lm.y * height)
+                pts.append((cx, cy))
+                cv2.circle(image, (cx, cy), 3, (0, 255, 0), -1)
+
+            # 簡易骨格線（親指とそれ以外をざっくり接続）
+            basic_connections = [
+                (0, 1), (1, 2), (2, 3), (3, 4),   # 親指
+                (5, 6), (6, 7), (7, 8),            # 人差し指
+                (9,10), (10,11), (11,12),          # 中指
+                (13,14), (14,15), (15,16),         # 薬指
+                (17,18), (18,19), (19,20),         # 小指
+                (0,5), (5,9), (9,13), (13,17), (17,0)  # 手のひら
+            ] if draw_connections and len(pts) == 21 else []
+
+            for a, b in basic_connections:
+                cv2.line(image, pts[a], pts[b], (0, 255, 0), 1)
+
+            # ラベル
+            x, y, w_box, h_box = hand_result.bounding_box
             label = f"{hand_result.handedness.value} {hand_result.id}"
             cv2.putText(image, label, (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
-            
-        except (cv2.error, AttributeError) as e:
-            # 描画エラー（警告レベル）
-            logger.warning(f"Landmark drawing error: {e}")
+
         except Exception as e:
-            # その他の予期しないエラー
-            logger.error(f"Unexpected landmark drawing error: {e}")
+            logger.warning(f"Landmark drawing error: {e}")
         
         return image
 
