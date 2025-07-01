@@ -19,6 +19,7 @@ from typing import List, Optional, Tuple
 import time
 import logging
 import numpy as np
+import weakref
 
 from .lod_mesh import LODMeshGenerator, TriangleMesh
 from .incremental import IncrementalMeshUpdater
@@ -94,7 +95,8 @@ class MeshPipeline:  # pylint: disable=too-few-public-methods
     ) -> None:
         self._lod = lod_generator or LODMeshGenerator()
         self._inc = incremental_updater  # may be None for the very first milestone
-        self._cached_mesh: Optional[TriangleMesh] = None
+        # Cache is stored as weak reference to avoid preventing GC (T-MEM-001)
+        self._cached_mesh_ref: Optional[weakref.ref[TriangleMesh]] = None
         self._stats = MeshPipelineStats()
 
         # --- Point-cloud diff state (T-PERF-001) --------------------------
@@ -140,8 +142,10 @@ class MeshPipeline:  # pylint: disable=too-few-public-methods
         force_update
             Skip cache heuristics and recompute unconditionally.
         """
+        cached_mesh = self._cached_mesh_ref() if (self._cached_mesh_ref is not None) else None  # type: ignore[misc]
+
         if points_3d is None or len(points_3d) < 10:  # type: ignore[arg-type]
-            return MeshResult(self._cached_mesh, changed=False, needs_refresh=False)
+            return MeshResult(cached_mesh, changed=False, needs_refresh=False)
 
         start = time.perf_counter()
 
@@ -151,12 +155,12 @@ class MeshPipeline:  # pylint: disable=too-few-public-methods
 
         refresh_due_to_diff = False
 
-        if not force_update and self._cached_mesh is not None:
+        if not force_update and cached_mesh is not None:
             # Debounce: if last regeneration happened <0.2s ago use cache directly
             if (time.perf_counter() - self._last_regen_ts) < 0.2:
                 elapsed = (time.perf_counter() - start) * 1000.0
                 self._stats.record(elapsed, "cache")
-                return MeshResult(self._cached_mesh, changed=False, needs_refresh=False)
+                return MeshResult(cached_mesh, changed=False, needs_refresh=False)
 
         if force_update:
             # Explicit regeneration request
@@ -164,7 +168,7 @@ class MeshPipeline:  # pylint: disable=too-few-public-methods
             selected_path = "lod"
         else:
             # If incremental updater is available and we have a previous mesh
-            if self._inc and self._cached_mesh is not None:
+            if self._inc and cached_mesh is not None:
                 try:
                     mesh, did_full = self._inc.update_mesh(points_3d, force_full_update=False)
                     selected_path = "inc-full" if did_full else "inc"
@@ -180,10 +184,11 @@ class MeshPipeline:  # pylint: disable=too-few-public-methods
         # Cache management
         if mesh is not None:
             # Detect whether this mesh differs from cached one (object identity)
-            mesh_changed = mesh is not self._cached_mesh
-            self._cached_mesh = mesh
+            mesh_changed = mesh is not cached_mesh
+            # Replace cached reference
+            self._cached_mesh_ref = weakref.ref(mesh)
         else:
-            mesh = self._cached_mesh  # keep previous mesh if generation failed
+            mesh = cached_mesh  # keep previous mesh if generation failed
             mesh_changed = False
 
         elapsed = (time.perf_counter() - start) * 1000.0

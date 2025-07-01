@@ -1619,6 +1619,17 @@ class FullPipelineViewer(DualViewer):
         
         self.perf_stats['total_pipeline_time'] = (time.perf_counter() - pipeline_start) * 1000
         
+        # ---- Memory hygiene: purge processed collision events (T-MEM-001) ----
+        if hasattr(self, 'event_queue') and self.event_queue is not None:
+            try:
+                self.event_queue.pop_processed(max_length=256)
+            except AttributeError:
+                # Older versions of CollisionEventQueue may lack this method
+                # (e.g. when running mixed code revisions). Fallback: clear if too big.
+                if len(self.event_queue.event_queue) > 512:
+                    while len(self.event_queue.event_queue) > 256:
+                        self.event_queue.event_queue.popleft()
+
         return collision_events
     
     def _should_update_mesh(self, tracked_hands: List[TrackedHand], 
@@ -1804,6 +1815,15 @@ class FullPipelineViewer(DualViewer):
                     gy = int(round(event.contact_position[1] * 50))
                     gz = int(round(event.contact_position[2] * 50))
                     self._last_contact_trigger_time[(event.hand_id, gx, gy, gz)] = current_time
+
+                    # Keep the debounce map bounded (T-MEM-001)
+                    if len(self._last_contact_trigger_time) > 500:
+                        # Remove ~20% oldest entries to avoid frequent churn
+                        for _ in range(int(0.2 * len(self._last_contact_trigger_time))):
+                            try:
+                                self._last_contact_trigger_time.pop(next(iter(self._last_contact_trigger_time)))
+                            except Exception:  # pragma: no cover
+                                break
             
             except Exception as e:
                 logger.error(f"音響生成エラー（イベント: {event.event_id}）: {e}")

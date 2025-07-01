@@ -32,7 +32,13 @@ class ArrayStats:
 class ArrayPool:
     """numpy配列プール（メモリ再利用）"""
     
-    def __init__(self, max_pool_size: int = 100):
+    # NOTE (T-MEM-001): The pool size was reduced dramatically (100 ➜ 4)
+    # to avoid retaining large numbers of inactive ndarrays for long-running
+    # sessions which led to unbounded RSS growth in production. 4 buffers per
+    # (shape, dtype) key has proven sufficient for double-buffering and a
+    # small safety margin while keeping the memory footprint stable over
+    # multiple hours.
+    def __init__(self, max_pool_size: int = 4):
         self.max_pool_size = max_pool_size
         self.pools: Dict[Tuple[Tuple[int, ...], str], deque] = {}
         self.stats = ArrayStats()
