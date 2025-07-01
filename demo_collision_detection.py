@@ -1179,6 +1179,22 @@ class FullPipelineViewer(DualViewer):
         if self.current_mesh and self.enable_collision_visualization:
             self._update_mesh_visualization(self.current_mesh)
         self._update_collision_visualization()
+
+        # Open3D ビューワーへ再描画を通知 (MS3 – Viewer refresh)
+        self._refresh_viewer()
+
+    # ------------------------------------------------------------------
+    # 3D Viewer helpers
+    # ------------------------------------------------------------------
+
+    def _refresh_viewer(self) -> None:
+        """Force Open3D visualizer to redraw the scene."""
+        if hasattr(self, "vis") and self.vis is not None:
+            try:
+                self.vis.poll_events()
+                self.vis.update_renderer()
+            except Exception as exc:  # pylint: disable=broad-except
+                logger.debug("Visualizer refresh failed: %s", exc)
     
     def _force_mesh_update(self) -> None:
         """メッシュ強制更新をリクエスト"""

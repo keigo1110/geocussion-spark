@@ -13,6 +13,7 @@ Level of Detail (LOD) メッシュ生成システム
 """
 
 import time
+import gc
 from typing import Optional, Tuple, List, Dict, Any
 from dataclasses import dataclass
 import numpy as np
@@ -146,7 +147,16 @@ class LODMeshGenerator:
             mesh = self.triangulator.triangulate_points(filtered_points)
             tri_time = (time.perf_counter() - tri_start) * 1000
             
-            # キャッシュ更新
+            # キャッシュ更新 (旧メッシュを確実に解放) – T-MESH-104
+            if self.cached_mesh is not None:
+                try:
+                    del self.cached_mesh  # remove strong ref
+                except Exception:
+                    pass
+                # 不要参照クリア
+                self.mesh_update_regions.clear()
+                gc.collect()
+
             self.cached_mesh = mesh
             self.cache_timestamp = current_time
             self.last_hand_positions = [hand.position.copy() for hand in tracked_hands]
