@@ -67,6 +67,9 @@ problems:
   - id: GAP-04
     title: "Collision → Audio パスの詳細プロファイル不足"
     impact: "ボトルネック特定が困難、レイテンシ保証不可"
+  - id: GAP-05
+    title: "RGB ウィンドウ描画がカクつく"
+    impact: "Depth 画は滑らかだが RGB 側が 5–10 FPS まで低下し UX が悪化。\n      Root-cause: 同フレーム再取得・cv2.normalize 連続実行・MJPG デコードの再実行・OpenCV resize 多重化でフレーム時間スパイク (≈150 ms)。"
 
 # -----------------------------------------------------------------------------
 # 実装プラン (タスク分解)
@@ -121,6 +124,21 @@ tasks:
       - "GPU 距離計算のバッチサイズを 1 → N に動的調整し呼び出し回数を削減。"
     acceptance:
       - "平均レイテンシ < 30 ms (95th パーセンタイル)。"
+    status: "PENDING"
+
+  - id: T-5
+    title: "DualViewer RGB パイプライン最適化"
+    depends_on: []
+    steps:
+      - "_process_hand_detection を FrameData 共有型に変更しカメラ再取得を排除。"
+      - "Depth 可視化を convertScaleAbs + applyColorMap で固定スケール化し 1 ms 未満に短縮。"
+      - "ColorFrame 変換をフォーマット毎に一度だけ実施し、BGR→resize→cache で再利用。"
+      - "PointCloud/O3D 更新を ThreadPoolExecutor で非同期化し GUI スレッド負荷を抑制。"
+      - "skip_interval を 8 へ引き上げ MediaPipe 実行負荷を低減 (GPU 有効時は 4)。"
+    acceptance:
+      - "RGB ウィンドウ FPS ≥ 25 (low-res 424×240, CPU モード)。"
+      - "Depth と RGB のフレームタイミング差 < 1 フレーム。"
+      - "パフォーマンスオーバーレイで HandDetectionTime が安定 (<20 ms) しフレームスパイク消滅。"
     status: "PENDING"
 
 metrics:
