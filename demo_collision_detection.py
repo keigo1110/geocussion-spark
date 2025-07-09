@@ -153,6 +153,8 @@ from src.input.pointcloud import PointCloudConverter
 from src.config import get_config, InputConfig
 from src.mesh.pipeline import create_mesh_pipeline  # unified mesh pipeline
 from src.mesh.manager import PipelineManager  # NEW pipeline manager
+from src.mesh.update_scheduler import MeshUpdateScheduler  # NEW scheduler
+from src.mesh.terrain_change import TerrainChangeDetector  # NEW change detector
 
 # GPU加速コンポーネントの動的インポート
 HAS_GPU_ACCELERATION = False
@@ -419,8 +421,14 @@ class FullPipelineViewer(DualViewer):
 
         # 統合 MeshPipeline
         self.mesh_pipeline = create_mesh_pipeline(enable_incremental=False)
-        self.pipeline_manager = PipelineManager(self.mesh_pipeline)
+        # 1 Hz mesh update interval (configurable via scheduler)
+        self.pipeline_manager = PipelineManager(self.mesh_pipeline, min_interval_sec=1.0)
         self._mesh_version = -1  # track version for viewer refresh
+    
+        # Mesh update scheduler & terrain change detector --------------------------------
+        self.mesh_scheduler = MeshUpdateScheduler(base_interval_sec=1.0, grace_period_sec=1.0)
+        self.terrain_detector = TerrainChangeDetector()
+        self.terrain_deforming: bool = False  # flag to pause audio
     
     def _initialize_hand_detection(self):
         """手検出コンポーネントを初期化"""
@@ -1305,6 +1313,10 @@ class FullPipelineViewer(DualViewer):
         # フィルタ適用
         depth_image = self._apply_depth_filter(depth_image)
         
+        # ---------------- Hand detection first ----------------
+        hands_2d, hands_3d, tracked_hands = self._perform_hand_detection(depth_image)
+        self._save_hand_detection_results(hands_2d, hands_3d, tracked_hands)
+
         # ---------------- Hand masking (P-HAND-002) ----------------
         from src.detection.hand_mask import HandMasker  # type: ignore
         if not hasattr(self, "_hand_masker"):
@@ -1312,29 +1324,40 @@ class FullPipelineViewer(DualViewer):
 
         depth_image_masked, centers_3d, radii_arr = self._hand_masker.apply_mask(
             depth_image,
-            self.current_hands_2d,
-            self.current_tracked_hands,
+            hands_2d,
+            tracked_hands,
         )
 
         # 最新深度をキャッシュ
         self._latest_depth_image = depth_image_masked
 
-        # 点群生成
-        points_3d = self._generate_point_cloud_if_needed(depth_image_masked)
-
-        # 手検出処理はマスク前の深度画像を使用
-
-        hands_2d, hands_3d, tracked_hands = self._perform_hand_detection(depth_image)
-        self._save_hand_detection_results(hands_2d, hands_3d, tracked_hands)
-
-        # ----- adjust further references -----
-        # Use adaptive exclusion when we regenerate pointcloud on subsequent calls
+        # ----- adaptive exclusion for point cloud -----
         self._exclude_centers_cached = (centers_3d, radii_arr)
+
+        # 点群生成（手マスク後）
+        points_3d = self._generate_point_cloud_if_needed(depth_image_masked)
 
         # Continue pipeline below so we need to skip duplicated code (return later edits)
         
-        # 衝突検出とメッシュ生成のパイプライン
-        collision_events = self._process_collision_pipeline(points_3d, tracked_hands)
+        # --------------------------------------------------------------
+        # Terrain change detection (before heavy mesh generation)
+        # --------------------------------------------------------------
+        # Preliminary hand presence (2D or 3D)
+        prelim_hands_present = bool(self.current_hands_2d) or bool(tracked_hands)
+
+        self.terrain_deforming = self.terrain_detector.update(
+            depth_image_masked, hands_present=prelim_hands_present
+        )
+
+        # --------------------------------------------------------------
+        # Decide if we need to force mesh update via scheduler
+        # --------------------------------------------------------------
+        any_hands_present = bool(self.current_hands_2d) or bool(tracked_hands) or self.terrain_deforming
+        force_update = self.mesh_scheduler.should_update(any_hands_present)
+
+        collision_events = self._process_collision_pipeline(
+            points_3d, tracked_hands, force_update=force_update
+        )
         
         # 表示処理（ヘッドレスモードでは表示をスキップ）
         if not self.headless_mode:
@@ -1353,6 +1376,22 @@ class FullPipelineViewer(DualViewer):
         frame_time = (time.perf_counter() - frame_start_time) * 1000
         self.performance_stats['frame_time'] = frame_time
         self.performance_stats['fps'] = 1000.0 / frame_time if frame_time > 0 else 0.0
+        
+        # オーディオ一時停止制御 ----------------------------------------
+        if (
+            self.enable_audio_synthesis
+            and self.audio_enabled
+            and getattr(self, "voice_manager", None) is not None
+        ):
+            if self.terrain_deforming and not getattr(self, "_audio_paused", False):
+                try:
+                    self.voice_manager.stop_all_voices()  # type: ignore[func-returns-value]
+                except Exception:
+                    pass  # tolerate
+                self._audio_paused = True
+            elif (not self.terrain_deforming) and getattr(self, "_audio_paused", False):
+                # resume (nothing to do; voices will play on next collision)
+                self._audio_paused = False
         
         return True
     
@@ -1610,14 +1649,23 @@ class FullPipelineViewer(DualViewer):
             del self._hand_position_history[hid]
     
     def _process_collision_pipeline(self, points_3d: Optional[np.ndarray], 
-                                   tracked_hands: List[TrackedHand]) -> List[Any]:
+                                   tracked_hands: List[TrackedHand], *,
+                                   force_update: bool = False) -> List[Any]:
         """衝突検出とメッシュ生成のパイプライン処理"""
         pipeline_start = time.perf_counter()
         self.frame_counter = self.frame_count
         collision_events = []
         
+        # Determine hand presence (2D or tracked)
+        any_hands_present = bool(self.current_hands_2d) or bool(tracked_hands)
+
         # Mesh update via PipelineManager (asynchronous-ready)
-        res = self.pipeline_manager.update_if_needed(points_3d, tracked_hands)
+        res = self.pipeline_manager.update_if_needed(
+            points_3d,
+            tracked_hands,
+            hands_present_override=any_hands_present,
+            force=force_update,
+        )
 
         if res.mesh is not None and (
             self._mesh_version != self.pipeline_manager.get_version()
@@ -1639,7 +1687,12 @@ class FullPipelineViewer(DualViewer):
             collision_events = self._perform_collision_detection(tracked_hands)
         
         # 音響生成
-        if self.enable_audio_synthesis and self.audio_enabled and collision_events:
+        if (
+            self.enable_audio_synthesis
+            and self.audio_enabled
+            and collision_events
+            and not self.terrain_deforming
+        ):
             self._perform_audio_synthesis(collision_events)
         
         self.perf_stats['total_pipeline_time'] = (time.perf_counter() - pipeline_start) * 1000
@@ -1655,6 +1708,10 @@ class FullPipelineViewer(DualViewer):
                     while len(self.event_queue.event_queue) > 256:
                         self.event_queue.event_queue.popleft()
 
+        if force_update:
+            # Inform scheduler that we actually regenerated so interval resets
+            self.mesh_scheduler.mark_updated()
+        
         return collision_events
     
     def _should_update_mesh(self, tracked_hands: List[TrackedHand], 

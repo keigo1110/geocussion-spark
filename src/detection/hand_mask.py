@@ -63,10 +63,29 @@ class HandMasker:  # pylint: disable=too-few-public-methods
         """
         masked = depth_image.copy()
 
-        # --- 2-D depth blanking ---------------------------------------
+        # --- Handle resolution mismatch between RGB (detection) and depth ---
         h_img, w_img = depth_image.shape[:2]
+
+        # Estimate original resolution from bounding boxes (assume same for all)
+        if hands_2d:
+            max_x_bb = max((bx + bw) for bx, _, bw, _ in (h.bounding_box for h in hands_2d))
+            max_y_bb = max((by + bh) for _, by, _, bh in (h.bounding_box for h in hands_2d))
+            src_w = max(max_x_bb, w_img)
+            src_h = max(max_y_bb, h_img)
+        else:
+            src_w, src_h = w_img, h_img
+
+        scale_x = w_img / src_w if src_w > 0 else 1.0
+        scale_y = h_img / src_h if src_h > 0 else 1.0
+
         for hand in hands_2d:
             x, y, w, h = hand.bounding_box
+            # Scale bbox to depth resolution
+            x *= scale_x
+            y *= scale_y
+            w *= scale_x
+            h *= scale_y
+
             cx = x + w / 2.0
             cy = y + h / 2.0
             w *= self.inflate
