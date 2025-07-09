@@ -149,3 +149,23 @@ PERFORMANCE_HISTORY_SIZE: Final[int] = 100
 # パフォーマンス警告閾値
 HIGH_CPU_USAGE_THRESHOLD: Final[float] = 80.0  # 80%
 HIGH_MEMORY_USAGE_THRESHOLD: Final[float] = 512 * 1024 * 1024  # 512MB 
+
+# =============================================================================
+# デモスクリプト（demo_collision_detection.py）固有の設定
+# =============================================================================
+
+# 衝突デモ用デフォルト値
+DEMO_SPHERE_RADIUS_DEFAULT: Final[float] = 0.05  # 5 cm
+DEMO_MESH_UPDATE_INTERVAL: Final[int] = 15       # フレーム
+DEMO_MAX_MESH_SKIP_FRAMES: Final[int] = 60       # フレーム
+
+# オーディオ／ビジュアルデフォルト
+DEMO_AUDIO_COOLDOWN_TIME: Final[float] = 0.3     # 秒
+DEMO_VOXEL_SIZE: Final[float] = 0.005            # 5 mm
+DEMO_AUDIO_POLYPHONY: Final[int] = 16
+DEMO_MASTER_VOLUME: Final[float] = 0.7
+
+# 解像度プリセット
+LOW_RESOLUTION: Final[tuple[int, int]] = (424, 240)
+HIGH_RESOLUTION: Final[tuple[int, int]] = (848, 480)
+ESTIMATED_HIGH_RES_POINTS: Final[int] = 300_000 

@@ -21,17 +21,21 @@ import signal
 import numpy as np
 import cv2
 
-# Constants
-DEFAULT_SPHERE_RADIUS = 0.05  # 5cm
-DEFAULT_MESH_UPDATE_INTERVAL = 15
-DEFAULT_MAX_MESH_SKIP_FRAMES = 60
-DEFAULT_AUDIO_COOLDOWN_TIME = 0.3  # 300ms (debounce)
-DEFAULT_VOXEL_SIZE = 0.005  # 5mm
-DEFAULT_AUDIO_POLYPHONY = 16
-DEFAULT_MASTER_VOLUME = 0.7
-LOW_RESOLUTION = (424, 240)
-HIGH_RESOLUTION = (848, 480)
-ESTIMATED_HIGH_RES_POINTS = 300000
+# -----------------------------------------------------------------------------
+# 共通定数の集中管理 (src.constants) からインポート
+# -----------------------------------------------------------------------------
+from src.constants import (
+    DEMO_SPHERE_RADIUS_DEFAULT as DEFAULT_SPHERE_RADIUS,
+    DEMO_MESH_UPDATE_INTERVAL as DEFAULT_MESH_UPDATE_INTERVAL,
+    DEMO_MAX_MESH_SKIP_FRAMES as DEFAULT_MAX_MESH_SKIP_FRAMES,
+    DEMO_AUDIO_COOLDOWN_TIME as DEFAULT_AUDIO_COOLDOWN_TIME,
+    DEMO_VOXEL_SIZE as DEFAULT_VOXEL_SIZE,
+    DEMO_AUDIO_POLYPHONY as DEFAULT_AUDIO_POLYPHONY,
+    DEMO_MASTER_VOLUME as DEFAULT_MASTER_VOLUME,
+    LOW_RESOLUTION,
+    HIGH_RESOLUTION,
+    ESTIMATED_HIGH_RES_POINTS,
+)
 
 # プロジェクトルートをパスに追加
 project_root = Path(__file__).parent
