@@ -1385,8 +1385,8 @@ class FullPipelineViewer(DualViewer):
         
         # 表示処理（ヘッドレスモードでは表示をスキップ）
         if not self.headless_mode:
-            # RGB表示処理
-            if not self._process_rgb_display(frame_data, collision_events):
+            # RGB表示処理（frame_data の再処理を避けるため None を渡す）
+            if not self._process_rgb_display(None, collision_events):
                 return False
             
             # 点群表示処理
@@ -2016,11 +2016,14 @@ class FullPipelineViewer(DualViewer):
         except Exception as e:
             logger.error(f"[CLEANUP] クリーンアップエラー: {e}")
     
-    def _process_rgb_display(self, frame_data: Any, collision_events: Optional[List[Any]] = None) -> bool:
+    def _process_rgb_display(self, frame_data: Optional[Any] = None, collision_events: Optional[List[Any]] = None) -> bool:
         """RGB表示処理（衝突検出版）"""
         try:
-            # 深度画像の可視化
-            depth_image = self._extract_depth_image(frame_data)
+            # 深度画像は前段で取得済みのキャッシュを優先利用し、
+            # 未取得の場合のみバックアップとして frame_data から抽出する。
+            depth_image = getattr(self, "_latest_depth_image", None)
+            if depth_image is None and frame_data is not None:
+                depth_image = self._extract_depth_image(frame_data)
             if depth_image is None:
                 return True
             
@@ -2035,31 +2038,51 @@ class FullPipelineViewer(DualViewer):
                        (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
             display_images.append(depth_resized)
             
-            # RGB画像処理（手検出結果はキャッシュを使用）
-            color_bgr = self._process_color_image(
-                frame_data, 
-                self.current_hands_2d,
-                self.current_hands_3d,
-                self.current_tracked_hands,
-                collision_events
-            )
+            # RGB画像処理: MJPG デコードの再実行を回避し、
+            # 前段で取得した最新カラー画像 (_last_color_frame) を再利用する。
+            color_src = getattr(self, "_last_color_frame", None)
+            color_bgr = None
+            if color_src is not None:
+                color_bgr = cv2.resize(color_src, self.rgb_window_size)
 
-            # ===== Flicker fix =====
+                # 手検出結果を描画
+                if self.enable_hand_detection and self.current_hands_2d:
+                    color_bgr = self._draw_hand_detections(
+                        color_bgr,
+                        self.current_hands_2d,
+                        self.current_hands_3d,
+                        self.current_tracked_hands,
+                    )
+
+                # 衝突検出情報を描画
+                if collision_events:
+                    self._draw_collision_info(color_bgr, collision_events)
+
+                cv2.putText(
+                    color_bgr,
+                    f"RGB (FPS: {self.performance_stats['fps']:.1f})",
+                    (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.7,
+                    (255, 255, 255),
+                    2,
+                )
+
+            # ----- Flicker fix -------------------------------------------------
             if not hasattr(self, "_last_color_bgr"):
-                self._last_color_bgr = None  # 初期化
+                self._last_color_bgr = None  # type: ignore[attr-defined]
 
             if color_bgr is None:
-                # カラーフレームが取得できなかった場合は前フレームを再利用
+                # フレーム取得失敗時は直前の画像を再利用
                 if self._last_color_bgr is not None:
                     color_bgr = self._last_color_bgr
                 else:
-                    # まだキャッシュが無ければ黒画像で埋める
                     color_bgr = np.zeros((self.rgb_window_size[1], self.rgb_window_size[0], 3), dtype=np.uint8)
             else:
                 # 正常に取得できた場合はキャッシュを更新
-                self._last_color_bgr = color_bgr
+                self._last_color_bgr = color_bgr  # type: ignore[attr-defined]
 
-            # カラー画像を表示用リストに追加
+            # 表示リストに追加
             display_images.append(color_bgr)
             
             # 画像を結合して表示
@@ -2090,40 +2113,6 @@ class FullPipelineViewer(DualViewer):
         d_ptp = float(depth_image.ptp()) if depth_image.ptp() > 0 else 1.0
         depth_normalized = ((depth_image.astype(np.float32) - d_min) / d_ptp * 255.0).astype(np.uint8)
         return cv2.applyColorMap(depth_normalized, cv2.COLORMAP_JET)
-    
-    def _process_color_image(self, frame_data: Any, hands_2d: List, hands_3d: List, 
-                           tracked_hands: List, collision_events: Optional[List[Any]]) -> Optional[np.ndarray]:
-        """カラー画像を処理"""
-        if (
-            frame_data.color_frame is None
-            or self.camera is None
-            or not getattr(self.camera, "has_color", False)
-        ):
-            return None
-        
-        color_data = np.frombuffer(frame_data.color_frame.get_data(), dtype=np.uint8)
-        color_format = frame_data.color_frame.get_format()
-        
-        # フォーマット変換
-        color_image = self._convert_color_format(color_data, color_format)
-        if color_image is None:
-            return None
-        
-        # 既に BGR 配列になっているので、そのままリサイズして使用する
-        color_bgr = cv2.resize(color_image, self.rgb_window_size)
-        
-        # 手検出結果を描画
-        if self.enable_hand_detection and hands_2d:
-            color_bgr = self._draw_hand_detections(color_bgr, hands_2d, hands_3d, tracked_hands)
-        
-        # 衝突検出情報を描画
-        if collision_events:
-            self._draw_collision_info(color_bgr, collision_events)
-        
-        cv2.putText(color_bgr, f"RGB (FPS: {self.performance_stats['fps']:.1f})", 
-                   (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-        
-        return color_bgr
     
     def _convert_color_format(self, color_data: np.ndarray, color_format: Any) -> Optional[np.ndarray]:
         """カラーフォーマットを変換"""
@@ -2421,6 +2410,23 @@ def main():
     """メイン関数"""
     parser = create_argument_parser()
     args = parser.parse_args()
+    
+    # Auto-enable MediaPipe GPU mode if a CUDA-enabled device is detected
+    # and the user did not specify --gpu-mediapipe.
+    if not getattr(args, "gpu_mediapipe", False):
+        try:
+            import cv2
+            cuda_available = (
+                hasattr(cv2, "cuda")
+                and callable(getattr(cv2.cuda, "getCudaEnabledDeviceCount", None))
+                and cv2.cuda.getCudaEnabledDeviceCount() > 0
+            )
+        except Exception:
+            cuda_available = False
+
+        if cuda_available:
+            args.gpu_mediapipe = True
+            print("🔎 CUDA device detected – enabling MediaPipe GPU mode by default")
     
     # 引数検証
     if not validate_arguments(args):

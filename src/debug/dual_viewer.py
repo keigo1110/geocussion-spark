@@ -107,6 +107,26 @@ class DualViewer:
         self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
         self._color_decode_future = None
         
+        # --- RGB パイプライン高速化パラメータ ---
+        # カラーフレームのデコードは毎フレーム不要。直前の画像を再利用することで
+        # CPU スパイクを抑制し FPS を安定させる。
+        self._color_decode_interval = 2  # decode every N frames
+        self._next_color_decode_frame = 0
+        self._last_color_bgr = np.zeros((self.rgb_window_size[1], self.rgb_window_size[0], 3), dtype=np.uint8)
+        
+        # --- Hand detection timing ---
+        self._hand_detection_interval = 2  # run detection every N RGB frames
+        self._next_hand_detection_frame = 0
+        self._last_detected_hands_2d: List = []
+        self._last_detected_hands_3d: List = []
+        self._last_tracked_hands: List = []
+        
+        # ------------- Display buffer pre-allocation -------------------
+        # To avoid per-frame allocation from np.hstack, allocate a single
+        # contiguous buffer that we copy depth & color images into.
+        disp_h, disp_w = self.rgb_window_size[1], self.rgb_window_size[0] * 2
+        self._combined_buffer = np.zeros((disp_h, disp_w, 3), dtype=np.uint8)
+        
     def initialize(self) -> bool:
         """
         ビューワーを初期化
@@ -310,27 +330,33 @@ class DualViewer:
         """
         try:
             # 深度画像をカラーマップで可視化
-            depth_data = np.frombuffer(frame_data.depth_frame.get_data(), dtype=np.uint16)
-            depth_image = depth_data.reshape(
-                (self.camera.depth_intrinsics.height, self.camera.depth_intrinsics.width)
-            )
-            
-            # フィルタ適用
-            filter_start_time = time.perf_counter()
-            if self.depth_filter is not None:
-                depth_image = self.depth_filter.apply_filter(depth_image)
-            self.performance_stats['filter_time'] = (time.perf_counter() - filter_start_time) * 1000
-            
-            # 深度画像の疑似カラー化（高速）
             depth_colored = self._create_depth_visualization(depth_image)
             
-            # 手検出処理
-            hands_2d, hands_3d, tracked_hands = [], [], []
-            if self.enable_hand_detection and self.hands_2d is not None:
-                hands_2d, hands_3d, tracked_hands = self._process_hand_detection(frame_data, depth_image)
-                # 3Dマーカー用に結果を保存
-                self.current_hands_3d = hands_3d
-                self.current_tracked_hands = tracked_hands
+            # --- Decide whether to run hand detection this frame ---
+            detect_now = (
+                self.enable_hand_detection and self.hands_2d is not None and
+                self.frame_count >= self._next_hand_detection_frame
+            )
+
+            if detect_now and self._last_color_bgr is not None and self._last_color_bgr.size > 0:
+                hands_2d, hands_3d, tracked_hands = self._process_hand_detection(self._last_color_bgr, depth_image)
+
+                # Save for reuse and visualization
+                self._last_detected_hands_2d = hands_2d
+                self._last_detected_hands_3d = hands_3d
+                self._last_tracked_hands = tracked_hands
+
+                # Schedule next detection
+                self._next_hand_detection_frame = self.frame_count + self._hand_detection_interval
+            else:
+                # Reuse previous detection results
+                hands_2d = self._last_detected_hands_2d
+                hands_3d = self._last_detected_hands_3d
+                tracked_hands = self._last_tracked_hands
+
+            # 3Dマーカー更新用に保存
+            self.current_hands_3d = hands_3d
+            self.current_tracked_hands = tracked_hands
             
             # カラー画像があれば表示
             display_images = []
@@ -349,22 +375,31 @@ class DualViewer:
                 except Exception:
                     pass  # keep previous image on error
 
-            # スケジュール次カラーのデコード
-            if frame_data.color_frame is not None:
+            # スケジュール次カラーのデコード（一定間隔＆前ジョブが完了している場合のみ）
+            if (
+                frame_data.color_frame is not None
+                and self.frame_count >= self._next_color_decode_frame
+                and (self._color_decode_future is None or self._color_decode_future.done())
+            ):
+                self._next_color_decode_frame = self.frame_count + self._color_decode_interval
                 self._color_decode_future = self._executor.submit(
                     self._decode_color_frame_resized, frame_data.color_frame
                 )
 
-            color_bgr = self._last_color_bgr if hasattr(self, '_last_color_bgr') else None
-            if color_bgr is None:
-                # フォールバックで同期デコード (初回など)
+            color_bgr = self._last_color_bgr
+            if color_bgr is None or color_bgr.size == 0:
+                # まだ画像が無い場合のみ同期デコード（最初の1回）
                 color_bgr = self._decode_color_frame_resized(frame_data.color_frame)
+                self._last_color_bgr = color_bgr
 
             display_images.append(color_bgr)
             
-            # 画像を横に並べて表示
-            if len(display_images) > 1:
-                combined_image = np.hstack(display_images)
+            # ----- Efficient image stacking using preallocated buffer -----
+            if len(display_images) == 2:
+                w = self.rgb_window_size[0]
+                self._combined_buffer[:, :w, :] = display_images[0]
+                self._combined_buffer[:, w:, :] = display_images[1]
+                combined_image = self._combined_buffer
             else:
                 combined_image = display_images[0]
             
@@ -412,15 +447,17 @@ class DualViewer:
         try:
             pointcloud_start_time = time.perf_counter()
             
-            # 深度画像取得
-            depth_data = np.frombuffer(frame_data.depth_frame.get_data(), dtype=np.uint16)
-            depth_image = depth_data.reshape(
-                (self.camera.depth_intrinsics.height, self.camera.depth_intrinsics.width)
-            )
-            
-            # フィルタ適用
-            if self.depth_filter is not None:
-                depth_image = self.depth_filter.apply_filter(depth_image)
+            # 深度画像 – 先に RGB パスでフィルタ済みのものを再利用
+            if hasattr(self, "_last_depth_image_filtered") and self._last_depth_image_filtered is not None:
+                depth_image = self._last_depth_image_filtered
+            else:
+                depth_data = np.frombuffer(frame_data.depth_frame.get_data(), dtype=np.uint16)
+                depth_image = depth_data.reshape(
+                    (self.camera.depth_intrinsics.height, self.camera.depth_intrinsics.width)
+                )
+                # フィルタ適用（必要な場合）
+                if self.depth_filter is not None:
+                    depth_image = self.depth_filter.apply_filter(depth_image)
             
             # 点群生成
             points, colors = self.pointcloud_converter.depth_to_pointcloud(
@@ -525,12 +562,12 @@ class DualViewer:
         except Exception:
             pass
     
-    def _process_hand_detection(self, frame_data: FrameData, depth_image: np.ndarray) -> Tuple[list, list, list]:
+    def _process_hand_detection(self, color_bgr: np.ndarray, depth_image: np.ndarray) -> Tuple[list, list, list]:
         """
         手検出処理
         
         Args:
-            frame_data: フレームデータ
+            color_bgr: カラー画像（BGR形式）
             depth_image: 深度画像
             
         Returns:
@@ -539,34 +576,10 @@ class DualViewer:
         hands_2d, hands_3d, tracked_hands = [], [], []
         
         try:
-            if frame_data.color_frame is None:
+            if color_bgr is None or color_bgr.size == 0:
                 return hands_2d, hands_3d, tracked_hands
-            
-            # カラー画像を作成
-            color_data = np.frombuffer(frame_data.color_frame.get_data(), dtype=np.uint8)
-            color_format = frame_data.color_frame.get_format()
-            
-            rgb_image = None
-            try:
-                from pyorbbecsdk import OBFormat
-            except ImportError:
-                pass  # Use the imported OBFormat from src.types
-            
-            if color_format == OBFormat.RGB:
-                rgb_image = color_data.reshape((self.camera.depth_intrinsics.height, self.camera.depth_intrinsics.width, 3))
-            elif color_format == OBFormat.BGR:
-                rgb_image = color_data.reshape((self.camera.depth_intrinsics.height, self.camera.depth_intrinsics.width, 3))
-                rgb_image = cv2.cvtColor(rgb_image, cv2.COLOR_BGR2RGB)
-            elif color_format == OBFormat.MJPG:
-                rgb_image = cv2.imdecode(color_data, cv2.IMREAD_COLOR)
-                if rgb_image is not None:
-                    rgb_image = cv2.cvtColor(rgb_image, cv2.COLOR_BGR2RGB)
-            
-            if rgb_image is None:
-                return hands_2d, hands_3d, tracked_hands
-            
-            # BGR変換（MediaPipe用）
-            bgr_image = cv2.cvtColor(rgb_image, cv2.COLOR_RGB2BGR)
+
+            bgr_image = color_bgr  # Already BGR resized image
             
             # 2D手検出
             detection_start = time.perf_counter()
