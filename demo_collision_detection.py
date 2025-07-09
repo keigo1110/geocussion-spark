@@ -426,7 +426,8 @@ class FullPipelineViewer(DualViewer):
         self._mesh_version = -1  # track version for viewer refresh
     
         # Mesh update scheduler & terrain change detector --------------------------------
-        self.mesh_scheduler = MeshUpdateScheduler(base_interval_sec=1.0, grace_period_sec=1.0)
+        # Grace period extended to 2 s to absorb temporary detection dropouts
+        self.mesh_scheduler = MeshUpdateScheduler(base_interval_sec=1.0, grace_period_sec=2.0)
         self.terrain_detector = TerrainChangeDetector()
         self.terrain_deforming: bool = False  # flag to pause audio
     
@@ -464,6 +465,10 @@ class FullPipelineViewer(DualViewer):
         # 直近の点群 / 深度フレームを保持
         self._last_points_3d: Optional[np.ndarray] = None
         self._latest_depth_image: Optional[np.ndarray] = None
+    
+        # 最終の手検出時刻 (hand-presence grace 用)
+        import time as _time
+        self._last_hand_presence_ts: float = _time.perf_counter() - 10.0  # guarantee treated as absent initially
     
     def _initialize_performance_stats(self):
         """パフォーマンス統計を初期化"""
@@ -1332,7 +1337,9 @@ class FullPipelineViewer(DualViewer):
         self._latest_depth_image = depth_image_masked
 
         # ----- adaptive exclusion for point cloud -----
-        self._exclude_centers_cached = (centers_3d, radii_arr)
+        # Only overwrite exclusion cache when we have at least one centre
+        if centers_3d is not None and len(centers_3d) > 0:
+            self._exclude_centers_cached = (centers_3d, radii_arr)
 
         # 点群生成（手マスク後）
         points_3d = self._generate_point_cloud_if_needed(depth_image_masked)
@@ -1340,21 +1347,38 @@ class FullPipelineViewer(DualViewer):
         # Continue pipeline below so we need to skip duplicated code (return later edits)
         
         # --------------------------------------------------------------
-        # Terrain change detection (before heavy mesh generation)
+        # Robust hand-presence estimation
+        #   • 手検出が一時的に失敗しても "手あり" と扱う猶予時間を導入
+        #   • これにより sporadic なメッシュ更新を抑止する
         # --------------------------------------------------------------
-        # Preliminary hand presence (2D or 3D)
-        prelim_hands_present = bool(self.current_hands_2d) or bool(tracked_hands)
 
+        import time as _time  # local alias
+
+        # 1) 手検出があったフレームではタイムスタンプを更新
+        detected_now = bool(self.current_hands_2d) or bool(tracked_hands)
+        if detected_now:
+            self._last_hand_presence_ts = _time.perf_counter()
+
+        # 2) 猶予期間内なら「手あり」とみなす
+        HAND_PRESENCE_GRACE_SEC = 1.2  # detection dropout tolerance
+        hands_recently_present = (
+            (_time.perf_counter() - getattr(self, "_last_hand_presence_ts", 0.0))
+            < HAND_PRESENCE_GRACE_SEC
+        )
+
+        prelim_hands_present = detected_now or hands_recently_present
+
+        # Terrain change detection uses *actual* current detection only – OK
         self.terrain_deforming = self.terrain_detector.update(
-            depth_image_masked, hands_present=prelim_hands_present
+            depth_image_masked, hands_present=detected_now
         )
 
         # --------------------------------------------------------------
         # Decide if we need to force mesh update via scheduler
         # --------------------------------------------------------------
-        any_hands_present = bool(self.current_hands_2d) or bool(tracked_hands) or self.terrain_deforming
+        any_hands_present = prelim_hands_present or self.terrain_deforming
         force_update = self.mesh_scheduler.should_update(any_hands_present)
-
+        
         collision_events = self._process_collision_pipeline(
             points_3d, tracked_hands, force_update=force_update
         )
