@@ -11,7 +11,7 @@ from typing import List, Tuple, Optional, Sequence
 import numpy as np
 import cv2
 
-from src.types import HandDetectionResult, Hand3D, TrackingState
+from src.data_types import HandDetectionResult, Hand3D, TrackingState
 
 __all__ = ["HandMasker"]
 
@@ -49,6 +49,8 @@ class HandMasker:  # pylint: disable=too-few-public-methods
         depth_image: np.ndarray,
         hands_2d: Sequence[HandDetectionResult],
         tracked_hands: Sequence[Hand3D],
+        *,
+        src_resolution: Optional[Tuple[int, int]] = None,
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Blank hand pixels in *depth_image* and return exclusion spheres.
 
@@ -63,10 +65,39 @@ class HandMasker:  # pylint: disable=too-few-public-methods
         """
         masked = depth_image.copy()
 
-        # --- 2-D depth blanking ---------------------------------------
+        # ------------------------------------------------------------------
+        # Handle resolution mismatch between color (hand detection) and depth
+        # ------------------------------------------------------------------
         h_img, w_img = depth_image.shape[:2]
+
+        # Prefer explicitly provided source (color) resolution
+        if src_resolution is not None:
+            src_w, src_h = src_resolution
+        else:
+            # Fallback – infer a conservative estimate from image & bboxes
+            if hands_2d:
+                max_x_bb = max((bx + bw) for bx, _, bw, _ in (h.bounding_box for h in hands_2d))
+                max_y_bb = max((by + bh) for _, by, _, bh in (h.bounding_box for h in hands_2d))
+                src_w = int(max(max_x_bb, w_img))
+                src_h = int(max(max_y_bb, h_img))
+            else:
+                src_w, src_h = w_img, h_img
+
+        # Guard-rails against division by zero
+        src_w = max(1, src_w)
+        src_h = max(1, src_h)
+
+        scale_x = w_img / src_w
+        scale_y = h_img / src_h
+
         for hand in hands_2d:
             x, y, w, h = hand.bounding_box
+            # Scale bbox to depth resolution
+            x *= scale_x
+            y *= scale_y
+            w *= scale_x
+            h *= scale_y
+
             cx = x + w / 2.0
             cy = y + h / 2.0
             w *= self.inflate

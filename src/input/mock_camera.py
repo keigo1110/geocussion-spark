@@ -13,7 +13,7 @@ import numpy as np
 from types import SimpleNamespace
 from typing import Any, Optional
 
-from src.types import CameraIntrinsics, FrameData, OBFormat
+from src.data_types import CameraIntrinsics, FrameData, OBFormat
 
 __all__ = ["MockCamera"]
 

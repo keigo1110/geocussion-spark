@@ -21,17 +21,21 @@ import signal
 import numpy as np
 import cv2
 
-# Constants
-DEFAULT_SPHERE_RADIUS = 0.05  # 5cm
-DEFAULT_MESH_UPDATE_INTERVAL = 15
-DEFAULT_MAX_MESH_SKIP_FRAMES = 60
-DEFAULT_AUDIO_COOLDOWN_TIME = 0.3  # 300ms (debounce)
-DEFAULT_VOXEL_SIZE = 0.005  # 5mm
-DEFAULT_AUDIO_POLYPHONY = 16
-DEFAULT_MASTER_VOLUME = 0.7
-LOW_RESOLUTION = (424, 240)
-HIGH_RESOLUTION = (848, 480)
-ESTIMATED_HIGH_RES_POINTS = 300000
+# -----------------------------------------------------------------------------
+# 共通定数の集中管理 (src.constants) からインポート
+# -----------------------------------------------------------------------------
+from src.constants import (
+    DEMO_SPHERE_RADIUS_DEFAULT as DEFAULT_SPHERE_RADIUS,
+    DEMO_MESH_UPDATE_INTERVAL as DEFAULT_MESH_UPDATE_INTERVAL,
+    DEMO_MAX_MESH_SKIP_FRAMES as DEFAULT_MAX_MESH_SKIP_FRAMES,
+    DEMO_AUDIO_COOLDOWN_TIME as DEFAULT_AUDIO_COOLDOWN_TIME,
+    DEMO_VOXEL_SIZE as DEFAULT_VOXEL_SIZE,
+    DEMO_AUDIO_POLYPHONY as DEFAULT_AUDIO_POLYPHONY,
+    DEMO_MASTER_VOLUME as DEFAULT_MASTER_VOLUME,
+    LOW_RESOLUTION,
+    HIGH_RESOLUTION,
+    ESTIMATED_HIGH_RES_POINTS,
+)
 
 # プロジェクトルートをパスに追加
 project_root = Path(__file__).parent
@@ -153,6 +157,8 @@ from src.input.pointcloud import PointCloudConverter
 from src.config import get_config, InputConfig
 from src.mesh.pipeline import create_mesh_pipeline  # unified mesh pipeline
 from src.mesh.manager import PipelineManager  # NEW pipeline manager
+from src.mesh.update_scheduler import MeshUpdateScheduler  # NEW scheduler
+from src.mesh.terrain_change import TerrainChangeDetector  # NEW change detector
 
 # GPU加速コンポーネントの動的インポート
 HAS_GPU_ACCELERATION = False
@@ -376,7 +382,7 @@ class FullPipelineViewer(DualViewer):
         
         # 音響生成コンポーネント
         self.audio_mapper: Optional[AudioMapper] = None
-        self.audio_synthesizer: Optional[AudioSynthesizer] = None
+        self.audio_synthesizer: Optional[Any] = None
         self.voice_manager: Optional[VoiceManager] = None
         self.audio_enabled = False
         
@@ -419,8 +425,15 @@ class FullPipelineViewer(DualViewer):
 
         # 統合 MeshPipeline
         self.mesh_pipeline = create_mesh_pipeline(enable_incremental=False)
-        self.pipeline_manager = PipelineManager(self.mesh_pipeline)
+        # 1 Hz mesh update interval (configurable via scheduler)
+        self.pipeline_manager = PipelineManager(self.mesh_pipeline, min_interval_sec=1.0)
         self._mesh_version = -1  # track version for viewer refresh
+    
+        # Mesh update scheduler & terrain change detector --------------------------------
+        # Grace period extended to 2 s to absorb temporary detection dropouts
+        self.mesh_scheduler = MeshUpdateScheduler(base_interval_sec=1.0, grace_period_sec=2.0)
+        self.terrain_detector = TerrainChangeDetector()
+        self.terrain_deforming: bool = False  # flag to pause audio
     
     def _initialize_hand_detection(self):
         """手検出コンポーネントを初期化"""
@@ -456,6 +469,10 @@ class FullPipelineViewer(DualViewer):
         # 直近の点群 / 深度フレームを保持
         self._last_points_3d: Optional[np.ndarray] = None
         self._latest_depth_image: Optional[np.ndarray] = None
+    
+        # 最終の手検出時刻 (hand-presence grace 用)
+        import time as _time
+        self._last_hand_presence_ts: float = _time.perf_counter() - 10.0  # guarantee treated as absent initially
     
     def _initialize_performance_stats(self):
         """パフォーマンス統計を初期化"""
@@ -1022,7 +1039,7 @@ class FullPipelineViewer(DualViewer):
                                             computation_time_ms: float) -> Any:
         """距離情報から衝突情報を生成"""
         from src.collision.sphere_tri import CollisionInfo, ContactPoint
-        from src.types import CollisionType
+        from src.data_types import CollisionType
         
         # 衝突判定（半径内の距離）
         collision_mask = distances[0] <= radius
@@ -1305,41 +1322,82 @@ class FullPipelineViewer(DualViewer):
         # フィルタ適用
         depth_image = self._apply_depth_filter(depth_image)
         
+        # ---------------- Hand detection first ----------------
+        hands_2d, hands_3d, tracked_hands = self._perform_hand_detection(depth_image)
+        self._save_hand_detection_results(hands_2d, hands_3d, tracked_hands)
+
         # ---------------- Hand masking (P-HAND-002) ----------------
         from src.detection.hand_mask import HandMasker  # type: ignore
         if not hasattr(self, "_hand_masker"):
             self._hand_masker = HandMasker()
 
+        # Provide original color resolution for accurate scaling
+        color_shape = None
+        if color_image is not None:
+            # color_image shape: (h, w, 3)
+            color_shape = (color_image.shape[1], color_image.shape[0])  # (width, height)
+
         depth_image_masked, centers_3d, radii_arr = self._hand_masker.apply_mask(
             depth_image,
-            self.current_hands_2d,
-            self.current_tracked_hands,
+            hands_2d,
+            tracked_hands,
+            src_resolution=color_shape,
         )
 
         # 最新深度をキャッシュ
         self._latest_depth_image = depth_image_masked
 
-        # 点群生成
+        # ----- adaptive exclusion for point cloud -----
+        # Only overwrite exclusion cache when we have at least one centre
+        if centers_3d is not None and len(centers_3d) > 0:
+            self._exclude_centers_cached = (centers_3d, radii_arr)
+
+        # 点群生成（手マスク後）
         points_3d = self._generate_point_cloud_if_needed(depth_image_masked)
-
-        # 手検出処理はマスク前の深度画像を使用
-
-        hands_2d, hands_3d, tracked_hands = self._perform_hand_detection(depth_image)
-        self._save_hand_detection_results(hands_2d, hands_3d, tracked_hands)
-
-        # ----- adjust further references -----
-        # Use adaptive exclusion when we regenerate pointcloud on subsequent calls
-        self._exclude_centers_cached = (centers_3d, radii_arr)
 
         # Continue pipeline below so we need to skip duplicated code (return later edits)
         
-        # 衝突検出とメッシュ生成のパイプライン
-        collision_events = self._process_collision_pipeline(points_3d, tracked_hands)
+        # --------------------------------------------------------------
+        # Robust hand-presence estimation
+        #   • 手検出が一時的に失敗しても "手あり" と扱う猶予時間を導入
+        #   • これにより sporadic なメッシュ更新を抑止する
+        # --------------------------------------------------------------
+
+        import time as _time  # local alias
+
+        # 1) 手検出があったフレームではタイムスタンプを更新
+        detected_now = bool(self.current_hands_2d) or bool(tracked_hands)
+        if detected_now:
+            self._last_hand_presence_ts = _time.perf_counter()
+
+        # 2) 猶予期間内なら「手あり」とみなす
+        HAND_PRESENCE_GRACE_SEC = 1.2  # detection dropout tolerance
+        hands_recently_present = (
+            (_time.perf_counter() - getattr(self, "_last_hand_presence_ts", 0.0))
+            < HAND_PRESENCE_GRACE_SEC
+        )
+
+        prelim_hands_present = detected_now or hands_recently_present
+
+        # Terrain change detection uses *actual* current detection only – OK
+        self.terrain_deforming = self.terrain_detector.update(
+            depth_image_masked, hands_present=detected_now
+        )
+
+        # --------------------------------------------------------------
+        # Decide if we need to force mesh update via scheduler
+        # --------------------------------------------------------------
+        any_hands_present = prelim_hands_present or self.terrain_deforming
+        force_update = self.mesh_scheduler.should_update(any_hands_present)
+        
+        collision_events = self._process_collision_pipeline(
+            points_3d, tracked_hands, force_update=force_update
+        )
         
         # 表示処理（ヘッドレスモードでは表示をスキップ）
         if not self.headless_mode:
-            # RGB表示処理
-            if not self._process_rgb_display(frame_data, collision_events):
+            # RGB表示処理（frame_data の再処理を避けるため None を渡す）
+            if not self._process_rgb_display(None, collision_events):
                 return False
             
             # 点群表示処理
@@ -1353,6 +1411,10 @@ class FullPipelineViewer(DualViewer):
         frame_time = (time.perf_counter() - frame_start_time) * 1000
         self.performance_stats['frame_time'] = frame_time
         self.performance_stats['fps'] = 1000.0 / frame_time if frame_time > 0 else 0.0
+        
+        # pygame版: オーディオ一時停止制御はスキップ（必要に応じて個別対応）
+        # pygame版では VoiceManager を使用していないため、個別にボイス停止が必要な場合は
+        # synthesizer.stop_all_voices() などの実装が必要
         
         return True
     
@@ -1610,14 +1672,23 @@ class FullPipelineViewer(DualViewer):
             del self._hand_position_history[hid]
     
     def _process_collision_pipeline(self, points_3d: Optional[np.ndarray], 
-                                   tracked_hands: List[TrackedHand]) -> List[Any]:
+                                   tracked_hands: List[TrackedHand], *,
+                                   force_update: bool = False) -> List[Any]:
         """衝突検出とメッシュ生成のパイプライン処理"""
         pipeline_start = time.perf_counter()
         self.frame_counter = self.frame_count
         collision_events = []
         
+        # Determine hand presence (2D or tracked)
+        any_hands_present = bool(self.current_hands_2d) or bool(tracked_hands)
+
         # Mesh update via PipelineManager (asynchronous-ready)
-        res = self.pipeline_manager.update_if_needed(points_3d, tracked_hands)
+        res = self.pipeline_manager.update_if_needed(
+            points_3d,
+            tracked_hands,
+            hands_present_override=any_hands_present,
+            force=force_update,
+        )
 
         if res.mesh is not None and (
             self._mesh_version != self.pipeline_manager.get_version()
@@ -1633,13 +1704,19 @@ class FullPipelineViewer(DualViewer):
                 self.collision_tester = SphereTriangleCollision(res.mesh)
 
             self._update_mesh_visualization(res.mesh)
+            # Update mesh timestamp to throttle point-cloud generation
+            self.last_mesh_update = self.frame_count
         
         # 衝突検出
         if self.enable_collision_detection and self.current_mesh is not None and tracked_hands:
             collision_events = self._perform_collision_detection(tracked_hands)
         
         # 音響生成
-        if self.enable_audio_synthesis and self.audio_enabled and collision_events:
+        if (
+            self.enable_audio_synthesis
+            and self.audio_enabled
+            and collision_events
+        ):
             self._perform_audio_synthesis(collision_events)
         
         self.perf_stats['total_pipeline_time'] = (time.perf_counter() - pipeline_start) * 1000
@@ -1655,6 +1732,10 @@ class FullPipelineViewer(DualViewer):
                     while len(self.event_queue.event_queue) > 256:
                         self.event_queue.event_queue.popleft()
 
+        if force_update:
+            # Inform scheduler that we actually regenerated so interval resets
+            self.mesh_scheduler.mark_updated()
+        
         return collision_events
     
     def _should_update_mesh(self, tracked_hands: List[TrackedHand], 
@@ -1718,9 +1799,9 @@ class FullPipelineViewer(DualViewer):
     
     # 音響システム関連メソッド
     def _initialize_audio_system(self) -> None:
-        """音響システムを初期化"""
+        """音響システムを初期化（pygame版）"""
         try:
-            logger.info("音響システムを初期化中...")
+            logger.info("音響システム（pygame版）を初期化中...")
             
             # 音響マッパー初期化
             self.audio_mapper = AudioMapper(
@@ -1730,29 +1811,30 @@ class FullPipelineViewer(DualViewer):
                 enable_adaptive_mapping=True
             )
             
-            # 音響シンセサイザー初期化
-            self.audio_synthesizer = create_audio_synthesizer(
+            # 音響シンセサイザー初期化（シンプルpygame版）
+            from src.sound.simple_synth import create_simple_audio_synthesizer
+            self.audio_synthesizer = create_simple_audio_synthesizer(
                 sample_rate=44100,
-                buffer_size=256,
+                buffer_size=512,
                 max_polyphony=self.audio_polyphony
             )
             
             # 音響エンジン開始
+            logger.info("Audio synthesizer starting engine...")
             if self.audio_synthesizer.start_engine():
-                # ボイス管理システム初期化
-                self.voice_manager = create_voice_manager(
-                    self.audio_synthesizer,
-                    max_polyphony=self.audio_polyphony,
-                    steal_strategy=StealStrategy.OLDEST
-                )
+                # pygame版では VoiceManager は不要、直接 synthesizer を使用
+                self.voice_manager = None  # pygame版では使用しない
                 
                 # マスターボリューム設定
                 self.audio_synthesizer.update_master_volume(self.audio_master_volume)
                 
                 self.audio_enabled = True
-                logger.info("音響システム初期化完了")
+                logger.info(f"音響システム（pygame版）初期化完了 - master_volume: {self.audio_master_volume}")
+                logger.info(f"Audio synthesizer state: {self.audio_synthesizer.state}")
+                logger.info(f"Audio synthesizer config: {self.audio_synthesizer.config}")
             else:
-                logger.error("音響エンジンの開始に失敗しました")
+                logger.error("pygame音響エンジンの開始に失敗しました")
+                logger.error(f"Audio synthesizer state: {getattr(self.audio_synthesizer, 'state', 'UNKNOWN')}")
                 self.audio_enabled = False
         
         except Exception as e:
@@ -1760,19 +1842,13 @@ class FullPipelineViewer(DualViewer):
             self.audio_enabled = False
     
     def _shutdown_audio_system(self) -> None:
-        """音響システムを停止"""
+        """音響システムを停止（pygame版）"""
         try:
-            logger.info("[AUDIO-SHUTDOWN] 音響システムを停止中...")
+            logger.info("[AUDIO-SHUTDOWN] 音響システム（pygame版）を停止中...")
             self.audio_enabled = False
             
-            # ボイス管理システムの停止
-            if self.voice_manager:
-                try:
-                    self.voice_manager.stop_all_voices(fade_out_time=0.01)
-                    time.sleep(0.05)
-                    self.voice_manager = None
-                except Exception as e:
-                    logger.error(f"[AUDIO-SHUTDOWN] VoiceManager停止エラー: {e}")
+            # pygame版では VoiceManager を使用していないためスキップ
+            self.voice_manager = None
             
             # シンセサイザーエンジンの停止
             if self.audio_synthesizer:
@@ -1781,12 +1857,12 @@ class FullPipelineViewer(DualViewer):
                     time.sleep(0.05)
                     self.audio_synthesizer = None
                 except Exception as e:
-                    logger.error(f"[AUDIO-SHUTDOWN] Synthesizer停止エラー: {e}")
+                    logger.error(f"[AUDIO-SHUTDOWN] pygame Synthesizer停止エラー: {e}")
             
             # 音響マッパーもクリア
             self.audio_mapper = None
             
-            logger.info("[AUDIO-SHUTDOWN] 音響システムを停止しました")
+            logger.info("[AUDIO-SHUTDOWN] 音響システム（pygame版）を停止しました")
         
         except Exception as e:
             logger.error(f"[AUDIO-SHUTDOWN] 音響システム停止エラー: {e}")
@@ -1801,7 +1877,7 @@ class FullPipelineViewer(DualViewer):
     
     def _generate_audio(self, collision_events: List[Any]) -> int:
         """衝突イベントから音響を生成"""
-        if not self.audio_enabled or not self.audio_mapper or not self.voice_manager:
+        if not self.audio_enabled or not self.audio_mapper or not self.audio_synthesizer:
             return 0
         
         notes_played = 0
@@ -1820,26 +1896,30 @@ class FullPipelineViewer(DualViewer):
                 # 音響パラメータマッピング
                 audio_params = self.audio_mapper.map_collision_event(event)
                 
-                # 空間位置設定
-                spatial_position = self._get_spatial_position(event)
-                
-                # 音響再生
-                voice_id = allocate_and_play(
-                    self.voice_manager,
-                    audio_params,
-                    priority=7,
-                    spatial_position=spatial_position
-                )
+                # pygame版: 直接シンセサイザーを使用
+                voice_id = None
+                if self.audio_synthesizer:
+                    logger.info(f"[AUDIO-DEBUG] Attempting to play audio: instrument={audio_params.instrument}, "
+                               f"frequency={audio_params.frequency:.1f}Hz, velocity={audio_params.velocity:.2f}")
+                    voice_id = self.audio_synthesizer.play_audio_parameters(audio_params)
+                    if voice_id:
+                        logger.info(f"[AUDIO-SUCCESS] Audio played successfully with voice_id: {voice_id}")
+                    else:
+                        logger.error(f"[AUDIO-FAILED] play_audio_parameters returned None")
+                else:
+                    logger.error(f"[AUDIO-ERROR] self.audio_synthesizer is None")
                 
                 if voice_id:
                     notes_played += 1
                     self.last_audio_trigger_time[event.hand_id] = current_time
-                    logger.debug(f"[AUDIO-TRIGGER] Hand {event.hand_id}: Note triggered")
+                    logger.info(f"[AUDIO-TRIGGER] Hand {event.hand_id}: Note triggered (pygame) - voice_id: {voice_id}")
                     # 記録 – debounce と同じキー形式 (hand_id, gx, gy, gz)
                     gx = int(round(event.contact_position[0] * 50))
                     gy = int(round(event.contact_position[1] * 50))
                     gz = int(round(event.contact_position[2] * 50))
                     self._last_contact_trigger_time[(event.hand_id, gx, gy, gz)] = current_time
+                else:
+                    logger.warning(f"[AUDIO-SKIP] Could not play audio for event {event.event_id}")
 
                     # Keep the debounce map bounded (T-MEM-001)
                     if len(self._last_contact_trigger_time) > 500:
@@ -1853,12 +1933,12 @@ class FullPipelineViewer(DualViewer):
             except Exception as e:
                 logger.error(f"音響生成エラー（イベント: {event.event_id}）: {e}")
         
-        # ボイスクリーンアップ
-        if self.voice_manager and self.frame_count % 10 == 0:
+        # pygame版: 定期的にボイスクリーンアップ
+        if self.audio_synthesizer and self.frame_count % 10 == 0:
             try:
-                self.voice_manager.cleanup_finished_voices()
+                self.audio_synthesizer.cleanup_finished_voices()
             except Exception as e:
-                logger.error(f"[AUDIO-CLEANUP] Error during cleanup: {e}")
+                logger.error(f"[AUDIO-CLEANUP] Error during pygame cleanup: {e}")
         
         return notes_played
     
@@ -1935,11 +2015,14 @@ class FullPipelineViewer(DualViewer):
         except Exception as e:
             logger.error(f"[CLEANUP] クリーンアップエラー: {e}")
     
-    def _process_rgb_display(self, frame_data: Any, collision_events: Optional[List[Any]] = None) -> bool:
+    def _process_rgb_display(self, frame_data: Optional[Any] = None, collision_events: Optional[List[Any]] = None) -> bool:
         """RGB表示処理（衝突検出版）"""
         try:
-            # 深度画像の可視化
-            depth_image = self._extract_depth_image(frame_data)
+            # 深度画像は前段で取得済みのキャッシュを優先利用し、
+            # 未取得の場合のみバックアップとして frame_data から抽出する。
+            depth_image = getattr(self, "_latest_depth_image", None)
+            if depth_image is None and frame_data is not None:
+                depth_image = self._extract_depth_image(frame_data)
             if depth_image is None:
                 return True
             
@@ -1954,31 +2037,51 @@ class FullPipelineViewer(DualViewer):
                        (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
             display_images.append(depth_resized)
             
-            # RGB画像処理（手検出結果はキャッシュを使用）
-            color_bgr = self._process_color_image(
-                frame_data, 
-                self.current_hands_2d,
-                self.current_hands_3d,
-                self.current_tracked_hands,
-                collision_events
-            )
+            # RGB画像処理: MJPG デコードの再実行を回避し、
+            # 前段で取得した最新カラー画像 (_last_color_frame) を再利用する。
+            color_src = getattr(self, "_last_color_frame", None)
+            color_bgr = None
+            if color_src is not None:
+                color_bgr = cv2.resize(color_src, self.rgb_window_size)
 
-            # ===== Flicker fix =====
+                # 手検出結果を描画
+                if self.enable_hand_detection and self.current_hands_2d:
+                    color_bgr = self._draw_hand_detections(
+                        color_bgr,
+                        self.current_hands_2d,
+                        self.current_hands_3d,
+                        self.current_tracked_hands,
+                    )
+
+                # 衝突検出情報を描画
+                if collision_events:
+                    self._draw_collision_info(color_bgr, collision_events)
+
+                cv2.putText(
+                    color_bgr,
+                    f"RGB (FPS: {self.performance_stats['fps']:.1f})",
+                    (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.7,
+                    (255, 255, 255),
+                    2,
+                )
+
+            # ----- Flicker fix -------------------------------------------------
             if not hasattr(self, "_last_color_bgr"):
-                self._last_color_bgr = None  # 初期化
+                self._last_color_bgr = None  # type: ignore[attr-defined]
 
             if color_bgr is None:
-                # カラーフレームが取得できなかった場合は前フレームを再利用
+                # フレーム取得失敗時は直前の画像を再利用
                 if self._last_color_bgr is not None:
                     color_bgr = self._last_color_bgr
                 else:
-                    # まだキャッシュが無ければ黒画像で埋める
                     color_bgr = np.zeros((self.rgb_window_size[1], self.rgb_window_size[0], 3), dtype=np.uint8)
             else:
                 # 正常に取得できた場合はキャッシュを更新
-                self._last_color_bgr = color_bgr
+                self._last_color_bgr = color_bgr  # type: ignore[attr-defined]
 
-            # カラー画像を表示用リストに追加
+            # 表示リストに追加
             display_images.append(color_bgr)
             
             # 画像を結合して表示
@@ -2009,40 +2112,6 @@ class FullPipelineViewer(DualViewer):
         d_ptp = float(depth_image.ptp()) if depth_image.ptp() > 0 else 1.0
         depth_normalized = ((depth_image.astype(np.float32) - d_min) / d_ptp * 255.0).astype(np.uint8)
         return cv2.applyColorMap(depth_normalized, cv2.COLORMAP_JET)
-    
-    def _process_color_image(self, frame_data: Any, hands_2d: List, hands_3d: List, 
-                           tracked_hands: List, collision_events: Optional[List[Any]]) -> Optional[np.ndarray]:
-        """カラー画像を処理"""
-        if (
-            frame_data.color_frame is None
-            or self.camera is None
-            or not getattr(self.camera, "has_color", False)
-        ):
-            return None
-        
-        color_data = np.frombuffer(frame_data.color_frame.get_data(), dtype=np.uint8)
-        color_format = frame_data.color_frame.get_format()
-        
-        # フォーマット変換
-        color_image = self._convert_color_format(color_data, color_format)
-        if color_image is None:
-            return None
-        
-        # 既に BGR 配列になっているので、そのままリサイズして使用する
-        color_bgr = cv2.resize(color_image, self.rgb_window_size)
-        
-        # 手検出結果を描画
-        if self.enable_hand_detection and hands_2d:
-            color_bgr = self._draw_hand_detections(color_bgr, hands_2d, hands_3d, tracked_hands)
-        
-        # 衝突検出情報を描画
-        if collision_events:
-            self._draw_collision_info(color_bgr, collision_events)
-        
-        cv2.putText(color_bgr, f"RGB (FPS: {self.performance_stats['fps']:.1f})", 
-                   (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-        
-        return color_bgr
     
     def _convert_color_format(self, color_data: np.ndarray, color_format: Any) -> Optional[np.ndarray]:
         """カラーフォーマットを変換"""
@@ -2340,6 +2409,23 @@ def main():
     """メイン関数"""
     parser = create_argument_parser()
     args = parser.parse_args()
+    
+    # Auto-enable MediaPipe GPU mode if a CUDA-enabled device is detected
+    # and the user did not specify --gpu-mediapipe.
+    if not getattr(args, "gpu_mediapipe", False):
+        try:
+            import cv2
+            cuda_available = (
+                hasattr(cv2, "cuda")
+                and callable(getattr(cv2.cuda, "getCudaEnabledDeviceCount", None))
+                and cv2.cuda.getCudaEnabledDeviceCount() > 0
+            )
+        except Exception:
+            cuda_available = False
+
+        if cuda_available:
+            args.gpu_mediapipe = True
+            print("🔎 CUDA device detected – enabling MediaPipe GPU mode by default")
     
     # 引数検証
     if not validate_arguments(args):

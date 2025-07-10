@@ -28,7 +28,7 @@ except ImportError:
                 DrawingSpec = lambda *args: None
 
 from .. import get_logger
-from ..types import HandednessType, HandLandmark, HandROI, HandDetectionResult, ROITrackingStats
+from ..data_types import HandednessType, HandLandmark, HandROI, HandDetectionResult, ROITrackingStats
 
 logger = get_logger(__name__)
 

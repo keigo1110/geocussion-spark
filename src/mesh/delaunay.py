@@ -16,6 +16,7 @@ from scipy.spatial.distance import cdist
 import cv2
 
 from .projection import HeightMap
+from src.utils.gpu_support import log_gpu_status
 
 # GPU三角分割器をインポート（オプション）
 try:
@@ -123,16 +124,11 @@ class DelaunayTriangulator:
                     enable_caching=True,
                     force_cpu=False  # 明示的にCPU強制を無効化
                 )
-                print(f"GPU Delaunay triangulation enabled: {'GPU' if self.gpu_triangulator.use_gpu else 'CPU fallback'}")
+                log_gpu_status("DelaunayTriangulator", self.gpu_triangulator.use_gpu)
                 
-                # デバッグ情報
-                if self.gpu_triangulator.use_gpu:
-                    print(f"✅ GPU triangulation initialized successfully")
-                else:
-                    print(f"⚠️ GPU triangulation fell back to CPU mode")
-                    
             except Exception as e:
-                print(f"GPU triangulation initialization failed: {e}")
+                import logging as _logging
+                _logging.getLogger(__name__).warning("GPU triangulator init failed: %s", e)
                 self.gpu_triangulator = None
         
         # パフォーマンス統計
@@ -351,10 +347,13 @@ class DelaunayTriangulator:
                                 valid_triangles.append(tri)
                     
                     if valid_triangles:
+                        import logging as _logging
                         elapsed_ms = (time.perf_counter() - start_time) * 1000
                         self.stats['gpu_triangulations'] += 1
-                        
-                        print(f"[GPU-DELAUNAY] {len(points)} points -> {len(valid_triangles)} triangles in {elapsed_ms:.1f}ms")
+                        _logging.getLogger(__name__).debug(
+                            "[GPU-DELAUNAY] %d points -> %d triangles in %.1fms",
+                            len(points), len(valid_triangles), elapsed_ms,
+                        )
                         
                         return TriangleMesh(
                             vertices=vertices_3d.astype(np.float32),
@@ -362,7 +361,8 @@ class DelaunayTriangulator:
                         )
                 
             except Exception as e:
-                print(f"GPU triangulation failed: {e}, falling back to CPU")
+                import logging as _logging
+                _logging.getLogger(__name__).warning("GPU triangulation failed: %s, falling back to CPU", e)
         
         # CPU版三角分割（フォールバック）
         xy_points = points[:, :2]
@@ -378,8 +378,10 @@ class DelaunayTriangulator:
                     valid_triangles.append(tri)
             
             if not valid_triangles:
-                # フォールバック: 全ての三角形を使用
-                print(f"Warning: No triangles passed quality filter, using all {len(triangles)} triangles")
+                import logging as _logging
+                _logging.getLogger(__name__).warning(
+                    "No triangles passed quality filter, using all %d triangles", len(triangles)
+                )
                 valid_triangles = triangles.tolist()
             
             triangles = np.array(valid_triangles)
@@ -387,7 +389,10 @@ class DelaunayTriangulator:
             elapsed_ms = (time.perf_counter() - start_time) * 1000
             self.stats['cpu_triangulations'] += 1
             
-            print(f"[CPU-DELAUNAY] {len(points)} points -> {len(triangles)} triangles in {elapsed_ms:.1f}ms")
+            import logging as _logging
+            _logging.getLogger(__name__).debug(
+                "[CPU-DELAUNAY] %d points -> %d triangles in %.1fms", len(points), len(triangles), elapsed_ms
+            )
             
             return TriangleMesh(
                 vertices=points,

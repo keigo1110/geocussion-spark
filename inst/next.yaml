@@ -1,44 +1,156 @@
-- id: P-MEM-001
-  title: "長時間実行でのフリーズ／メモリリーク疑惑"
-  module: ["demo_collision_detection.py", "src/mesh/pipeline.py", "src/input/pointcloud.py", "src/debug/profiler.py"]
-  severity: "Critical"
-  description: |
-    30 分以上連続稼働させると RSS が 3.5 GB 以上に増加し GUI がフリーズする。
-    GPU 無し環境でも再現。gc.collect() では回収されず、Python レベルの
-    オブジェクト参照が残っている可能性が高い。
-  symptoms:
-    • top / htop でメモリ使用量がフレームごとに徐々に増大。
-    • Open3D ビューワーの remove_geometry 直後でも Geometry 数が増え続ける。
-    • event_queue や hand position history が上限なく蓄積。
-  hypothesis:
-    • PointCloudConverter が ArrayPool に確保した ndarray を解放せず運用。
-    • MeshPipeline で cached_mesh の世代がリスト参照で残り続ける。
-    • CollisionEventQueue / _last_contact_trigger_time dict が肥大化 (キー永続)。
-    • Open3D TriangleMesh インスタンスが vis から削除後も Python 側参照が残り GC されない。
-  investigation_plan: |
-    1) tracemalloc で 10k フレーム分スナップショット比較しリーク箇所特定。
-    2) objgraph.show_growth(top=20) を 1000 フレームごとにログに出力。
-    3) Debug buildで resource.getrusage(RUSAGE_SELF).ru_maxrss を時系列記録。
-  fix_suggestion: |
-    • PointCloudConverter: ArrayPool に maxlen=4 の deque を導入し再利用バッファを上書き式に。
-    • MeshPipeline: _cached_mesh を weakref、世代管理リストを削除。
-    • CollisionEventQueue: pop_processed() を毎フレーム呼び FIFO 長さ <=256 に。 
-    • _last_contact_trigger_time を LRUDict(size=500) に変更。
-    • Open3D geometry は add/remove ではなく update_geometry_in_place を使用しインスタンス数一定化。
-  status: "TODO"
+id: terrain_audio_rt
+date: "2025-07-09"
+title: "リアルタイム地形追従 & 打音レスポンス高速化"
+owner: "@zigen4"
+status: "DRAFT"
 
-- id: T-MEM-001
-  description: "Memory leak root-cause isolation & mitigation"
-  depends_on: [P-MEM-001]
-  steps:
-    - "1. src/debug/profiler.py に tracemalloc_logger(enable=True, interval=1000) を実装しリーク出力。"
-    - "2. PointCloudConverter.ArrayPool を capacity=4 の deque に置換し古いバッファを再利用。"
-    - "3. MeshPipeline.cached_mesh を weakref.ref に変更し世代リストを撤廃。"
-    - "4. CollisionEventQueue.pop_processed() を _process_collision_pipeline 後に必ず呼び出し。"
-    - "5. _last_contact_trigger_time を collections.OrderedDict + size guard 500 件で truncate。"
-    - "6. Open3D: vis.update_geometry(o3d_mesh, write=True) で Geometry 再利用し remove_geometry を廃止。"
-  acceptance_criteria:
-    - "1 時間連続稼働で RSS 上昇 < 150 MB。"
-    - "tracemalloc top diff に大幅な未解放 ndarray/mesh が無いこと。"
-    - "FPS 低下なし（±5% 以内）。"
-  status: "TODO"
+# -----------------------------------------------------------------------------
+# 目的 / 背景
+# -----------------------------------------------------------------------------
+# 砂場打楽器（砂場の地形を作り、形に応じた音が地形を叩くと鳴るインタラクション）の体験品質を高めるため、
+#   1) 地形メッシュを最新状態へリアルタイムに追従させる
+#   2) 叩いた瞬間に音が鳴る超低レイテンシ実行経路を確保する
+# -----------------------------------------------------------------------------
+
+objectives:
+  - id: OBJ-001
+    desc: |
+      砂場地形を正確に認識し、ユーザーが手をどけた直後 (≦200 ms) に
+      メッシュを更新・可視化する。
+  - id: OBJ-002
+    desc: |
+      手が画面内に検出されている間はメッシュ更新を停止し、
+      不要な GPU/CPU コストを削減する。
+  - id: OBJ-003
+    desc: |
+      地形の大幅な変化 (高さ差 > 2 cm の領域が 5 % 以上) を検出した場合、
+      "地形変形モード" に入り、楽器演奏を一時停止する。地形を変化させるのは基本手なので、手の検出がなくなると地形変形モードをやめる。
+  - id: OBJ-004
+    desc: |
+      衝突検出 → 音響合成 までの往復レイテンシを 30 ms 未満に抑え、
+      打楽器のような即時フィードバックを実現する。
+
+# -----------------------------------------------------------------------------
+# 要件
+# -----------------------------------------------------------------------------
+requirements:
+  functional:
+    - id: FR-1
+      text: "通常時 (手が無い) は 1 Hz 程度で地形メッシュを更新する。"
+    - id: FR-2
+      text: "手検出中は地形メッシュ生成をスキップする。"
+    - id: FR-3
+      text: "手が消失したフレームで強制的にメッシュ更新をトリガする。"
+    - id: FR-4
+      text: "大規模地形変化を検出した場合、AudioSynthesizer を pause し UI にステータスを表示する。"
+    - id: FR-5
+      text: "衝突イベント発生から音声再生開始まで 30 ms 以内。"
+  non_functional:
+    - id: NFR-1
+      text: "CPU 使用率を +10 % 以内、GPU 使用率を +15 % 以内に抑える (比較: 現行 HEAD)。"
+    - id: NFR-2
+      text: "mypy strict & pytest 全パスを維持する。"
+
+# -----------------------------------------------------------------------------
+# 既存実装ギャップ分析
+# -----------------------------------------------------------------------------
+problems:
+  - id: GAP-01
+    title: "メッシュ更新条件が単純なフレーム間隔のみ"
+    impact: "不要な計算が発生 & 手検出時にも更新され得る"
+  - id: GAP-02
+    title: "手の消失をフラグ化する仕組みがない"
+    impact: "手をどかしても更新が次の周期まで遅延"
+  - id: GAP-03
+    title: "地形変化量の定量判定ロジックが未実装"
+    impact: "大規模変形時に Audio を止められない"
+  - id: GAP-04
+    title: "Collision → Audio パスの詳細プロファイル不足"
+    impact: "ボトルネック特定が困難、レイテンシ保証不可"
+  - id: GAP-05
+    title: "RGB ウィンドウ描画がカクつく"
+    impact: "Depth 画は滑らかだが RGB 側が 5–10 FPS まで低下し UX が悪化。\n      Root-cause: 同フレーム再取得・cv2.normalize 連続実行・MJPG デコードの再実行・OpenCV resize 多重化でフレーム時間スパイク (≈150 ms)。"
+
+# -----------------------------------------------------------------------------
+# 実装プラン (タスク分解)
+# -----------------------------------------------------------------------------
+# WBS レベル: 大項目→小項目→受入れ基準 で管理
+# -----------------------------------------------------------------------------
+tasks:
+  - id: T-1
+    title: "MeshUpdateScheduler 実装"
+    owner: "@zigen4"
+    depends_on: []
+    steps:
+      - "メッシュ更新専用のスケジューラクラスを src/mesh/manager.py に追加。"
+      - "入力: 現在の TrackedHand リスト, 前回更新時刻, 地形変化フラグ"
+      - "ロジック: \n         * 手が存在: return SKIP\n         * 手→無し遷移: return FORCE_UPDATE\n         * 前回更新から >1 s: return PERIODIC_UPDATE"
+      - "DualViewer._process_frame 内で PipelineManager.update_if_needed() へ scheduler 結果を渡す。"
+    acceptance:
+      - "手が映っていない & 1 s 経過で update が呼ばれる。"
+      - "手→無し遷移フレームで即 update が呼ばれる。"
+    status: "PENDING"
+
+  - id: T-2
+    title: "TerrainChangeDetector プロトタイプ"
+    depends_on: []
+    steps:
+      - "連続 2 回の depth_image (または pointcloud) を比較し RMS 差分を計算。" 
+      - "差分 > θ (例 20 mm) が画面の 5 % を超えたら change=True と返す。"
+      - "変更検出時: EventQueue に TerrainChanged イベントを push。"
+    acceptance:
+      - "砂を大きく動かしたときに change=True を検出。"
+    status: "PENDING"
+
+  - id: T-3
+    title: "地形変形モード制御 & AudioPause"
+    depends_on: [T-2]
+    steps:
+      - "CollisionPipeline に terrain_deforming フラグを追加。"
+      - "TerrainChanged 受信で terrain_deforming=True, 一定フレーム静止で False。"
+      - "terrain_deforming=True 中は VoiceManager.stop_all_voices(), 衝突→音生成をスキップ。"
+      - "UI オーバーレイに『地形更新中...』を表示 (既存 help_text の area を流用)。"
+    acceptance:
+      - "地形を崩すと音が止まり、静止後に自動で再開する。"
+    status: "PENDING"
+
+  - id: T-4
+    title: "Audio レイテンシプロファイル & 最適化"
+    depends_on: []
+    steps:
+      - "cProfile + time.perf_counter で HandCollision → allocate_and_play までを計測。"
+      - "VoiceManager.allocate() のメモリアロケーションを事前 pool 化し 0alloc 化。"
+      - "AudioMapper.map_collision_event を NumPy 配列演算へリファクタ。"
+      - "GPU 距離計算のバッチサイズを 1 → N に動的調整し呼び出し回数を削減。"
+    acceptance:
+      - "平均レイテンシ < 30 ms (95th パーセンタイル)。"
+    status: "PENDING"
+
+  - id: T-5
+    title: "DualViewer RGB パイプライン最適化"
+    depends_on: []
+    steps:
+      - "_process_hand_detection を FrameData 共有型に変更しカメラ再取得を排除。"
+      - "Depth 可視化を convertScaleAbs + applyColorMap で固定スケール化し 1 ms 未満に短縮。"
+      - "ColorFrame 変換をフォーマット毎に一度だけ実施し、BGR→resize→cache で再利用。"
+      - "PointCloud/O3D 更新を ThreadPoolExecutor で非同期化し GUI スレッド負荷を抑制。"
+      - "skip_interval を 8 へ引き上げ MediaPipe 実行負荷を低減 (GPU 有効時は 4)。"
+    acceptance:
+      - "RGB ウィンドウ FPS ≥ 25 (low-res 424×240, CPU モード)。"
+      - "Depth と RGB のフレームタイミング差 < 1 フレーム。"
+      - "パフォーマンスオーバーレイで HandDetectionTime が安定 (<20 ms) しフレームスパイク消滅。"
+    status: "PENDING"
+
+metrics:
+  - name: "Mesh update latency (hand→none)"
+    target: "≤200 ms (avg)"
+  - name: "Audio response latency (collision→sound)"
+    target: "≤30 ms (p95)"
+  - name: "CPU overhead"
+    target: "+10 % 以下"
+  - name: "GPU overhead"
+    target: "+15 % 以下"
+
+notes:
+  - "Scheduler & Detector は将来 async/pipeline thread と統合予定 (非同期化余地あり)。"
+  - "大量三角形 (>50k) で距離計算が重くなる場合は BVH early-exit を検討。"

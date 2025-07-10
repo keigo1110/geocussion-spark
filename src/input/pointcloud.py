@@ -21,10 +21,10 @@ try:
     HAS_OPEN3D = True
 except ImportError:
     # テスト用のモック定義（types.pyのOBFormatと統合）
-    from ..types import OBFormat
+    from ..data_types import OBFormat
     HAS_OPEN3D = False
 
-from ..types import CameraIntrinsics, FrameData
+from ..data_types import CameraIntrinsics, FrameData
 from ..collision.optimization import ArrayPool
 from src import get_logger
 

@@ -24,7 +24,7 @@ except ImportError:
 # 音響設定
 from ..sound.mapping import ScaleType, InstrumentType
 from ..input.stream import OrbbecCamera
-from ..types import FrameData, OBFormat, CameraIntrinsics
+from ..data_types import FrameData, OBFormat, CameraIntrinsics
 
 # イベントシステム
 from .events import (
@@ -451,7 +451,7 @@ class IntegratedGeocussionViewer(EventHandler):
             if not self.camera:
                 # モック深度・カラー画像生成
                 import numpy as np
-                from ..types import FrameData, CameraIntrinsics
+                from ..data_types import FrameData, CameraIntrinsics
                 
                 depth_image = np.random.randint(500, 2000, (240, 424), dtype=np.uint16)
                 color_image = np.random.randint(0, 255, (480, 640, 3), dtype=np.uint8)
@@ -863,7 +863,7 @@ class IntegratedGeocussionViewer(EventHandler):
                 return self._create_fallback_image()
             
             import cv2
-            from ..types import OBFormat
+            from ..data_types import OBFormat
             
             try:
                 color_frame = frame_data.color_frame

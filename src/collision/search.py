@@ -21,7 +21,7 @@ if TYPE_CHECKING:
     from ..detection.tracker import TrackedHand
 from .sphere_tri import point_triangle_distance
 from .distance import point_triangle_distance_vectorized  # Numba最適化された距離計算
-from ..types import SearchStrategy, SearchResult
+from ..data_types import SearchStrategy, SearchResult
 from ..config import get_config
 from .optimization import optimize_array_operations, memory_efficient_context
 

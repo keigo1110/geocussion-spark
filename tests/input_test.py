@@ -14,7 +14,7 @@ from unittest.mock import Mock, patch
 from src.input.depth_filter import DepthFilter, FilterType, CudaBilateralFilter
 from src.input.pointcloud import PointCloudConverter, NumpyVoxelDownsampler
 from src.input.stream import OrbbecCamera, FastResize
-from src.types import CameraIntrinsics, FrameData
+from src.data_types import CameraIntrinsics, FrameData
 
 
 class TestDepthFilter:

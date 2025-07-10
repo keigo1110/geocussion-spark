@@ -12,7 +12,7 @@ import numpy as np
 import cv2
 
 # 他フェーズとの連携  
-from ..types import FrameData, CameraIntrinsics
+from ..data_types import FrameData, CameraIntrinsics
 
 # ロギング設定
 from src import get_logger

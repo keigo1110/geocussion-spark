@@ -13,7 +13,7 @@ import numpy as np
 from ..numba_config import get_numba, get_optimized_jit_config, create_optimized_jit
 
 from ..mesh.delaunay import TriangleMesh
-from ..types import CollisionType
+from ..data_types import CollisionType
 from .. import get_logger
 
 logger = get_logger(__name__)

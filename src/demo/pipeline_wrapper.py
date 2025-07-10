@@ -22,7 +22,7 @@ from .pipeline.collision_stage import CollisionStageConfig
 from .pipeline.audio_stage import AudioStageConfig
 
 # 既存の型定義（後方互換性のため）
-from ..types import FrameData
+from ..data_types import FrameData
 from ..sound.mapping import ScaleType, InstrumentType
 from ..input.stream import OrbbecCamera
 from ..input.depth_filter import FilterType
