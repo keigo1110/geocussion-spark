@@ -382,7 +382,7 @@ class FullPipelineViewer(DualViewer):
         
         # 音響生成コンポーネント
         self.audio_mapper: Optional[AudioMapper] = None
-        self.audio_synthesizer: Optional[AudioSynthesizer] = None
+        self.audio_synthesizer: Optional[Any] = None
         self.voice_manager: Optional[VoiceManager] = None
         self.audio_enabled = False
         
@@ -1039,7 +1039,7 @@ class FullPipelineViewer(DualViewer):
                                             computation_time_ms: float) -> Any:
         """距離情報から衝突情報を生成"""
         from src.collision.sphere_tri import CollisionInfo, ContactPoint
-        from src.types import CollisionType
+        from src.data_types import CollisionType
         
         # 衝突判定（半径内の距離）
         collision_mask = distances[0] <= radius
@@ -1709,7 +1709,6 @@ class FullPipelineViewer(DualViewer):
             self.enable_audio_synthesis
             and self.audio_enabled
             and collision_events
-            and not self.terrain_deforming
         ):
             self._perform_audio_synthesis(collision_events)
         
@@ -1805,14 +1804,16 @@ class FullPipelineViewer(DualViewer):
                 enable_adaptive_mapping=True
             )
             
-            # 音響シンセサイザー初期化（pygame版）
-            self.audio_synthesizer = create_audio_synthesizer(
+            # 音響シンセサイザー初期化（シンプルpygame版）
+            from src.sound.simple_synth import create_simple_audio_synthesizer
+            self.audio_synthesizer = create_simple_audio_synthesizer(
                 sample_rate=44100,
                 buffer_size=512,
                 max_polyphony=self.audio_polyphony
             )
             
             # 音響エンジン開始
+            logger.info("Audio synthesizer starting engine...")
             if self.audio_synthesizer.start_engine():
                 # pygame版では VoiceManager は不要、直接 synthesizer を使用
                 self.voice_manager = None  # pygame版では使用しない
@@ -1821,9 +1822,12 @@ class FullPipelineViewer(DualViewer):
                 self.audio_synthesizer.update_master_volume(self.audio_master_volume)
                 
                 self.audio_enabled = True
-                logger.info("音響システム（pygame版）初期化完了")
+                logger.info(f"音響システム（pygame版）初期化完了 - master_volume: {self.audio_master_volume}")
+                logger.info(f"Audio synthesizer state: {self.audio_synthesizer.state}")
+                logger.info(f"Audio synthesizer config: {self.audio_synthesizer.config}")
             else:
                 logger.error("pygame音響エンジンの開始に失敗しました")
+                logger.error(f"Audio synthesizer state: {getattr(self.audio_synthesizer, 'state', 'UNKNOWN')}")
                 self.audio_enabled = False
         
         except Exception as e:
@@ -1866,7 +1870,7 @@ class FullPipelineViewer(DualViewer):
     
     def _generate_audio(self, collision_events: List[Any]) -> int:
         """衝突イベントから音響を生成"""
-        if not self.audio_enabled or not self.audio_mapper or not self.voice_manager:
+        if not self.audio_enabled or not self.audio_mapper or not self.audio_synthesizer:
             return 0
         
         notes_played = 0
@@ -1888,17 +1892,27 @@ class FullPipelineViewer(DualViewer):
                 # pygame版: 直接シンセサイザーを使用
                 voice_id = None
                 if self.audio_synthesizer:
+                    logger.info(f"[AUDIO-DEBUG] Attempting to play audio: instrument={audio_params.instrument}, "
+                               f"frequency={audio_params.frequency:.1f}Hz, velocity={audio_params.velocity:.2f}")
                     voice_id = self.audio_synthesizer.play_audio_parameters(audio_params)
+                    if voice_id:
+                        logger.info(f"[AUDIO-SUCCESS] Audio played successfully with voice_id: {voice_id}")
+                    else:
+                        logger.error(f"[AUDIO-FAILED] play_audio_parameters returned None")
+                else:
+                    logger.error(f"[AUDIO-ERROR] self.audio_synthesizer is None")
                 
                 if voice_id:
                     notes_played += 1
                     self.last_audio_trigger_time[event.hand_id] = current_time
-                    logger.debug(f"[AUDIO-TRIGGER] Hand {event.hand_id}: Note triggered (pygame)")
+                    logger.info(f"[AUDIO-TRIGGER] Hand {event.hand_id}: Note triggered (pygame) - voice_id: {voice_id}")
                     # 記録 – debounce と同じキー形式 (hand_id, gx, gy, gz)
                     gx = int(round(event.contact_position[0] * 50))
                     gy = int(round(event.contact_position[1] * 50))
                     gz = int(round(event.contact_position[2] * 50))
                     self._last_contact_trigger_time[(event.hand_id, gx, gy, gz)] = current_time
+                else:
+                    logger.warning(f"[AUDIO-SKIP] Could not play audio for event {event.event_id}")
 
                     # Keep the debounce map bounded (T-MEM-001)
                     if len(self._last_contact_trigger_time) > 500:

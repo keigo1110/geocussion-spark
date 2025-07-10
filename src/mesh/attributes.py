@@ -14,7 +14,7 @@ from scipy.spatial.distance import cdist
 from scipy import sparse
 
 from .delaunay import TriangleMesh
-from ..types import ArrayLike
+from ..data_types import ArrayLike
 from .. import get_logger
 
 logger = get_logger(__name__)

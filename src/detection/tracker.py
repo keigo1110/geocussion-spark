@@ -17,7 +17,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from .hands3d import Hand3DResult, Hand3DLandmark
 
-from ..types import HandednessType, TrackingState
+from ..data_types import HandednessType, TrackingState
 from src import get_logger
 
 logger = get_logger(__name__)

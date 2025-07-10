@@ -11,7 +11,7 @@ from typing import List, Tuple, Optional, Sequence
 import numpy as np
 import cv2
 
-from src.types import HandDetectionResult, Hand3D, TrackingState
+from src.data_types import HandDetectionResult, Hand3D, TrackingState
 
 __all__ = ["HandMasker"]
 

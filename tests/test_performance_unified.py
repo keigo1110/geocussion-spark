@@ -19,7 +19,7 @@ from src.collision.optimization import ArrayPool, memory_efficient_context
 from src.mesh.delaunay import TriangleMesh
 from src.mesh.index import SpatialIndex, IndexType
 from src.detection.tracker import TrackedHand
-from src.types import SearchResult, CollisionInfo, Hand3D, HandednessType, TrackingState
+from src.data_types import SearchResult, CollisionInfo, Hand3D, HandednessType, TrackingState
 from src.constants import COLLISION_SEARCH_TIME_LIMIT_MS, COLLISION_DETECTION_TIME_LIMIT_MS
 
 

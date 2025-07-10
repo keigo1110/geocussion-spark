@@ -15,7 +15,7 @@ import numpy as np
 # 他フェーズとの連携
 from ..mesh.delaunay import TriangleMesh
 from ..mesh.attributes import MeshAttributes
-from ..types import CollisionType, ContactPoint, CollisionInfo, SearchResult
+from ..data_types import CollisionType, ContactPoint, CollisionInfo, SearchResult
 from ..constants import (
     COLLISION_TOLERANCE, 
     MAX_CONTACTS_PER_SPHERE,

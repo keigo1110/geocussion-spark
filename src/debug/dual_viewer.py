@@ -20,7 +20,7 @@ sys.path.append(os.path.join(os.path.dirname(__file__), '..', '..'))
 from src.input.stream import OrbbecCamera, FrameData, CameraIntrinsics
 from src.input.pointcloud import PointCloudConverter
 from src.input.depth_filter import DepthFilter, FilterType
-from src.types import OBFormat
+from src.data_types import OBFormat
 
 # 手検出フェーズ
 from src.detection.hands2d import MediaPipeHandsWrapper, HandednessType, filter_hands_by_confidence
@@ -675,7 +675,7 @@ class DualViewer:
             try:
                 from pyorbbecsdk import OBFormat as _OBF
             except ImportError:
-                from src.types import OBFormat as _OBF  # type: ignore
+                from src.data_types import OBFormat as _OBF  # type: ignore
 
             if color_format == _OBF.RGB:  # type: ignore[attr-defined]
                 rgb_image = color_data.reshape((self.camera.depth_intrinsics.height, self.camera.depth_intrinsics.width, 3))
@@ -848,7 +848,7 @@ class DualViewer:
             try:
                 from pyorbbecsdk import OBFormat as _OBF
             except ImportError:
-                from src.types import OBFormat as _OBF  # type: ignore
+                from src.data_types import OBFormat as _OBF  # type: ignore
 
             fmt = color_frame.get_format()
             h_src = self.camera.depth_intrinsics.height if self.camera and self.camera.depth_intrinsics else 720

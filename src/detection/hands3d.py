@@ -13,7 +13,7 @@ import cv2
 from scipy import ndimage
 from scipy.interpolate import griddata
 
-from ..types import CameraIntrinsics, HandDetectionResult, HandLandmark, HandednessType
+from ..data_types import CameraIntrinsics, HandDetectionResult, HandLandmark, HandednessType
 from src import get_logger
 
 logger = get_logger(__name__)

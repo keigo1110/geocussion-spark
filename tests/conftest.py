@@ -21,7 +21,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 from src import setup_logging, get_logger
 from src.config import get_config
-from src.types import CameraIntrinsics, FrameData
+from src.data_types import CameraIntrinsics, FrameData
 from src.constants import (
     DEFAULT_DEPTH_WIDTH, DEFAULT_DEPTH_HEIGHT,
     DEFAULT_COLOR_WIDTH, DEFAULT_COLOR_HEIGHT
