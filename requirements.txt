@@ -48,7 +48,7 @@ types-setuptools>=69.0.0
 # ===================================================================
 
 # GPU Acceleration (Optional - requires CUDA)
-cupy-cuda11x>=12.0.0,<13.0.0  # For CUDA 11.x
+# cupy-cuda11x>=12.0.0,<13.0.0  # For CUDA 11.x
 cupy-cuda12x>=12.0.0,<13.0.0  # For CUDA 12.x (default)
 # Note: Install the appropriate CuPy version for your CUDA installation
 # For GPU mesh generation acceleration (20-40x speedup)

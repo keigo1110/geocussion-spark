@@ -1331,10 +1331,17 @@ class FullPipelineViewer(DualViewer):
         if not hasattr(self, "_hand_masker"):
             self._hand_masker = HandMasker()
 
+        # Provide original color resolution for accurate scaling
+        color_shape = None
+        if color_image is not None:
+            # color_image shape: (h, w, 3)
+            color_shape = (color_image.shape[1], color_image.shape[0])  # (width, height)
+
         depth_image_masked, centers_3d, radii_arr = self._hand_masker.apply_mask(
             depth_image,
             hands_2d,
             tracked_hands,
+            src_resolution=color_shape,
         )
 
         # 最新深度をキャッシュ
