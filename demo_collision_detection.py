@@ -1405,21 +1405,9 @@ class FullPipelineViewer(DualViewer):
         self.performance_stats['frame_time'] = frame_time
         self.performance_stats['fps'] = 1000.0 / frame_time if frame_time > 0 else 0.0
         
-        # オーディオ一時停止制御 ----------------------------------------
-        if (
-            self.enable_audio_synthesis
-            and self.audio_enabled
-            and getattr(self, "voice_manager", None) is not None
-        ):
-            if self.terrain_deforming and not getattr(self, "_audio_paused", False):
-                try:
-                    self.voice_manager.stop_all_voices()  # type: ignore[func-returns-value]
-                except Exception:
-                    pass  # tolerate
-                self._audio_paused = True
-            elif (not self.terrain_deforming) and getattr(self, "_audio_paused", False):
-                # resume (nothing to do; voices will play on next collision)
-                self._audio_paused = False
+        # pygame版: オーディオ一時停止制御はスキップ（必要に応じて個別対応）
+        # pygame版では VoiceManager を使用していないため、個別にボイス停止が必要な場合は
+        # synthesizer.stop_all_voices() などの実装が必要
         
         return True
     
@@ -1805,9 +1793,9 @@ class FullPipelineViewer(DualViewer):
     
     # 音響システム関連メソッド
     def _initialize_audio_system(self) -> None:
-        """音響システムを初期化"""
+        """音響システムを初期化（pygame版）"""
         try:
-            logger.info("音響システムを初期化中...")
+            logger.info("音響システム（pygame版）を初期化中...")
             
             # 音響マッパー初期化
             self.audio_mapper = AudioMapper(
@@ -1817,29 +1805,25 @@ class FullPipelineViewer(DualViewer):
                 enable_adaptive_mapping=True
             )
             
-            # 音響シンセサイザー初期化
+            # 音響シンセサイザー初期化（pygame版）
             self.audio_synthesizer = create_audio_synthesizer(
                 sample_rate=44100,
-                buffer_size=256,
+                buffer_size=512,
                 max_polyphony=self.audio_polyphony
             )
             
             # 音響エンジン開始
             if self.audio_synthesizer.start_engine():
-                # ボイス管理システム初期化
-                self.voice_manager = create_voice_manager(
-                    self.audio_synthesizer,
-                    max_polyphony=self.audio_polyphony,
-                    steal_strategy=StealStrategy.OLDEST
-                )
+                # pygame版では VoiceManager は不要、直接 synthesizer を使用
+                self.voice_manager = None  # pygame版では使用しない
                 
                 # マスターボリューム設定
                 self.audio_synthesizer.update_master_volume(self.audio_master_volume)
                 
                 self.audio_enabled = True
-                logger.info("音響システム初期化完了")
+                logger.info("音響システム（pygame版）初期化完了")
             else:
-                logger.error("音響エンジンの開始に失敗しました")
+                logger.error("pygame音響エンジンの開始に失敗しました")
                 self.audio_enabled = False
         
         except Exception as e:
@@ -1847,19 +1831,13 @@ class FullPipelineViewer(DualViewer):
             self.audio_enabled = False
     
     def _shutdown_audio_system(self) -> None:
-        """音響システムを停止"""
+        """音響システムを停止（pygame版）"""
         try:
-            logger.info("[AUDIO-SHUTDOWN] 音響システムを停止中...")
+            logger.info("[AUDIO-SHUTDOWN] 音響システム（pygame版）を停止中...")
             self.audio_enabled = False
             
-            # ボイス管理システムの停止
-            if self.voice_manager:
-                try:
-                    self.voice_manager.stop_all_voices(fade_out_time=0.01)
-                    time.sleep(0.05)
-                    self.voice_manager = None
-                except Exception as e:
-                    logger.error(f"[AUDIO-SHUTDOWN] VoiceManager停止エラー: {e}")
+            # pygame版では VoiceManager を使用していないためスキップ
+            self.voice_manager = None
             
             # シンセサイザーエンジンの停止
             if self.audio_synthesizer:
@@ -1868,12 +1846,12 @@ class FullPipelineViewer(DualViewer):
                     time.sleep(0.05)
                     self.audio_synthesizer = None
                 except Exception as e:
-                    logger.error(f"[AUDIO-SHUTDOWN] Synthesizer停止エラー: {e}")
+                    logger.error(f"[AUDIO-SHUTDOWN] pygame Synthesizer停止エラー: {e}")
             
             # 音響マッパーもクリア
             self.audio_mapper = None
             
-            logger.info("[AUDIO-SHUTDOWN] 音響システムを停止しました")
+            logger.info("[AUDIO-SHUTDOWN] 音響システム（pygame版）を停止しました")
         
         except Exception as e:
             logger.error(f"[AUDIO-SHUTDOWN] 音響システム停止エラー: {e}")
@@ -1907,21 +1885,15 @@ class FullPipelineViewer(DualViewer):
                 # 音響パラメータマッピング
                 audio_params = self.audio_mapper.map_collision_event(event)
                 
-                # 空間位置設定
-                spatial_position = self._get_spatial_position(event)
-                
-                # 音響再生
-                voice_id = allocate_and_play(
-                    self.voice_manager,
-                    audio_params,
-                    priority=7,
-                    spatial_position=spatial_position
-                )
+                # pygame版: 直接シンセサイザーを使用
+                voice_id = None
+                if self.audio_synthesizer:
+                    voice_id = self.audio_synthesizer.play_audio_parameters(audio_params)
                 
                 if voice_id:
                     notes_played += 1
                     self.last_audio_trigger_time[event.hand_id] = current_time
-                    logger.debug(f"[AUDIO-TRIGGER] Hand {event.hand_id}: Note triggered")
+                    logger.debug(f"[AUDIO-TRIGGER] Hand {event.hand_id}: Note triggered (pygame)")
                     # 記録 – debounce と同じキー形式 (hand_id, gx, gy, gz)
                     gx = int(round(event.contact_position[0] * 50))
                     gy = int(round(event.contact_position[1] * 50))
@@ -1940,12 +1912,12 @@ class FullPipelineViewer(DualViewer):
             except Exception as e:
                 logger.error(f"音響生成エラー（イベント: {event.event_id}）: {e}")
         
-        # ボイスクリーンアップ
-        if self.voice_manager and self.frame_count % 10 == 0:
+        # pygame版: 定期的にボイスクリーンアップ
+        if self.audio_synthesizer and self.frame_count % 10 == 0:
             try:
-                self.voice_manager.cleanup_finished_voices()
+                self.audio_synthesizer.cleanup_finished_voices()
             except Exception as e:
-                logger.error(f"[AUDIO-CLEANUP] Error during cleanup: {e}")
+                logger.error(f"[AUDIO-CLEANUP] Error during pygame cleanup: {e}")
         
         return notes_played
     
