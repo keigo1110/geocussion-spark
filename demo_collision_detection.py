@@ -1709,6 +1709,8 @@ class FullPipelineViewer(DualViewer):
                 self.collision_tester = SphereTriangleCollision(res.mesh)
 
             self._update_mesh_visualization(res.mesh)
+            # Update mesh timestamp to throttle point-cloud generation
+            self.last_mesh_update = self.frame_count
         
         # 衝突検出
         if self.enable_collision_detection and self.current_mesh is not None and tracked_hands:

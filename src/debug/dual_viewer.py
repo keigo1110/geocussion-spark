@@ -113,6 +113,13 @@ class DualViewer:
         self._color_decode_interval = 2  # decode every N frames
         self._next_color_decode_frame = 0
         self._last_color_bgr = np.zeros((self.rgb_window_size[1], self.rgb_window_size[0], 3), dtype=np.uint8)
+
+        # -------- Depth filter interval control (GAP-05 fix) --------
+        # Depth bilateral filtering is heavy; run once every N frames and
+        # reuse the cached result to eliminate redundant computation.
+        self._filter_interval = 2  # apply filter every 2 RGB frames
+        self._next_filter_frame = 0
+        self._depth_filtered_cache = None  # type: Optional[np.ndarray]
         
         # --- Hand detection timing ---
         self._hand_detection_interval = 2  # run detection every N RGB frames
@@ -329,7 +336,30 @@ class DualViewer:
             継続する場合True
         """
         try:
-            # 深度画像をカラーマップで可視化
+            # ------------------------------------------------------------------
+            # 1) 深度画像を抽出 & 必要ならフィルタを適用
+            # ------------------------------------------------------------------
+            depth_image = self._extract_depth_image(frame_data)
+
+            # 深度画像が取得できなければスキップ (たとえば一時的にフレーム無し)
+            if depth_image is None:
+                return True
+
+            # Depth filtering (heavy) – apply only every N frames
+            if self.depth_filter is not None and self.enable_filter:
+                if self.frame_count >= self._next_filter_frame or self._depth_filtered_cache is None:
+                    depth_image = self.depth_filter.apply_filter(depth_image)
+                    # Schedule next filtering
+                    self._next_filter_frame = self.frame_count + self._filter_interval
+                    self._depth_filtered_cache = depth_image
+                else:
+                    # Reuse cached filtered image for interim frames
+                    depth_image = self._depth_filtered_cache
+
+            # キャッシュして PointCloud パスで再利用 (不要なリシェイプを排除)
+            self._last_depth_image_filtered = depth_image  # type: ignore[attr-defined]
+
+            # 疑似カラー化
             depth_colored = self._create_depth_visualization(depth_image)
             
             # --- Decide whether to run hand detection this frame ---
@@ -339,7 +369,10 @@ class DualViewer:
             )
 
             if detect_now and self._last_color_bgr is not None and self._last_color_bgr.size > 0:
-                hands_2d, hands_3d, tracked_hands = self._process_hand_detection(self._last_color_bgr, depth_image)
+                hands_2d, hands_3d, tracked_hands = self._process_hand_detection(
+                    self._last_color_bgr,
+                    depth_image,
+                )
 
                 # Save for reuse and visualization
                 self._last_detected_hands_2d = hands_2d
@@ -775,7 +808,7 @@ class DualViewer:
             pass
 
     def _create_depth_visualization(self, depth_image: np.ndarray) -> np.ndarray:
-        """深度画像を高速に疑似カラー化（uint16→BGR）"""
+        """深度画像の可視化を高速に疑似カラー化（uint16→BGR）"""
         # OpenCV は8bit入力を期待するためリスケール
         if depth_image.dtype != np.uint8:
             # 固定スケール (0-4 m → 0-255) で十分。動的計算はコスト高
@@ -784,6 +817,23 @@ class DualViewer:
             depth_8u = depth_image
 
         return cv2.applyColorMap(depth_8u, cv2.COLORMAP_JET)
+
+    # ------------------------------------------------------------------
+    # Depth frame helpers
+    # ------------------------------------------------------------------
+
+    def _extract_depth_image(self, frame_data: FrameData):
+        """FrameData から NumPy uint16 深度画像を抽出 (カメラ intrinsics 依存)"""
+        try:
+            if frame_data.depth_frame is None or self.camera is None or self.camera.depth_intrinsics is None:
+                return None
+
+            intr = self.camera.depth_intrinsics
+            depth_data = np.frombuffer(frame_data.depth_frame.get_data(), dtype=np.uint16)
+            return depth_data.reshape((intr.height, intr.width))
+        except Exception:
+            # 何らかの理由で取得できなければ None を返して後段でスキップ
+            return None
 
     # ------------------------------------------------------------------
     # Color frame helpers
