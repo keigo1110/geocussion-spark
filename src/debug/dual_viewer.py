@@ -386,6 +386,15 @@ class DualViewer:
                 hands_2d = self._last_detected_hands_2d
                 hands_3d = self._last_detected_hands_3d
                 tracked_hands = self._last_tracked_hands
+                
+            # 手検出が無効化されている場合はキャッシュをクリア
+            if not self.enable_hand_detection:
+                hands_2d = []
+                hands_3d = []
+                tracked_hands = []
+                self._last_detected_hands_2d = []
+                self._last_detected_hands_3d = []
+                self._last_tracked_hands = []
 
             # 3Dマーカー更新用に保存
             self.current_hands_3d = hands_3d
@@ -425,7 +434,14 @@ class DualViewer:
                 color_bgr = self._decode_color_frame_resized(frame_data.color_frame)
                 self._last_color_bgr = color_bgr
 
-            display_images.append(color_bgr)
+            # 手検出結果を描画したRGB画像を生成
+            if color_bgr is not None and color_bgr.size > 0:
+                color_with_hands = self._draw_hand_detections_on_image(
+                    color_bgr.copy(), hands_2d, hands_3d, tracked_hands
+                )
+                display_images.append(color_with_hands)
+            else:
+                display_images.append(color_bgr)
             
             # ----- Efficient image stacking using preallocated buffer -----
             if len(display_images) == 2:
@@ -650,6 +666,71 @@ class DualViewer:
         
         return hands_2d, hands_3d, tracked_hands
     
+    def _draw_hand_detections_on_image(self, image: np.ndarray, hands_2d: list, hands_3d: list, tracked_hands: list) -> np.ndarray:
+        """
+        RGB画像に手検出結果を描画
+        
+        Args:
+            image: 描画対象画像
+            hands_2d: 2D手検出結果
+            hands_3d: 3D手検出結果
+            tracked_hands: トラッキング結果
+            
+        Returns:
+            描画済み画像
+        """
+        height, width = image.shape[:2]
+        
+        # 2D手検出結果描画
+        for hand_2d in hands_2d:
+            bbox = hand_2d.bounding_box
+            
+            # バウンディングボックス描画
+            cv2.rectangle(image, (bbox[0], bbox[1]), 
+                         (bbox[0] + bbox[2], bbox[1] + bbox[3]), 
+                         (0, 255, 0), 2)  # 緑色の枠
+            
+            # 手の情報表示
+            cv2.putText(image, f"{hand_2d.handedness.value} ({hand_2d.confidence:.2f})",
+                       (bbox[0], bbox[1] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+            
+            # 主要ランドマーク描画
+            for i, landmark in enumerate(hand_2d.landmarks):
+                if i in [0, 4, 8, 12, 16, 20]:  # 主要ランドマークのみ
+                    x = int(landmark.x * width)
+                    y = int(landmark.y * height)
+                    cv2.circle(image, (x, y), 3, (0, 255, 0), -1)
+        
+        # 3D投影結果情報表示
+        info_y = 60
+        if hands_3d:
+            cv2.putText(image, f"3D Hands: {len(hands_3d)}", (10, info_y), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 0), 2)
+            
+            for i, hand_3d in enumerate(hands_3d):
+                palm_x, palm_y, palm_z = hand_3d.palm_center_3d
+                cv2.putText(image, f"  Hand {i+1}: ({palm_x:.2f}, {palm_y:.2f}, {palm_z:.2f}m)",
+                           (10, info_y + 25 * (i + 1)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 1)
+        
+        # トラッキング結果表示
+        if tracked_hands:
+            track_y = info_y + 25 * (len(hands_3d) + 2) if hands_3d else info_y + 25
+            cv2.putText(image, f"Tracked: {len(tracked_hands)}", (10, track_y), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+            
+            for i, tracked_hand in enumerate(tracked_hands):
+                try:
+                    speed = tracked_hand.speed
+                    cv2.putText(image, 
+                               f"  ID: {tracked_hand.id[:8]} Speed: {speed:.2f}m/s",
+                               (10, track_y + 25 * (i + 1)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
+                except:
+                    cv2.putText(image, 
+                               f"  ID: {getattr(tracked_hand, 'id', 'Unknown')[:8]}",
+                               (10, track_y + 25 * (i + 1)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
+        
+        return image
+
     def _process_color_image(self, frame_data: FrameData, hands_2d: list, hands_3d: list, tracked_hands: list) -> np.ndarray:
         """
         RGB画像に手検出結果を描画
