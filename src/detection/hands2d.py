@@ -245,6 +245,19 @@ class MediaPipeHandsWrapper:
         self.last_mediapipe_frame = self.frame_count
         self.roi_tracking_stats.mediapipe_executions += 1
         
+        # 高速化: ROIトラッキングが安定している場合はMediaPipe頻度をさらに下げる
+        if self.enable_roi_tracking and len(self.current_rois) > 0:
+            # 全てのROIが高信頼度で追跡されている場合、MediaPipe頻度を動的に調整
+            stable_tracking = all(
+                self.frame_count - roi.last_updated_frame < self.max_tracking_age // 2
+                for roi in self.current_rois.values()
+            )
+            if stable_tracking and (self.frame_count - self.last_mediapipe_frame) < self.skip_interval * 2:
+                # 安定時はMediaPipeをさらにスキップ
+                detection_time = (time.perf_counter() - start_time) * 1000
+                self._update_stats(detection_time, 0)  # MediaPipeスキップを記録
+                return []  # ROIトラッキング結果を使用
+        
         try:
             # BGR -> RGB 変換
             rgb_image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
@@ -318,7 +331,7 @@ class MediaPipeHandsWrapper:
                     hand_result = self._create_tracked_hand_result(roi, hand_id)
                     if hand_result:
                         hand_results.append(hand_result)
-                    
+                        
                     self.roi_tracking_stats.tracking_successes += 1
                     logger.debug(f"ROI tracking success for {hand_id}: confidence={confidence:.3f}")
                 else:

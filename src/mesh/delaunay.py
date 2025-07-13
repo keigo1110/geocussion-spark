@@ -92,7 +92,7 @@ class DelaunayTriangulator:
         quality_threshold: float = 0.5,   # 品質閾値（0-1）
         # GPU加速設定
         use_gpu: bool = True,              # GPU使用フラグ
-        gpu_fallback_threshold: int = 1000 # GPU使用の最小点数
+        gpu_fallback_threshold: int = 300  # GPU使用の最小点数（より積極的に）
     ):
         """
         初期化
@@ -316,7 +316,7 @@ class DelaunayTriangulator:
         use_gpu_for_this = (
             self.gpu_triangulator is not None and 
             self.gpu_triangulator.use_gpu and 
-            len(points) >= 100  # fallback_thresholdを無視してより実用的な閾値に
+            len(points) >= 50   # さらに低い閾値でGPU使用を積極化
         )
         
         start_time = time.perf_counter()
