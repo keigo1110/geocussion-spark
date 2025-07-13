@@ -115,16 +115,25 @@ def initialize_numba_optimization():
     """Numba JIT最適化を初期化"""
     try:
         sys.path.insert(0, str(project_root / "src"))
-        from src.numba_config import initialize_numba, get_numba_status, warmup_basic_functions
+        from src.numba_config import (
+            initialize_numba, get_numba_status, warmup_basic_functions,
+            get_numba_cache_info, force_numba_cache_cleanup
+        )
         
         logger.info("Starting Numba initialization...")
-        success = initialize_numba(verbose=True, force_retry=True)
+        success = initialize_numba(verbose=True, force_retry=True, enable_auto_cleanup=True)
         if success:
             status = get_numba_status()
             logger.info(f"Numba JIT acceleration enabled (v{status['version']})")
             logger.info("Warming up JIT functions...")
             warmup_basic_functions()
             logger.info("JIT functions warmed up - maximum performance ready")
+            
+            # Numbaキャッシュ情報を表示
+            cache_info = get_numba_cache_info()
+            logger.info(f"Numba cache: {cache_info['total_size_mb']:.1f}MB in {cache_info['total_files']} files")
+            logger.info(f"Automatic cache cleanup: {'enabled' if cache_info['cleanup_active'] else 'disabled'}")
+            
         else:
             logger.warning("Numba JIT acceleration disabled (falling back to NumPy)")
     except Exception as e:

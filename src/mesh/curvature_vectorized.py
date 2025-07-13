@@ -33,6 +33,7 @@ except ImportError:
 
 from .delaunay import TriangleMesh
 from .. import get_logger
+from ..utils.cache_manager import get_cache_manager
 
 logger = get_logger(__name__)
 
@@ -119,7 +120,10 @@ class VectorizedCurvatureCalculator:
         self.cache_timeout_sec = cache_timeout_sec
         self.use_jit = use_jit and NUMBA_AVAILABLE
         
-        # キャッシュ
+        # 拡張キャッシュマネージャーを使用
+        self.cache_manager = get_cache_manager('curvature')
+        
+        # 従来のキャッシュ（統計目的で残す）
         self._cache: Dict[int, Tuple[CurvatureResult, float]] = {}
         self._cache_lock = threading.Lock()
         
@@ -139,7 +143,7 @@ class VectorizedCurvatureCalculator:
         
         if self.enable_async:
             self._executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="curvature_calc")
-    
+
     def compute_curvatures(
         self,
         mesh: TriangleMesh,
@@ -157,7 +161,15 @@ class VectorizedCurvatureCalculator:
         """
         mesh_hash = self._compute_mesh_hash(mesh)
         
-        # キャッシュチェック
+        # 拡張キャッシュからの取得試行
+        if self.enable_caching and self.cache_manager:
+            cache_key = f"curvature_{mesh_hash}"
+            cached_result = self.cache_manager.get(cache_key)
+            if cached_result is not None:
+                self.stats['cache_hits'] += 1
+                return cached_result
+        
+        # 従来のキャッシュチェック
         if self.enable_caching:
             cached_result = self._get_cached_result(mesh_hash)
             if cached_result is not None:
@@ -171,7 +183,7 @@ class VectorizedCurvatureCalculator:
         
         # 同期計算
         return self._compute_sync(mesh, mesh_hash)
-    
+
     def _compute_sync(self, mesh: TriangleMesh, mesh_hash: int) -> CurvatureResult:
         """同期計算（JIT最適化対応）"""
         start_time = time.perf_counter()
@@ -207,7 +219,13 @@ class VectorizedCurvatureCalculator:
                 cached=False
             )
             
-            # キャッシュに保存
+            # 拡張キャッシュに保存
+            if self.enable_caching and self.cache_manager:
+                cache_key = f"curvature_{mesh_hash}"
+                result_size = self._estimate_result_size(result)
+                self.cache_manager.put(cache_key, result, result_size)
+            
+            # 従来のキャッシュに保存
             if self.enable_caching:
                 self._cache_result(mesh_hash, result)
             
@@ -218,9 +236,40 @@ class VectorizedCurvatureCalculator:
             
         except Exception as e:
             logger.error(f"Curvature calculation failed: {e}")
-            # フォールバック: ゼロ値で返す
             return self._create_fallback_result(mesh)
-    
+
+    def _estimate_result_size(self, result: CurvatureResult) -> int:
+        """CurvatureResultのメモリサイズを推定"""
+        if result is None:
+            return 0
+        
+        # 各配列のサイズを推定
+        base_size = 200  # 基本オブジェクトサイズ
+        
+        arrays = [
+            result.vertex_curvatures,
+            result.gaussian_curvatures,
+            result.mean_curvatures,
+            result.gradients,
+            result.gradient_magnitudes
+        ]
+        
+        total_array_size = 0
+        for arr in arrays:
+            if arr is not None and hasattr(arr, 'nbytes'):
+                total_array_size += arr.nbytes
+        
+        return base_size + total_array_size
+
+    def clear_cache(self):
+        """キャッシュクリア"""
+        if self.cache_manager:
+            self.cache_manager.clear()
+        
+        # 従来のキャッシュもクリア
+        with self._cache_lock:
+            self._cache.clear()
+
     def _compute_mean_curvatures_jit(self, mesh: TriangleMesh, laplacian: csr_matrix) -> np.ndarray:
         """JIT最適化された平均曲率計算"""
         n_vertices = mesh.num_vertices

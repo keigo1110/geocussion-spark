@@ -212,6 +212,34 @@ class VisualizationConfig:
 
 
 @dataclass
+class CacheConfig:
+    """キャッシュ拡張設定"""
+    # 基本設定
+    enable_extended_cache: bool = True
+    cache_extension_factor: float = 2.0  # キャッシュ有効期間を2倍に延長
+    
+    # LODメッシュキャッシュ設定
+    lod_cache_validity_time: float = 1.0  # 0.5秒から1.0秒に延長
+    lod_cache_size_limit: int = 20  # キャッシュサイズ制限
+    
+    # 衝突検索キャッシュ設定
+    collision_cache_validity_time: float = 2.0  # 1.0秒から2.0秒に延長
+    collision_cache_size_limit: int = 200  # 100から200に増加
+    
+    # 曲率計算キャッシュ設定
+    curvature_cache_validity_time: float = 2.0  # 1.0秒から2.0秒に延長
+    curvature_cache_size_limit: int = 15  # 10から15に増加
+    
+    # メッシュパイプラインキャッシュ設定
+    pipeline_cache_validity_time: float = 1.5  # 新設定
+    pipeline_cache_size_limit: int = 10  # 新設定
+    
+    # 自動キャッシュ管理設定
+    auto_cache_cleanup_interval: float = 30.0  # 30秒間隔でクリーンアップ
+    cache_memory_threshold_mb: float = 100.0  # 100MB閾値でクリーンアップ
+    enable_cache_statistics: bool = True  # 統計収集を有効化
+
+@dataclass
 class GeocussionConfig:
     """プロジェクト全体設定"""
     audio: AudioConfig = field(default_factory=AudioConfig)
@@ -220,6 +248,7 @@ class GeocussionConfig:
     input: InputConfig = field(default_factory=InputConfig)
     detection: DetectionConfig = field(default_factory=DetectionConfig)
     visualization: VisualizationConfig = field(default_factory=VisualizationConfig)
+    cache: CacheConfig = field(default_factory=CacheConfig)
     
     # ログ設定
     log_level: str = "INFO"
@@ -336,6 +365,13 @@ class ConfigManager:
                     if hasattr(config.collision, key):
                         setattr(config.collision, key, value)
         
+        if 'cache' in config_dict:
+            cache_dict = config_dict['cache']
+            if isinstance(cache_dict, dict):
+                for key, value in cache_dict.items():
+                    if hasattr(config.cache, key):
+                        setattr(config.cache, key, value)
+        
         # 他のセクションも同様に処理...
         # （実装は長くなるため、必要に応じて拡張）
         
@@ -372,6 +408,21 @@ class ConfigManager:
                 'min_detection_confidence': config.detection.min_detection_confidence,
                 'min_tracking_confidence': config.detection.min_tracking_confidence,
                 'max_num_hands': config.detection.max_num_hands,
+            },
+            'cache': {
+                'enable_extended_cache': config.cache.enable_extended_cache,
+                'cache_extension_factor': config.cache.cache_extension_factor,
+                'lod_cache_validity_time': config.cache.lod_cache_validity_time,
+                'lod_cache_size_limit': config.cache.lod_cache_size_limit,
+                'collision_cache_validity_time': config.cache.collision_cache_validity_time,
+                'collision_cache_size_limit': config.cache.collision_cache_size_limit,
+                'curvature_cache_validity_time': config.cache.curvature_cache_validity_time,
+                'curvature_cache_size_limit': config.cache.curvature_cache_size_limit,
+                'pipeline_cache_validity_time': config.cache.pipeline_cache_validity_time,
+                'pipeline_cache_size_limit': config.cache.pipeline_cache_size_limit,
+                'auto_cache_cleanup_interval': config.cache.auto_cache_cleanup_interval,
+                'cache_memory_threshold_mb': config.cache.cache_memory_threshold_mb,
+                'enable_cache_statistics': config.cache.enable_cache_statistics,
             },
             'log_level': config.log_level,
         }
