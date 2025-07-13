@@ -82,9 +82,17 @@ class LODMeshGenerator:
             'total_time_ms': 0.0,
             'lod_time_ms': 0.0,
             'triangulation_time_ms': 0.0,
+            'total_lod_time_ms': 0.0,
+            'total_triangulation_time_ms': 0.0,
             'cache_hits': 0,
             'original_points_total': 0,
-            'filtered_points_total': 0
+            'filtered_points_total': 0,
+            'average_points_reduction_ratio': 0.0,
+            'points_processed_per_level': {
+                'high': 0,
+                'medium': 0,
+                'low': 0
+            }
         }
         
         # メッシュ更新領域（メモリ解放用）
