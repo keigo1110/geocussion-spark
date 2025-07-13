@@ -197,6 +197,14 @@ class GPUDelaunayTriangulator:
             # 品質フィルタリング
             quality_mask = quality_scores > self.quality_threshold
             filtered_triangles = triangles_cpu[cp.asnumpy(quality_mask)]
+
+            # If filtering removes too many triangles, keep original set
+            if len(filtered_triangles) < 0.2 * len(triangles_cpu):
+                logger.debug(
+                    "Quality filter kept only %d / %d triangles; relaxing threshold",
+                    len(filtered_triangles), len(triangles_cpu),
+                )
+                filtered_triangles = triangles_cpu
             
             # 結果をCPUに転送
             final_vertices = vertices_cpu

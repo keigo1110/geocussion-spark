@@ -4,6 +4,7 @@ MediaPipe Hands 2D検出ラッパー
 GPU対応・batch処理・パフォーマンス最適化対応
 ROI トラッキングによるMediaPipe実行スキップ機能
 """
+from __future__ import annotations  # postpone evaluation of type hints
 
 import time
 from typing import List, Optional, Tuple, Dict, Any, NamedTuple
@@ -31,6 +32,28 @@ from .. import get_logger
 from ..data_types import HandednessType, HandLandmark, HandROI, HandDetectionResult, ROITrackingStats
 
 logger = get_logger(__name__)
+
+
+# -----------------------------------------------------------------------------
+# OpenCV compatibility shim
+# Some OpenCV builds (e.g. pip wheels without legacy modules) do not provide the
+# top-level attribute ``cv2.Tracker`` that is referenced in type annotations
+# below.  The absence of this symbol triggers an ``AttributeError`` *during
+# module import* (because type annotations are evaluated eagerly in Python <3.11
+# unless `from __future__ import annotations` is used).  We therefore (1) delay
+# evaluation via the future import above and (2) register a lightweight fallback
+# alias so that dynamic checks like ``hasattr(cv2, 'Tracker')`` succeed later.
+# -----------------------------------------------------------------------------
+if not hasattr(cv2, "Tracker"):
+    # Try to reuse the implementation living in the legacy namespace, or else
+    # create a dummy placeholder to satisfy type-checking / isinstance tests.
+    if hasattr(cv2, "legacy") and hasattr(cv2.legacy, "Tracker"):
+        cv2.Tracker = cv2.legacy.Tracker  # type: ignore
+    else:
+        class _DummyTracker:  # type: ignore
+            """Minimal placeholder when OpenCV is built without the legacy tracker."""
+            pass
+        cv2.Tracker = _DummyTracker  # type: ignore
 
 
 class MediaPipeHandsWrapper:
