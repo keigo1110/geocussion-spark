@@ -33,6 +33,17 @@ MAX_COLLISION_CANDIDATES: Final[int] = 100
 COLLISION_SEARCH_TIME_LIMIT_MS: Final[float] = 10.0
 COLLISION_DETECTION_TIME_LIMIT_MS: Final[float] = 5.0
 
+# 衝突検出改善パラメータ
+COLLISION_ADAPTIVE_VELOCITY_COEFFICIENT = 0.12  # 速度係数（0.05から拡大）
+COLLISION_ADAPTIVE_MAX_RADIUS_EXTENSION = 0.08  # 最大半径拡張（3cmから8cmに）
+COLLISION_INTERPOLATION_MIN_SAMPLES = 3  # 最小補間サンプル数
+COLLISION_INTERPOLATION_MAX_SAMPLES = 8  # 最大補間サンプル数
+COLLISION_HAND_HISTORY_SIZE = 8  # 手位置履歴サイズ（3から8に拡張）
+
+# 高速移動検出閾値
+HIGH_SPEED_VELOCITY_THRESHOLD = 1.5  # m/s - 高速移動判定閾値
+VERY_HIGH_SPEED_VELOCITY_THRESHOLD = 2.5  # m/s - 超高速移動判定閾値
+
 # =============================================================================
 # メッシュ処理関連
 # =============================================================================

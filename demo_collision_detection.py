@@ -161,6 +161,10 @@ from src.mesh.pipeline import create_mesh_pipeline  # unified mesh pipeline
 from src.mesh.manager import PipelineManager  # NEW pipeline manager
 from src.mesh.update_scheduler import MeshUpdateScheduler  # NEW scheduler
 from src.mesh.terrain_change import TerrainChangeDetector  # NEW change detector
+from src.collision.continuous_detection import (  # NEW continuous collision detection
+    ContinuousCollisionDetector,
+    create_continuous_collision_detector
+)
 
 # GPU加速コンポーネントの動的インポート
 HAS_GPU_ACCELERATION = False
@@ -321,7 +325,23 @@ class FullPipelineViewer(DualViewer):
         # 初期化完了フラグ
         self._components_initialized = False
         
+        # 連続衝突検出器を初期化
+        self._initialize_continuous_collision_detector()
+        
         self._display_initialization_info()
+    
+    def _initialize_continuous_collision_detector(self):
+        """連続衝突検出器を初期化"""
+        try:
+            self.continuous_detector = create_continuous_collision_detector(
+                enable_interpolation=True,
+                enable_adaptive_radius=True,
+                base_radius=self.sphere_radius
+            )
+            logger.info("Continuous collision detector initialized")
+        except Exception as e:
+            logger.error(f"Failed to initialize continuous collision detector: {e}")
+            self.continuous_detector = None
     
     def _extract_configuration(self, kwargs):
         """設定値を抽出"""
@@ -382,18 +402,22 @@ class FullPipelineViewer(DualViewer):
         self.collision_tester: Optional[SphereTriangleCollision] = None
         self.event_queue: CollisionEventQueue = CollisionEventQueue()
         
+        # 連続衝突検出器（高速移動対応）
+        self.continuous_detector: Optional[ContinuousCollisionDetector] = None
+        
         # 音響生成コンポーネント
         self.audio_mapper: Optional[AudioMapper] = None
         self.audio_synthesizer: Optional[Any] = None
         self.voice_manager: Optional[VoiceManager] = None
         self.audio_enabled = False
         
-        # 音響クールダウン管理
-        self.audio_cooldown_time = DEFAULT_AUDIO_COOLDOWN_TIME
+        # 音響クールダウン管理（高速タップ対応で短縮）
+        self.audio_cooldown_time = DEFAULT_AUDIO_COOLDOWN_TIME * 0.5  # 50%短縮
         self.last_audio_trigger_time = {}
-        # 衝突デバウンス用: (hand_id, triangle_idx) -> last trigger time
+        # 衝突デバウンス用: (hand_id, triangle_idx) -> last trigger time（短縮）
         from typing import Tuple as _Tuple
         self._last_contact_trigger_time: Dict[_Tuple[str, int, int, int], float] = {}
+        self._debounce_time = 0.15  # 250ms -> 150ms
     
         # 手検出コンポーネント
         self.enable_hand_detection = True
@@ -433,7 +457,13 @@ class FullPipelineViewer(DualViewer):
     
         # Mesh update scheduler & terrain change detector --------------------------------
         # Grace period extended to 2 s to absorb temporary detection dropouts
-        self.mesh_scheduler = MeshUpdateScheduler(base_interval_sec=1.0, grace_period_sec=2.0)
+        # High-speed prioritization: 1.5 m/s threshold, 0.5x interval ratio
+        self.mesh_scheduler = MeshUpdateScheduler(
+            base_interval_sec=1.0, 
+            grace_period_sec=2.0,
+            high_speed_threshold=1.5,  # m/s
+            high_speed_interval_ratio=0.5  # Faster updates for high-speed
+        )
         self.terrain_detector = TerrainChangeDetector()
         self.terrain_deforming: bool = False  # flag to pause audio
     
@@ -596,7 +626,9 @@ class FullPipelineViewer(DualViewer):
                 "V: 衝突可視化 ON/OFF",
                 "N: メッシュ強制更新",
                 "+/-: 球半径調整",
-                "P: パフォーマンス統計表示"
+                "P: パフォーマンス統計表示",
+                "E: 連続衝突検出 ON/OFF",
+                "D: デバウンス時間調整"
             ]),
             ("音響生成制御", [
                 "A: 音響合成 ON/OFF",
@@ -649,6 +681,10 @@ class FullPipelineViewer(DualViewer):
             ord('_'): self._decrease_sphere_radius,
             ord('p'): self._print_performance_stats,
             ord('P'): self._print_performance_stats,
+            ord('e'): self._toggle_continuous_detection,
+            ord('E'): self._toggle_continuous_detection,
+            ord('d'): self._adjust_debounce_time,
+            ord('D'): self._adjust_debounce_time,
             
             # 音響生成
             ord('a'): self._toggle_audio_synthesis,
@@ -860,14 +896,22 @@ class FullPipelineViewer(DualViewer):
                        f"Y[{mesh_min[1]:.3f}, {mesh_max[1]:.3f}], Z[{mesh_min[2]:.3f}, {mesh_max[2]:.3f}]")
     
     def _detect_collisions(self, tracked_hands: List[TrackedHand]) -> List[Any]:
-        """衝突検出を実行"""
+        """衝突検出を実行（連続衝突検出対応版）"""
         if not self.collision_searcher:
             logger.debug("No collision searcher available")
             return []
         
         events = []
         self.current_collision_points = []
+        current_time = time.perf_counter()
         logger.debug(f"Processing {len(tracked_hands)} hands")
+        
+        # アクティブな手IDリストを生成（履歴クリーンアップ用）
+        active_hand_ids = [hand.id for hand in tracked_hands if hand.position is not None]
+        
+        # 連続衝突検出器の履歴をクリーンアップ
+        if self.continuous_detector:
+            self.continuous_detector.cleanup_old_tracks(active_hand_ids)
         
         # GPU加速距離計算の準備
         use_gpu_distance = (
@@ -881,52 +925,70 @@ class FullPipelineViewer(DualViewer):
                 logger.debug(f"Hand {i} has no position")
                 continue
             
-            # Prepare list of positions to test: current + historical (predictive)
-            pos_history = self._hand_position_history.get(hand.id, [])
-            positions_to_test: List[np.ndarray] = [np.array(hand.position)] + [np.array(p) for p in pos_history]
-
-            # Remove duplicates while preserving order
-            seen = set()
-            unique_positions = []
-            for p in positions_to_test:
-                tup = tuple(np.round(p, 4))
-                if tup not in seen:
-                    seen.add(tup)
-                    unique_positions.append(p)
-
-            hand_pos_np = unique_positions[0]
-            
-            logger.debug(f"Hand {i} position: ({hand_pos_np[0]:.3f}, {hand_pos_np[1]:.3f}, {hand_pos_np[2]:.3f})")
+            logger.debug(f"Hand {i} position: ({hand.position[0]:.3f}, {hand.position[1]:.3f}, {hand.position[2]:.3f})")
             
             try:
-                for ptest in unique_positions:
-                    # Adaptive radius: enlarge slightly based on velocity magnitude
-                    vel_mag = float(np.linalg.norm(getattr(hand, "velocity", np.zeros(3)))) if hasattr(hand, "velocity") else 0.0
-                    adaptive_radius = self.sphere_radius + min(0.03, vel_mag * 0.05)
-
-                    # Direct sphere query for the specific test point
-                    res = self.collision_searcher._search_point(ptest, adaptive_radius)
-
-                    if not res.triangle_indices:
-                        continue
-
-                    info = self._perform_collision_test(
-                        ptest, adaptive_radius, res, use_gpu_distance, i
+                # 連続衝突検出を優先して試行
+                collision_info = None
+                if self.continuous_detector and self.collision_tester:
+                    collision_info = self.continuous_detector.detect_continuous_collision(
+                        hand, self.collision_searcher, self.collision_tester, current_time
                     )
-
-                    if info and info.has_collision:
-                        event = self._create_collision_event(hand, ptest, info)
-                        if event:
-                            events.append(event)
-                            self._update_collision_points(info)
-                        # Found collision, break predictive loop
-                        break
+                
+                # 連続衝突検出で見つからない場合は従来方式でフォールバック
+                if not collision_info or not collision_info.has_collision:
+                    collision_info = self._detect_collision_legacy(hand, use_gpu_distance, i)
+                
+                # 衝突が検出された場合
+                if collision_info and collision_info.has_collision:
+                    event = self._create_collision_event(hand, np.array(hand.position), collision_info)
+                    if event:
+                        events.append(event)
+                        self._update_collision_points(collision_info)
 
             except Exception as e:
                 logger.error(f"Error processing hand {i}: {e}")
         
         logger.debug(f"Total collision events: {len(events)}")
         return events
+    
+    def _detect_collision_legacy(self, hand: TrackedHand, use_gpu_distance: bool, hand_index: int) -> Optional[Any]:
+        """従来方式の衝突検出（フォールバック用）"""
+        # Prepare list of positions to test: current + historical (predictive)
+        pos_history = self._hand_position_history.get(hand.id, [])
+        positions_to_test: List[np.ndarray] = [np.array(hand.position)] + [np.array(p) for p in pos_history]
+
+        # Remove duplicates while preserving order
+        seen = set()
+        unique_positions = []
+        for p in positions_to_test:
+            tup = tuple(np.round(p, 4))
+            if tup not in seen:
+                seen.add(tup)
+                unique_positions.append(p)
+
+        for ptest in unique_positions:
+            # Enhanced adaptive radius using new constants
+            vel_mag = float(np.linalg.norm(getattr(hand, "velocity", np.zeros(3)))) if hasattr(hand, "velocity") else 0.0
+            from src.constants import COLLISION_ADAPTIVE_VELOCITY_COEFFICIENT, COLLISION_ADAPTIVE_MAX_RADIUS_EXTENSION
+            adaptive_radius = self.sphere_radius + min(COLLISION_ADAPTIVE_MAX_RADIUS_EXTENSION, vel_mag * COLLISION_ADAPTIVE_VELOCITY_COEFFICIENT)
+
+            # Direct sphere query for the specific test point
+            if self.collision_searcher is None:
+                continue
+            res = self.collision_searcher._search_point(ptest, adaptive_radius)
+
+            if not res.triangle_indices:
+                continue
+
+            info = self._perform_collision_test(
+                ptest, adaptive_radius, res, use_gpu_distance, hand_index
+            )
+
+            if info and info.has_collision:
+                return info
+        
+        return None
     
     def _perform_collision_test(self, hand_pos: np.ndarray, radius: float, 
                                search_result: Any, use_gpu: bool, hand_index: int) -> Any:
@@ -1236,6 +1298,27 @@ class FullPipelineViewer(DualViewer):
         """メッシュ強制更新をリクエスト"""
         self.force_mesh_update_requested = True
     
+    def _toggle_continuous_detection(self) -> bool:
+        """連続衝突検出のON/OFF切り替え"""
+        if self.continuous_detector:
+            # 現在の設定を反転
+            self.continuous_detector.config.enable_interpolation_sampling = not self.continuous_detector.config.enable_interpolation_sampling
+            self.continuous_detector.config.enable_adaptive_radius = not self.continuous_detector.config.enable_adaptive_radius
+            status = "有効" if self.continuous_detector.config.enable_interpolation_sampling else "無効"
+            print(f"連続衝突検出: {status}")
+        else:
+            print("連続衝突検出器が初期化されていません")
+        return True
+    
+    def _adjust_debounce_time(self) -> bool:
+        """デバウンス時間を調整"""
+        if self._debounce_time <= 0.05:
+            self._debounce_time = 0.3  # 5ms -> 300ms にリセット
+        else:
+            self._debounce_time *= 0.7  # 30%減少
+        print(f"デバウンス時間: {self._debounce_time*1000:.0f}ms")
+        return True
+    
     def _print_performance_stats(self) -> bool:
         """パフォーマンス統計を印刷"""
         print("\n" + "="*50)
@@ -1286,6 +1369,15 @@ class FullPipelineViewer(DualViewer):
         if self.current_mesh:
             print(f"現在のメッシュ: {self.current_mesh.num_triangles}三角形")
         print(f"球半径: {self.sphere_radius*100:.1f}cm")
+        
+        # 連続衝突検出統計
+        if self.continuous_detector:
+            continuous_stats = self.continuous_detector.get_performance_stats()
+            print(f"連続衝突検出統計:")
+            print(f"  - 補間サンプル生成: {continuous_stats['interpolation_samples_generated']}")
+            print(f"  - 適応的半径適用: {continuous_stats['adaptive_radius_applied']}")
+            print(f"  - 高速移動検出: {continuous_stats['high_speed_detections']}")
+            print(f"  - 処理時間: {continuous_stats['continuous_collision_time_ms']:.1f}ms")
     
     def _print_audio_stats(self) -> None:
         """音響統計を印刷"""
@@ -1390,7 +1482,7 @@ class FullPipelineViewer(DualViewer):
         # Decide if we need to force mesh update via scheduler
         # --------------------------------------------------------------
         any_hands_present = prelim_hands_present or self.terrain_deforming
-        force_update = self.mesh_scheduler.should_update(any_hands_present)
+        force_update = self.mesh_scheduler.should_update(any_hands_present, tracked_hands)
         
         collision_events = self._process_collision_pipeline(
             points_3d, tracked_hands, force_update=force_update
@@ -1971,13 +2063,19 @@ class FullPipelineViewer(DualViewer):
         return True
     
     def _check_contact_debounce(self, event: Any) -> bool:
-        """手ID + 接触位置グリッド (≈2 cm) で 250 ms デバウンス"""
+        """手ID + 接触位置グリッド (≈2 cm) で動的デバウンス"""
         gx = int(round(event.contact_position[0] * 50))  # 1/50 m = 2 cm
         gy = int(round(event.contact_position[1] * 50))
         gz = int(round(event.contact_position[2] * 50))
         key = (event.hand_id, gx, gy, gz)
         last_t = self._last_contact_trigger_time.get(key, 0.0)
-        if (time.perf_counter() - last_t) < 0.25:  # 250 ms
+        
+        # 動的デバウンス時間: 手の速度に応じて調整
+        debounce_time = self._debounce_time
+        if hasattr(event, 'velocity') and event.velocity > 1.5:  # 高速時
+            debounce_time *= 0.6  # さらに短縮
+        
+        if (time.perf_counter() - last_t) < debounce_time:
             return False
         return True
     
