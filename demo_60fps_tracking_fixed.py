@@ -156,7 +156,7 @@ from src.collision.sphere_tri import SphereTriangleCollision
 from src.collision.events import CollisionEventQueue
 from src.sound.mapping import AudioMapper
 from src.detection.hands2d import MediaPipeHandsWrapper
-from src.input.stream import OrbbecCamera
+from src.utils.camera_factory import create_camera, add_camera_arguments
 from src.detection.hands3d import Hand3DProjector
 from src.detection.tracker import Hand3DTracker
 
@@ -2367,7 +2367,7 @@ class FullPipelineViewer(DualViewer):
         # Manual normalization to avoid cv2 stub type issues
         assert depth_image is not None
         d_min = float(depth_image.min())
-        d_ptp = float(depth_image.ptp()) if depth_image.ptp() > 0 else 1.0
+        d_ptp = float(np.ptp(depth_image)) if np.ptp(depth_image) > 0 else 1.0
         depth_normalized = ((depth_image.astype(np.float32) - d_min) / d_ptp * 255.0).astype(np.uint8)
         return cv2.applyColorMap(depth_normalized, cv2.COLORMAP_JET)
     
@@ -2730,11 +2730,11 @@ def main():
         if depth_width and depth_height:
             print(f"   深度解像度: {depth_width}x{depth_height} に設定")
         
-        viewer.camera = OrbbecCamera(
-            enable_color=True,
-            depth_width=depth_width,
-            depth_height=depth_height
-        )
+        # カメラファクトリーを使用してカメラを作成
+        args.no_color = False
+        args.depth_w = depth_width
+        args.depth_h = depth_height
+        viewer.camera = create_camera(args)
         
         # DualViewer の初期化は viewer.run() 内部で行われるため、ここでは呼び出さない
         viewer.run()
@@ -2769,6 +2769,7 @@ def create_argument_parser() -> argparse.ArgumentParser:
     add_resolution_arguments(parser)
     add_window_arguments(parser)
     add_mode_arguments(parser)
+    add_camera_arguments(parser)
     
     return parser
 
