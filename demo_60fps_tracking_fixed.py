@@ -102,14 +102,7 @@ try:
 except ImportError:
     logger.warning("Open3D is not available. 3D visualization will be disabled.")
 
-# 音響ライブラリの動的インポート
-HAS_AUDIO = False
-try:
-    import pyo
-    HAS_AUDIO = True
-    logger.info("Pyo audio engine is available")
-except ImportError:
-    logger.warning("Pyo audio engine is not available. Audio synthesis will be disabled.")
+# 音響ライブラリの動的インポート (pygame handled in src.sound.simple_synth)
 
 # Numba JIT最適化の初期化
 def initialize_numba_optimization():
@@ -1535,6 +1528,14 @@ class FullPipelineViewer(DualViewer):
             except Exception as e:
                 logger.error(f"3D component initialization error: {e}")
     
+    # ------------------------------------------------------------------
+    # Helper: default intrinsics fallback
+    # ------------------------------------------------------------------
+    def _get_default_camera_intrinsics(self):
+        """Return a fallback CameraIntrinsics when camera intrinsics are unavailable."""
+        from src.input.pointcloud import _create_default_intrinsics  # local import to avoid circular deps
+        return _create_default_intrinsics(LOW_RESOLUTION[0], LOW_RESOLUTION[1])
+
     def _initialize_60fps_tracking_system(self) -> None:
         """60fps手追跡システムの初期化"""
         try:
@@ -1569,9 +1570,10 @@ class FullPipelineViewer(DualViewer):
             )
             
             # 統合コントローラー作成
+            # camera_intrinsicsはNoneを渡さず、必ずCameraIntrinsics型を渡す
             self.integrated_controller = IntegratedHandTrackingController(
                 config=config,
-                camera_intrinsics=self.camera.depth_intrinsics,
+                camera_intrinsics=self.camera.depth_intrinsics if self.camera and self.camera.depth_intrinsics is not None else self._get_default_camera_intrinsics(),
                 hands_2d=self.hands_2d,
                 hands_3d=self.projector_3d,
                 collision_searcher=self.collision_searcher,
@@ -1856,6 +1858,8 @@ class FullPipelineViewer(DualViewer):
         if color_image is None:
             return [], [], []
         
+        if self.integrated_controller is None:
+            raise RuntimeError("integrated_controller is None in _perform_60fps_hand_detection")
         try:
             # 60fps統合コントローラーでフレーム処理
             events = self.integrated_controller.process_frame(
@@ -1865,7 +1869,13 @@ class FullPipelineViewer(DualViewer):
             )
             
             # 現在の手情報取得
-            tracked_hands = self.integrated_controller.get_current_hands()
+            tracked_hands = []
+            if self.integrated_controller is not None and hasattr(self.integrated_controller, "get_current_hands"):
+                try:
+                    tracked_hands = self.integrated_controller.get_current_hands()
+                except Exception as e:
+                    logger.error(f"Error getting current hands: {e}")
+                    tracked_hands = []
             
             # 型チェック
             if not isinstance(events, list):
@@ -1884,12 +1894,17 @@ class FullPipelineViewer(DualViewer):
                     hands_3d.append(hand)  # 簡易実装
             
             # 統計情報の更新
-            if hasattr(self.integrated_controller, 'get_performance_stats'):
+            if (
+                self.integrated_controller is not None
+                and hasattr(self.integrated_controller, 'get_performance_stats')
+            ):
                 controller_stats = self.integrated_controller.get_performance_stats()
                 # 統計情報をメインの統計に反映
-                if 'hand_detection_time_ms' in controller_stats:
+                if (
+                    controller_stats is not None
+                    and 'hand_detection_time_ms' in controller_stats
+                ):
                     self.performance_stats['hand_detection_time'] = controller_stats['hand_detection_time_ms']
-            
             # ログ出力
             if self.frame_count % 10 == 0 and tracked_hands:
                 logger.info(f"[60FPS-DETECT] Frame {self.frame_count}: "

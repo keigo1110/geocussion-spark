@@ -101,14 +101,7 @@ try:
 except ImportError:
     logger.warning("Open3D is not available. 3D visualization will be disabled.")
 
-# 音響ライブラリの動的インポート
-HAS_AUDIO = False
-try:
-    import pyo
-    HAS_AUDIO = True
-    logger.info("Pyo audio engine is available")
-except ImportError:
-    logger.warning("Pyo audio engine is not available. Audio synthesis will be disabled.")
+# 音響ライブラリの動的インポート (pygame handled in src.sound.simple_synth)
 
 # Numba JIT最適化の初期化
 def initialize_numba_optimization():
