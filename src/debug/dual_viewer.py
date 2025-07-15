@@ -22,6 +22,13 @@ from src.input.pointcloud import PointCloudConverter
 from src.input.depth_filter import DepthFilter, FilterType
 from src.data_types import OBFormat
 
+# カメラファクトリーをインポート
+try:
+    from src.utils.camera_factory import create_camera
+    HAS_CAMERA_FACTORY = True
+except ImportError:
+    HAS_CAMERA_FACTORY = False
+
 # 手検出フェーズ
 from src.detection.hands2d import MediaPipeHandsWrapper, HandednessType, filter_hands_by_confidence
 from src.detection.hands3d import Hand3DProjector, DepthInterpolationMethod
@@ -134,6 +141,10 @@ class DualViewer:
         disp_h, disp_w = self.rgb_window_size[1], self.rgb_window_size[0] * 2
         self._combined_buffer = np.zeros((disp_h, disp_w, 3), dtype=np.uint8)
         
+    def set_camera(self, camera):
+        """外部からカメラを設定（OAK-D対応）"""
+        self.camera = camera
+    
     def initialize(self) -> bool:
         """
         ビューワーを初期化
@@ -144,7 +155,7 @@ class DualViewer:
         try:
             # 既に外部からカメラが注入されている場合は再利用する
             if self.camera is None:
-                # カメラをまだ持っていない場合のみ新規生成
+                # カメラをまだ持っていない場合のみ新規生成（OrbbecCameraをデフォルトとして使用）
                 self.camera = OrbbecCamera(enable_color=True)
 
             # カメラが未初期化・未スタートならここで起動する
@@ -745,34 +756,40 @@ class DualViewer:
             描画済み画像
         """
         # ------------------------------
-        # カラーフレームをNumPy BGR画像へ変換
+        # カラーフレームをNumPy BGR画像へ変換（OAK-D / Orbbec対応）
         # ------------------------------
         try:
-            color_data = np.frombuffer(frame_data.color_frame.get_data(), dtype=np.uint8)
-            color_format = frame_data.color_frame.get_format()
+            # OAK-D の OakFrameWrapper かどうかを判定
+            if hasattr(frame_data.color_frame, 'frame_data') and isinstance(frame_data.color_frame.frame_data, np.ndarray):
+                # OAK-D の場合: frame_data は既に BGR の NumPy 配列
+                bgr_image = frame_data.color_frame.frame_data.copy()
+            else:
+                # Orbbec SDK の場合: 従来の処理
+                color_data = np.frombuffer(frame_data.color_frame.get_data(), dtype=np.uint8)
+                color_format = frame_data.color_frame.get_format()
 
-            bgr_image: Optional[np.ndarray] = None
+                bgr_image: Optional[np.ndarray] = None
 
-            try:
-                from pyorbbecsdk import OBFormat as _OBF
-            except ImportError:
-                from src.data_types import OBFormat as _OBF  # type: ignore
+                try:
+                    from pyorbbecsdk import OBFormat as _OBF
+                except ImportError:
+                    from src.data_types import OBFormat as _OBF  # type: ignore
 
-            if color_format == _OBF.RGB:  # type: ignore[attr-defined]
-                rgb_image = color_data.reshape((self.camera.depth_intrinsics.height, self.camera.depth_intrinsics.width, 3))
-                bgr_image = cv2.cvtColor(rgb_image, cv2.COLOR_RGB2BGR)
-            elif color_format == _OBF.BGR:  # type: ignore[attr-defined]
-                bgr_image = color_data.reshape((self.camera.depth_intrinsics.height, self.camera.depth_intrinsics.width, 3))
-            elif color_format == _OBF.MJPG:  # type: ignore[attr-defined]
-                decoded = cv2.imdecode(color_data, cv2.IMREAD_COLOR)
-                if decoded is not None:
-                    bgr_image = decoded
+                if color_format == _OBF.RGB:  # type: ignore[attr-defined]
+                    rgb_image = color_data.reshape((self.camera.depth_intrinsics.height, self.camera.depth_intrinsics.width, 3))
+                    bgr_image = cv2.cvtColor(rgb_image, cv2.COLOR_RGB2BGR)
+                elif color_format == _OBF.BGR:  # type: ignore[attr-defined]
+                    bgr_image = color_data.reshape((self.camera.depth_intrinsics.height, self.camera.depth_intrinsics.width, 3))
+                elif color_format == _OBF.MJPG:  # type: ignore[attr-defined]
+                    decoded = cv2.imdecode(color_data, cv2.IMREAD_COLOR)
+                    if decoded is not None:
+                        bgr_image = decoded
 
-            if bgr_image is None:
-                # Fallback: create black image
-                h = self.camera.depth_intrinsics.height if self.camera.depth_intrinsics else 480
-                w = self.camera.depth_intrinsics.width if self.camera.depth_intrinsics else 640
-                bgr_image = np.zeros((h, w, 3), dtype=np.uint8)
+                if bgr_image is None:
+                    # Fallback: create black image
+                    h = self.camera.depth_intrinsics.height if self.camera.depth_intrinsics else 480
+                    w = self.camera.depth_intrinsics.width if self.camera.depth_intrinsics else 640
+                    bgr_image = np.zeros((h, w, 3), dtype=np.uint8)
 
             height, width = bgr_image.shape[:2]
 
@@ -921,9 +938,25 @@ class DualViewer:
     # ------------------------------------------------------------------
 
     def _decode_color_frame_resized(self, color_frame) -> np.ndarray:
-        """カラーFrame (Orbbec SDK) → BGR, リサイズ済み"""
+        """カラーFrame (Orbbec SDK / OAK-D) → BGR, リサイズ済み"""
         try:
             import numpy as _np
+            
+            # OAK-D の OakFrameWrapper かどうかを判定
+            if hasattr(color_frame, 'frame_data') and isinstance(color_frame.frame_data, _np.ndarray):
+                # OAK-D の場合: frame_data は既に BGR の NumPy 配列
+                bgr_img = color_frame.frame_data
+                if len(bgr_img.shape) == 3 and bgr_img.shape[2] == 3:
+                    # 既に適切なサイズの場合はそのまま返す、そうでなければリサイズ
+                    if bgr_img.shape[:2] == (self.rgb_window_size[1], self.rgb_window_size[0]):
+                        return bgr_img
+                    else:
+                        return cv2.resize(bgr_img, self.rgb_window_size)
+                else:
+                    # フォーマットが期待と異なる場合は黒画像を返す
+                    return _np.zeros((self.rgb_window_size[1], self.rgb_window_size[0], 3), dtype=_np.uint8)
+            
+            # Orbbec SDK の場合: 既存の処理を維持
             color_data = _np.frombuffer(color_frame.get_data(), dtype=_np.uint8)
 
             try:
@@ -945,8 +978,9 @@ class DualViewer:
                 bgr_img = decoded if decoded is not None else _np.zeros((h_src, w_src, 3), dtype=_np.uint8)
 
             return cv2.resize(bgr_img, self.rgb_window_size)
-        except Exception:
+        except Exception as e:
             # decoding error – return black image
+            print(f"Color frame decoding error: {e}")
             return np.zeros((self.rgb_window_size[1], self.rgb_window_size[0], 3), dtype=np.uint8)
 
 

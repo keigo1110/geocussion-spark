@@ -1616,7 +1616,7 @@ class FullPipelineViewer(DualViewer):
             logger.debug(f"60fps audio triggered: hand_id={event.hand_id}")
     
     def _extract_depth_image(self, frame_data: Any) -> Optional[np.ndarray]:
-        """フレームデータから深度画像を抽出"""
+        """フレームデータから深度画像を抽出（OAK-D/Orbbec対応）"""
         try:
             if self.camera is None or self.camera.depth_intrinsics is None:
                 # --------------------------------------------------------------
@@ -1626,21 +1626,28 @@ class FullPipelineViewer(DualViewer):
                 width = None
                 height = None
 
-                # Newer pyorbbecsdk versions expose width/height attributes
-                if hasattr(df, "width") and hasattr(df, "height"):
-                    width = int(df.width)
-                    height = int(df.height)
-                # Older versions expose getter functions
-                elif hasattr(df, "get_width") and hasattr(df, "get_height"):
-                    try:
-                        width = int(df.get_width())
-                        height = int(df.get_height())
-                    except Exception:  # pragma: no cover – defensive
-                        width, height = None, None
+                # OAK-DのOakFrameWrapperかどうかを判定
+                if hasattr(df, 'frame_data') and isinstance(df.frame_data, np.ndarray):
+                    # OAK-Dの場合: frame_dataから直接サイズを取得
+                    height, width = df.frame_data.shape[:2]
+                    logger.debug(f"[OAK-D-DEPTH] Using OAK-D depth dimensions: {width}x{height}")
+                else:
+                    # Orbbecカメラの場合: 従来の処理
+                    # Newer pyorbbecsdk versions expose width/height attributes
+                    if hasattr(df, "width") and hasattr(df, "height"):
+                        width = int(df.width)
+                        height = int(df.height)
+                    # Older versions expose getter functions
+                    elif hasattr(df, "get_width") and hasattr(df, "get_height"):
+                        try:
+                            width = int(df.get_width())
+                            height = int(df.get_height())
+                        except Exception:  # pragma: no cover – defensive
+                            width, height = None, None
 
-                if width is None or height is None:
-                    logger.warning("DepthFrame size unavailable – defaulting to 424x240")
-                    width, height = 424, 240
+                    if width is None or height is None:
+                        logger.warning("DepthFrame size unavailable – defaulting to 424x240")
+                        width, height = 424, 240
 
                 from src.input.pointcloud import _create_default_intrinsics  # local import
                 logger.warning("depth_intrinsics is None – using fallback intrinsics (%dx%d)", width, height)
@@ -1653,14 +1660,36 @@ class FullPipelineViewer(DualViewer):
             else:
                 intr = self.camera.depth_intrinsics
 
-            depth_data = np.frombuffer(frame_data.depth_frame.get_data(), dtype=np.uint16)
-            return depth_data.reshape((intr.height, intr.width))
+            # OAK-DのOakFrameWrapperかどうかを判定
+            if hasattr(frame_data.depth_frame, 'frame_data') and isinstance(frame_data.depth_frame.frame_data, np.ndarray):
+                # OAK-Dの場合: frame_dataは既に適切な形状のNumPy配列
+                depth_image = frame_data.depth_frame.frame_data
+                logger.debug(f"[OAK-D-DEPTH] Extracted depth frame: shape={depth_image.shape}, dtype={depth_image.dtype}")
+                
+                # 必要に応じてリサイズ（すでにOakFrameWrapperでリサイズされているはず）
+                if len(depth_image.shape) == 2 and depth_image.shape == (intr.height, intr.width):
+                    return depth_image
+                elif len(depth_image.shape) == 2:
+                    # サイズが違う場合はリサイズ
+                    import cv2
+                    resized = cv2.resize(depth_image, (intr.width, intr.height), interpolation=cv2.INTER_NEAREST)
+                    logger.debug(f"[OAK-D-DEPTH] Resized depth: {depth_image.shape} -> {resized.shape}")
+                    return resized
+                else:
+                    logger.error(f"[OAK-D-DEPTH] Invalid depth frame shape: {depth_image.shape}")
+                    return None
+            else:
+                # Orbbecカメラの場合: 従来の処理
+                depth_data = np.frombuffer(frame_data.depth_frame.get_data(), dtype=np.uint16)
+                depth_image = depth_data.reshape((intr.height, intr.width))
+                logger.debug(f"[ORBBEC-DEPTH] Extracted depth frame: shape={depth_image.shape}, dtype={depth_image.dtype}")
+                return depth_image
         except Exception as e:
             logger.error(f"Failed to extract depth image: {e}")
             return None
     
     def _extract_color_image(self, frame_data: Any) -> Optional[np.ndarray]:
-        """フレームデータからカラー画像を抽出"""
+        """フレームデータからカラー画像を抽出（OAK-D/Orbbec対応）"""
         try:
             if (
                 frame_data.color_frame is None
@@ -1669,11 +1698,24 @@ class FullPipelineViewer(DualViewer):
             ):
                 return None
             
-            color_data = np.frombuffer(frame_data.color_frame.get_data(), dtype=np.uint8)
-            color_format = frame_data.color_frame.get_format()
-            
-            # フォーマット変換
-            return self._convert_color_format(color_data, color_format)
+            # OAK-DのOakFrameWrapperかどうかを判定
+            if hasattr(frame_data.color_frame, 'frame_data') and isinstance(frame_data.color_frame.frame_data, np.ndarray):
+                # OAK-Dの場合: frame_dataは既にBGRのNumPy配列
+                color_image = frame_data.color_frame.frame_data
+                if len(color_image.shape) == 3 and color_image.shape[2] == 3:
+                    logger.debug(f"[OAK-D-COLOR] Extracted color frame: shape={color_image.shape}, dtype={color_image.dtype}")
+                    return color_image
+                else:
+                    logger.warning(f"[OAK-D-COLOR] Invalid color frame shape: {color_image.shape}")
+                    return None
+            else:
+                # Orbbecカメラの場合: 従来の処理
+                color_data = np.frombuffer(frame_data.color_frame.get_data(), dtype=np.uint8)
+                color_format = frame_data.color_frame.get_format()
+                logger.debug(f"[ORBBEC-COLOR] Extracted color data: size={len(color_data)}, format={color_format}")
+                
+                # フォーマット変換
+                return self._convert_color_format(color_data, color_format)
         except Exception as e:
             logger.error(f"Failed to extract color image: {e}")
             return None

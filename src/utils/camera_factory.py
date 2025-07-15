@@ -1,79 +1,60 @@
 #!/usr/bin/env python3
 """
-カメラファクトリーモジュール
-OrbbecCameraとOAK-D S2を統一的に作成
+カメラファクトリー - Orbbec と OAK-D カメラの統一インターフェース
 """
 
 import argparse
-from typing import Optional, Union
+from typing import Any
+
 from src import get_logger
 
 logger = get_logger(__name__)
 
 
-def create_camera(args: argparse.Namespace) -> Union['OrbbecCamera', 'OakCamera']:
+def create_camera(args: argparse.Namespace) -> Any:
     """
     引数に基づいてカメラインスタンスを作成
     
     Args:
-        args: コマンドライン引数（--oakフラグを含む）
+        args: コマンドライン引数
         
     Returns:
-        カメラインスタンス（OrbbecCameraまたはOakCamera）
-        
-    Raises:
-        ImportError: 指定されたカメラタイプが利用できない場合
-        RuntimeError: カメラの初期化に失敗した場合
+        OrbbecCamera または OakCamera インスタンス
     """
-    if args.oak:
-        # OAK-D S2を使用
-        try:
-            from src.input_oak.stream import OakCamera as Cam
-            logger.info("OAK-D S2カメラを使用します")
-            
-            camera = Cam(
-                enable_color=not args.no_color,
-                downsample_factor=getattr(args, 'oak_downsample', 3)
-            )
-            
-            return camera
-            
-        except ImportError as e:
-            logger.error(f"OAK-D S2が利用できません: {e}")
-            raise ImportError(
-                "OAK-D S2を使用するには、'source oakenv/bin/activate' で "
-                "OAK-D S2用仮想環境をアクティベートし、depthai>=2.24がインストールされている必要があります"
-            ) from e
-            
+    # OAK-D を使用する場合
+    if hasattr(args, 'oak') and args.oak:
+        logger.info("OAK-D カメラを使用します")
+        from src.input_oak.stream import OakCamera
+        
+        return OakCamera(
+            enable_color=not getattr(args, 'no_color', False)
+        )
+    
+    # デフォルトは Orbbec カメラ
     else:
-        # Orbbecを使用（デフォルト）
-        try:
-            from src.input.stream import OrbbecCamera as Cam
-            logger.info("Orbbecカメラを使用します")
-            
-            camera = Cam(
-                enable_color=not args.no_color,
-                depth_width=args.depth_w, 
-                depth_height=args.depth_h
-            )
-            
-            return camera
-            
-        except ImportError as e:
-            logger.error(f"Orbbecカメラが利用できません: {e}")
-            raise ImportError(
-                "Orbbecカメラを使用するには、OrbbecSDKがインストールされている必要があります"
-            ) from e
+        logger.info("Orbbec カメラを使用します")
+        from src.input.stream import OrbbecCamera
+        
+        return OrbbecCamera(
+            enable_color=not getattr(args, 'no_color', False),
+            depth_width=getattr(args, 'depth_w', None),
+            depth_height=getattr(args, 'depth_h', None)
+        )
 
 
-def add_camera_arguments(parser):
-    """カメラ選択用の引数を追加"""
-    camera_group = parser.add_argument_group('カメラ選択')
+def add_camera_arguments(parser: argparse.ArgumentParser) -> None:
+    """
+    カメラ関連の引数をparserに追加
+    
+    Args:
+        parser: ArgumentParser インスタンス
+    """
+    camera_group = parser.add_argument_group('camera', 'カメラ設定')
     
     camera_group.add_argument(
         '--oak',
         action='store_true',
-        help='OAK-D S2カメラを使用（デフォルト: Orbbec）'
+        help='OAK-D カメラを使用する（デフォルト: Orbbec）'
     )
     
     camera_group.add_argument(
@@ -85,22 +66,13 @@ def add_camera_arguments(parser):
     camera_group.add_argument(
         '--depth-w',
         type=int,
-        default=424,
-        help='深度ストリーム幅 (Orbbecのみ)'
+        help='深度ストリーム幅（Orbbecのみ）'
     )
     
     camera_group.add_argument(
-        '--depth-h',
+        '--depth-h', 
         type=int,
-        default=240,
-        help='深度ストリーム高さ (Orbbecのみ)'
-    )
-
-    camera_group.add_argument(
-        '--oak-downsample',
-        type=int,
-        default=3,
-        help='OAK-D S2のパフォーマンス向上のためのダウンサンプリング係数'
+        help='深度ストリーム高さ（Orbbecのみ）'
     )
 
 
