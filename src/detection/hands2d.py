@@ -30,6 +30,7 @@ except ImportError:
 
 from .. import get_logger
 from ..data_types import HandednessType, HandLandmark, HandROI, HandDetectionResult, ROITrackingStats
+from .hand_deduplication import HandDeduplicationFilter, create_hand_deduplication_filter
 
 logger = get_logger(__name__)
 
@@ -72,7 +73,10 @@ class MediaPipeHandsWrapper:
         skip_interval: int = 4,              # N フレームに1回 MediaPipe実行
         roi_confidence_threshold: float = 0.6,
         max_tracking_age: int = 15,
-        roi_expansion_factor: float = 1.2
+        roi_expansion_factor: float = 1.2,
+        # 重複排除設定
+        enable_deduplication: bool = True,
+        deduplication_distance: float = 0.15  # 15cm以内は同じ手と判定
     ):
         """
         初期化
@@ -103,6 +107,14 @@ class MediaPipeHandsWrapper:
         self.roi_confidence_threshold = roi_confidence_threshold
         self.max_tracking_age = max_tracking_age
         self.roi_expansion_factor = roi_expansion_factor
+        
+        # 重複排除設定
+        self.enable_deduplication = enable_deduplication
+        self.deduplication_filter = None
+        if enable_deduplication:
+            self.deduplication_filter = create_hand_deduplication_filter(
+                distance_threshold=deduplication_distance
+            )
         
         self.hands = None
         self.mp_hands = None
@@ -209,7 +221,16 @@ class MediaPipeHandsWrapper:
             return self._update_roi_tracking(image)
         
         # MediaPipe を実行
-        return self._run_mediapipe_detection(image)
+        raw_results = self._run_mediapipe_detection(image)
+        
+        # 重複排除フィルタを適用
+        if self.enable_deduplication and self.deduplication_filter and len(raw_results) > 1:
+            filtered_results = self.deduplication_filter.filter_duplicate_hands(raw_results)
+            if len(filtered_results) < len(raw_results):
+                logger.debug(f"Hand deduplication: {len(raw_results)} -> {len(filtered_results)} hands")
+            return filtered_results
+        
+        return raw_results
     
     def _should_run_mediapipe(self) -> bool:
         """MediaPipe手検出を実行すべきかを判定"""
@@ -537,9 +558,13 @@ class MediaPipeHandsWrapper:
             # 信頼度
             confidence = handedness.classification[0].score
             
-            # ID生成
+            # ID生成（重複しにくい形式に改善）
             if not hand_id:
-                hand_id = f"{hand_type.value.lower()}_{int(time.time() * 1000) % 10000}"
+                # 左右と座標を組み合わせたより一意性の高いID生成
+                center_x = (bbox_x + bbox_w // 2) // 10  # 10ピクセル単位で離散化
+                center_y = (bbox_y + bbox_h // 2) // 10
+                timestamp_ms = int(time.time() * 1000) % 100000  # 5桁の時刻
+                hand_id = f"{hand_type.value.lower()}_{center_x}_{center_y}_{timestamp_ms}"
             
             return HandDetectionResult(
                 id=hand_id,
