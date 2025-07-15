@@ -102,14 +102,7 @@ try:
 except ImportError:
     logger.warning("Open3D is not available. 3D visualization will be disabled.")
 
-# 音響ライブラリの動的インポート
-HAS_AUDIO = False
-try:
-    import pyo
-    HAS_AUDIO = True
-    logger.info("Pyo audio engine is available")
-except ImportError:
-    logger.warning("Pyo audio engine is not available. Audio synthesis will be disabled.")
+# 音響ライブラリの動的インポート (pygame handled in src.sound.simple_synth)
 
 # Numba JIT最適化の初期化
 def initialize_numba_optimization():
@@ -156,7 +149,7 @@ from src.collision.sphere_tri import SphereTriangleCollision
 from src.collision.events import CollisionEventQueue
 from src.sound.mapping import AudioMapper
 from src.detection.hands2d import MediaPipeHandsWrapper
-from src.input.stream import OrbbecCamera
+from src.utils.camera_factory import create_camera, add_camera_arguments
 from src.detection.hands3d import Hand3DProjector
 from src.detection.tracker import Hand3DTracker
 
@@ -1535,6 +1528,14 @@ class FullPipelineViewer(DualViewer):
             except Exception as e:
                 logger.error(f"3D component initialization error: {e}")
     
+    # ------------------------------------------------------------------
+    # Helper: default intrinsics fallback
+    # ------------------------------------------------------------------
+    def _get_default_camera_intrinsics(self):
+        """Return a fallback CameraIntrinsics when camera intrinsics are unavailable."""
+        from src.input.pointcloud import _create_default_intrinsics  # local import to avoid circular deps
+        return _create_default_intrinsics(LOW_RESOLUTION[0], LOW_RESOLUTION[1])
+
     def _initialize_60fps_tracking_system(self) -> None:
         """60fps手追跡システムの初期化"""
         try:
@@ -1569,9 +1570,10 @@ class FullPipelineViewer(DualViewer):
             )
             
             # 統合コントローラー作成
+            # camera_intrinsicsはNoneを渡さず、必ずCameraIntrinsics型を渡す
             self.integrated_controller = IntegratedHandTrackingController(
                 config=config,
-                camera_intrinsics=self.camera.depth_intrinsics,
+                camera_intrinsics=self.camera.depth_intrinsics if self.camera and self.camera.depth_intrinsics is not None else self._get_default_camera_intrinsics(),
                 hands_2d=self.hands_2d,
                 hands_3d=self.projector_3d,
                 collision_searcher=self.collision_searcher,
@@ -1616,7 +1618,7 @@ class FullPipelineViewer(DualViewer):
             logger.debug(f"60fps audio triggered: hand_id={event.hand_id}")
     
     def _extract_depth_image(self, frame_data: Any) -> Optional[np.ndarray]:
-        """フレームデータから深度画像を抽出"""
+        """フレームデータから深度画像を抽出（OAK-D/Orbbec対応）"""
         try:
             if self.camera is None or self.camera.depth_intrinsics is None:
                 # --------------------------------------------------------------
@@ -1626,21 +1628,28 @@ class FullPipelineViewer(DualViewer):
                 width = None
                 height = None
 
-                # Newer pyorbbecsdk versions expose width/height attributes
-                if hasattr(df, "width") and hasattr(df, "height"):
-                    width = int(df.width)
-                    height = int(df.height)
-                # Older versions expose getter functions
-                elif hasattr(df, "get_width") and hasattr(df, "get_height"):
-                    try:
-                        width = int(df.get_width())
-                        height = int(df.get_height())
-                    except Exception:  # pragma: no cover – defensive
-                        width, height = None, None
+                # OAK-DのOakFrameWrapperかどうかを判定
+                if hasattr(df, 'frame_data') and isinstance(df.frame_data, np.ndarray):
+                    # OAK-Dの場合: frame_dataから直接サイズを取得
+                    height, width = df.frame_data.shape[:2]
+                    logger.debug(f"[OAK-D-DEPTH] Using OAK-D depth dimensions: {width}x{height}")
+                else:
+                    # Orbbecカメラの場合: 従来の処理
+                    # Newer pyorbbecsdk versions expose width/height attributes
+                    if hasattr(df, "width") and hasattr(df, "height"):
+                        width = int(df.width)
+                        height = int(df.height)
+                    # Older versions expose getter functions
+                    elif hasattr(df, "get_width") and hasattr(df, "get_height"):
+                        try:
+                            width = int(df.get_width())
+                            height = int(df.get_height())
+                        except Exception:  # pragma: no cover – defensive
+                            width, height = None, None
 
-                if width is None or height is None:
-                    logger.warning("DepthFrame size unavailable – defaulting to 424x240")
-                    width, height = 424, 240
+                    if width is None or height is None:
+                        logger.warning("DepthFrame size unavailable – defaulting to 424x240")
+                        width, height = 424, 240
 
                 from src.input.pointcloud import _create_default_intrinsics  # local import
                 logger.warning("depth_intrinsics is None – using fallback intrinsics (%dx%d)", width, height)
@@ -1653,14 +1662,36 @@ class FullPipelineViewer(DualViewer):
             else:
                 intr = self.camera.depth_intrinsics
 
-            depth_data = np.frombuffer(frame_data.depth_frame.get_data(), dtype=np.uint16)
-            return depth_data.reshape((intr.height, intr.width))
+            # OAK-DのOakFrameWrapperかどうかを判定
+            if hasattr(frame_data.depth_frame, 'frame_data') and isinstance(frame_data.depth_frame.frame_data, np.ndarray):
+                # OAK-Dの場合: frame_dataは既に適切な形状のNumPy配列
+                depth_image = frame_data.depth_frame.frame_data
+                logger.debug(f"[OAK-D-DEPTH] Extracted depth frame: shape={depth_image.shape}, dtype={depth_image.dtype}")
+                
+                # 必要に応じてリサイズ（すでにOakFrameWrapperでリサイズされているはず）
+                if len(depth_image.shape) == 2 and depth_image.shape == (intr.height, intr.width):
+                    return depth_image
+                elif len(depth_image.shape) == 2:
+                    # サイズが違う場合はリサイズ
+                    import cv2
+                    resized = cv2.resize(depth_image, (intr.width, intr.height), interpolation=cv2.INTER_NEAREST)
+                    logger.debug(f"[OAK-D-DEPTH] Resized depth: {depth_image.shape} -> {resized.shape}")
+                    return resized
+                else:
+                    logger.error(f"[OAK-D-DEPTH] Invalid depth frame shape: {depth_image.shape}")
+                    return None
+            else:
+                # Orbbecカメラの場合: 従来の処理
+                depth_data = np.frombuffer(frame_data.depth_frame.get_data(), dtype=np.uint16)
+                depth_image = depth_data.reshape((intr.height, intr.width))
+                logger.debug(f"[ORBBEC-DEPTH] Extracted depth frame: shape={depth_image.shape}, dtype={depth_image.dtype}")
+                return depth_image
         except Exception as e:
             logger.error(f"Failed to extract depth image: {e}")
             return None
     
     def _extract_color_image(self, frame_data: Any) -> Optional[np.ndarray]:
-        """フレームデータからカラー画像を抽出"""
+        """フレームデータからカラー画像を抽出（OAK-D/Orbbec対応）"""
         try:
             if (
                 frame_data.color_frame is None
@@ -1669,11 +1700,24 @@ class FullPipelineViewer(DualViewer):
             ):
                 return None
             
-            color_data = np.frombuffer(frame_data.color_frame.get_data(), dtype=np.uint8)
-            color_format = frame_data.color_frame.get_format()
-            
-            # フォーマット変換
-            return self._convert_color_format(color_data, color_format)
+            # OAK-DのOakFrameWrapperかどうかを判定
+            if hasattr(frame_data.color_frame, 'frame_data') and isinstance(frame_data.color_frame.frame_data, np.ndarray):
+                # OAK-Dの場合: frame_dataは既にBGRのNumPy配列
+                color_image = frame_data.color_frame.frame_data
+                if len(color_image.shape) == 3 and color_image.shape[2] == 3:
+                    logger.debug(f"[OAK-D-COLOR] Extracted color frame: shape={color_image.shape}, dtype={color_image.dtype}")
+                    return color_image
+                else:
+                    logger.warning(f"[OAK-D-COLOR] Invalid color frame shape: {color_image.shape}")
+                    return None
+            else:
+                # Orbbecカメラの場合: 従来の処理
+                color_data = np.frombuffer(frame_data.color_frame.get_data(), dtype=np.uint8)
+                color_format = frame_data.color_frame.get_format()
+                logger.debug(f"[ORBBEC-COLOR] Extracted color data: size={len(color_data)}, format={color_format}")
+                
+                # フォーマット変換
+                return self._convert_color_format(color_data, color_format)
         except Exception as e:
             logger.error(f"Failed to extract color image: {e}")
             return None
@@ -1814,6 +1858,8 @@ class FullPipelineViewer(DualViewer):
         if color_image is None:
             return [], [], []
         
+        if self.integrated_controller is None:
+            raise RuntimeError("integrated_controller is None in _perform_60fps_hand_detection")
         try:
             # 60fps統合コントローラーでフレーム処理
             events = self.integrated_controller.process_frame(
@@ -1823,7 +1869,13 @@ class FullPipelineViewer(DualViewer):
             )
             
             # 現在の手情報取得
-            tracked_hands = self.integrated_controller.get_current_hands()
+            tracked_hands = []
+            if self.integrated_controller is not None and hasattr(self.integrated_controller, "get_current_hands"):
+                try:
+                    tracked_hands = self.integrated_controller.get_current_hands()
+                except Exception as e:
+                    logger.error(f"Error getting current hands: {e}")
+                    tracked_hands = []
             
             # 型チェック
             if not isinstance(events, list):
@@ -1842,12 +1894,17 @@ class FullPipelineViewer(DualViewer):
                     hands_3d.append(hand)  # 簡易実装
             
             # 統計情報の更新
-            if hasattr(self.integrated_controller, 'get_performance_stats'):
+            if (
+                self.integrated_controller is not None
+                and hasattr(self.integrated_controller, 'get_performance_stats')
+            ):
                 controller_stats = self.integrated_controller.get_performance_stats()
                 # 統計情報をメインの統計に反映
-                if 'hand_detection_time_ms' in controller_stats:
+                if (
+                    controller_stats is not None
+                    and 'hand_detection_time_ms' in controller_stats
+                ):
                     self.performance_stats['hand_detection_time'] = controller_stats['hand_detection_time_ms']
-            
             # ログ出力
             if self.frame_count % 10 == 0 and tracked_hands:
                 logger.info(f"[60FPS-DETECT] Frame {self.frame_count}: "
@@ -2367,7 +2424,7 @@ class FullPipelineViewer(DualViewer):
         # Manual normalization to avoid cv2 stub type issues
         assert depth_image is not None
         d_min = float(depth_image.min())
-        d_ptp = float(depth_image.ptp()) if depth_image.ptp() > 0 else 1.0
+        d_ptp = float(np.ptp(depth_image)) if np.ptp(depth_image) > 0 else 1.0
         depth_normalized = ((depth_image.astype(np.float32) - d_min) / d_ptp * 255.0).astype(np.uint8)
         return cv2.applyColorMap(depth_normalized, cv2.COLORMAP_JET)
     
@@ -2730,11 +2787,11 @@ def main():
         if depth_width and depth_height:
             print(f"   深度解像度: {depth_width}x{depth_height} に設定")
         
-        viewer.camera = OrbbecCamera(
-            enable_color=True,
-            depth_width=depth_width,
-            depth_height=depth_height
-        )
+        # カメラファクトリーを使用してカメラを作成
+        args.no_color = False
+        args.depth_w = depth_width
+        args.depth_h = depth_height
+        viewer.camera = create_camera(args)
         
         # DualViewer の初期化は viewer.run() 内部で行われるため、ここでは呼び出さない
         viewer.run()
@@ -2769,6 +2826,7 @@ def create_argument_parser() -> argparse.ArgumentParser:
     add_resolution_arguments(parser)
     add_window_arguments(parser)
     add_mode_arguments(parser)
+    add_camera_arguments(parser)
     
     return parser
 

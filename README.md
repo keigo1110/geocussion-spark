@@ -20,7 +20,8 @@ Geocussion-SPは、深度カメラで捉えた手のジェスチャーからリ�
 - **OS**: Linux (Ubuntu 20.04以降推奨)
 - **Python**: 3.10以上
 - **ハードウェア**:
-  - Orbbec深度カメラ (Femto Bolt等)
+  - **Orbbec深度カメラ** (Femto Bolt等) - デフォルト
+  - **OAK-D S2** - 新規対応！高精度ステレオ深度カメラ
   - GPU推奨 (3D可視化用)
   - オーディオ出力デバイス
 
@@ -42,6 +43,8 @@ sudo apt-get install -y \
 
 ### 2. Python仮想環境の作成
 
+#### Orbbec カメラ用（デフォルト）
+
 ```bash
 # 仮想環境の作成
 python3 -m venv venv
@@ -50,6 +53,18 @@ python3 -m venv venv
 source venv/bin/activate  # Linux/Mac
 # または
 # venv\Scripts\activate  # Windows
+```
+
+#### OAK-D S2 カメラ用
+
+```bash
+# OAK-D S2専用仮想環境の作成
+python3 -m venv oakenv
+
+# 仮想環境の有効化
+source oakenv/bin/activate  # Linux/Mac
+# または
+# oakenv\Scripts\activate  # Windows
 ```
 
 ### 3. プロジェクトのクローン
@@ -61,22 +76,35 @@ cd geocussion-sp
 
 ### 4. Python依存関係のインストール
 
+#### Orbbec カメラ用（デフォルト）
+
 ```bash
-# コア依存関係
+# 標準のrequirements.txtを使用
+pip install -r requirements.txt
+
+# 手動インストールの場合
 pip install numpy'<2.0' opencv-python open3d
-
-# Orbbec SDK
-pip install pyorbbecsdk
-
-# 各処理フェーズの依存関係
-pip install mediapipe scipy shapely pyo
-
-# 追加の依存関係
-pip install pygame pynput av wheel
+pip install pyorbbecsdk  # Orbbec SDK
+pip install mediapipe scipy shapely pygame
 pip install pybind11==2.11.0 pybind11-global==2.11.0
 ```
 
-### 5. Orbbecカメラの設定 (Linux)
+#### OAK-D S2 カメラ用
+
+```bash
+# OAK-D S2専用のrequirements.txtを使用
+pip install -r requirements_oak.txt
+
+# 手動インストールの場合
+pip install depthai>=2.24.0  # DepthAI SDK
+pip install numpy opencv-python open3d
+pip install mediapipe scipy pygame
+pip install numba cupy-cuda11x  # Optional GPU acceleration
+```
+
+### 5. カメラの設定 (Linux)
+
+#### Orbbec カメラの設定
 
 ```bash
 # USB権限の設定
@@ -88,6 +116,21 @@ sudo udevadm trigger
 sudo usermod -a -G plugdev $USER
 
 # 再ログインまたは再起動が必要
+```
+
+#### OAK-D S2 カメラの設定
+
+```bash
+# udev ルールの導入
+sudo wget -O /etc/udev/rules.d/80-oak.rules https://raw.githubusercontent.com/luxonis/depthai-core/main/cmake/depthaiConfig.cmake
+
+# ユーザーをplugdevグループに追加
+sudo groupadd plugdev
+sudo usermod -a -G plugdev $USER
+
+# 変更を適用（再ログインが必要）
+sudo udevadm control --reload-rules
+sudo udevadm trigger
 ```
 
 ### 6. 環境変数の設定
@@ -130,11 +173,20 @@ python demo_hand_detection.py --benchmark
 #### 3. 完全統合デモ (音響生成付き)
 
 ```bash
-# フルパイプラインの実行
+# Orbbec カメラを使用（デフォルト）
 python demo_collision_detection.py
+
+# OAK-D S2 カメラを使用
+python demo_collision_detection.py --oak
 
 # 特定の楽器で実行
 python demo_collision_detection.py --instrument marimba
+
+# 60fps追跡デモ
+python demo_60fps_tracking_fixed.py
+
+# 60fps追跡デモ（OAK-D S2）
+python demo_60fps_tracking_fixed.py --oak
 
 # 特定の音階で実行
 python demo_collision_detection.py --scale pentatonic

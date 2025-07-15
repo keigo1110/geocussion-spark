@@ -1,0 +1,5 @@
+Collecting depthai
+  Downloading depthai-2.30.0.0-cp310-cp310-manylinux_2_28_x86_64.whl (14.1 MB)
+     ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 14.1/14.1 MB 9.4 MB/s eta 0:00:00
+Installing collected packages: depthai
+Successfully installed depthai-2.30.0.0
