@@ -140,7 +140,7 @@ try:
     from src.detection.integrated_controller import (
         IntegratedHandTrackingController,
         IntegratedControllerConfig,
-        create_integrated_controller
+        create_integrated_controller_from_instances as create_integrated_controller
     )
     
     # 従来システム

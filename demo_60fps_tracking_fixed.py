@@ -176,7 +176,8 @@ from src.detection.unified_events import (
 from src.detection.integrated_controller import (
     IntegratedHandTrackingController,
     IntegratedControllerConfig,
-    create_integrated_controller
+    create_integrated_controller_from_instances as create_integrated_controller,
+    create_integrated_controller as create_integrated_controller_from_config
 )
 
 from src.sound.synth import AudioSynthesizer, AudioConfig, EngineState, create_audio_synthesizer

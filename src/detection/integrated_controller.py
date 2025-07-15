@@ -293,7 +293,7 @@ class IntegratedHandTrackingController:
                 if not self._is_audio_cooldown_active(event.hand_id, timestamp):
                     # 音響パラメータマッピング
                     # 衝突イベントを作成してマッピング
-                    from ...collision.events import CollisionEvent, CollisionIntensity
+                    from ..collision.events import CollisionEvent, CollisionIntensity
                     collision_event = CollisionEvent(
                         event_id=f"collision_{event.hand_id}_{int(time.time()*1000)}",
                         hand_id=event.hand_id,
@@ -466,7 +466,7 @@ class IntegratedHandTrackingController:
 # ファクトリー関数
 # =============================================================================
 
-def create_integrated_controller(
+def create_integrated_controller_from_instances(
     camera_intrinsics: CameraIntrinsics,
     hands_2d: 'MediaPipeHandsWrapper',
     hands_3d: 'Hand3DProjector',
@@ -475,7 +475,7 @@ def create_integrated_controller(
     audio_mapper: Optional['AudioMapper'] = None,
     audio_synthesizer: Optional['AudioSynthesizer'] = None
 ) -> IntegratedHandTrackingController:
-    """統合コントローラーを作成"""
+    """統合コントローラを作成（インスタンス受け渡し版）"""
     config = IntegratedControllerConfig(
         target_fps=target_fps,
         mediapipe_detection_fps=15,
