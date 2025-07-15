@@ -22,6 +22,7 @@ from concurrent.futures import Future
 
 from ..detection.tracker import TrackedHand, TrackingState
 from .delaunay import DelaunayTriangulator, TriangleMesh
+from ..utils.cache_manager import get_cache_manager
 
 logger = logging.getLogger(__name__)
 
@@ -51,61 +52,55 @@ class LODConfig:
 
 
 class LODMeshGenerator:
-    """Level of Detail メッシュ生成器"""
+    """LOD (Level of Detail) メッシュ生成器"""
     
     def __init__(
         self,
         config: Optional[LODConfig] = None,
         triangulator: Optional[DelaunayTriangulator] = None
     ):
-        """
-        初期化
+        self.config = config or LODConfig()
+        self.triangulator = triangulator or DelaunayTriangulator()
         
-        Args:
-            config: LOD設定
-            triangulator: 三角分割器
-        """
-        self.config = config if config is not None else LODConfig()
+        # 拡張キャッシュマネージャーを使用
+        self.cache_manager = get_cache_manager('lod_mesh')
         
-        # 三角分割器の設定
-        if triangulator is not None:
-            self.triangulator = triangulator
-        else:
-            # LOD用に最適化された設定
-            self.triangulator = DelaunayTriangulator(
-                max_edge_length=0.15,
-                quality_threshold=0.3,
-                adaptive_sampling=False,  # LODで既に制御済み
-                boundary_points=False,    # パフォーマンス重視
-                use_gpu=True,
-                gpu_fallback_threshold=500  # より低い閾値でGPU使用
-            )
-        
-        # 状態管理
-        self.last_hand_positions = []
-        self.last_update_time = 0.0
+        # 従来のキャッシュは廃止
         self.cached_mesh = None
         self.cache_timestamp = 0.0
-        self.mesh_update_regions = []
         
-        # Async triangulation future (CPU heavy) – P-PERF-002
+        # 手の位置履歴（更新判定用）
+        self.last_hand_positions = []
+        self.last_update_time = 0.0
+        
+        # 非同期処理用
         self._pending_future: Optional[Future] = None
         
-        # パフォーマンス統計
+        # 統計
         self.stats = {
             'total_updates': 0,
-            'full_updates': 0,
-            'partial_updates': 0,
-            'cache_hits': 0,
+            'total_time_ms': 0.0,
+            'lod_time_ms': 0.0,
+            'triangulation_time_ms': 0.0,
             'total_lod_time_ms': 0.0,
             'total_triangulation_time_ms': 0.0,
-            'points_processed_per_level': {'high': 0, 'medium': 0, 'low': 0},
-            'average_points_reduction_ratio': 0.0
+            'cache_hits': 0,
+            'original_points_total': 0,
+            'filtered_points_total': 0,
+            'average_points_reduction_ratio': 0.0,
+            'points_processed_per_level': {
+                'high': 0,
+                'medium': 0,
+                'low': 0
+            }
         }
         
-        logger.info(f"LODMeshGenerator initialized: high_radius={self.config.high_detail_radius}m, "
+        # メッシュ更新領域（メモリ解放用）
+        self.mesh_update_regions = []
+        
+        logger.info(f"LODMeshGenerator initialized with config: "
                    f"cache_enabled={self.config.enable_caching}")
-    
+
     def generate_mesh(
         self,
         points_3d: np.ndarray,
@@ -129,11 +124,21 @@ class LODMeshGenerator:
         start_time = time.perf_counter()
         current_time = time.perf_counter()
         
+        # キャッシュキーを生成
+        cache_key = self._generate_cache_key(points_3d, tracked_hands)
+        
+        # 拡張キャッシュから取得試行
+        if self.config.enable_caching and not force_update and self.cache_manager:
+            cached_mesh = self.cache_manager.get(cache_key)
+            if cached_mesh is not None:
+                self.stats['cache_hits'] += 1
+                return cached_mesh
+        
         # 更新判定
         should_update = self._should_update_mesh(tracked_hands, current_time, force_update)
         
-        if not should_update and self._is_cache_valid(current_time):
-            self.stats['cache_hits'] += 1
+        if not should_update and self.cached_mesh is not None:
+            # 従来のキャッシュもチェック（移行期間用）
             return self.cached_mesh
         
         # LODベース点群フィルタリング
@@ -172,7 +177,13 @@ class LODMeshGenerator:
 
             tri_time = (time.perf_counter() - tri_start) * 1000
             
-            # キャッシュ更新 (旧メッシュを確実に解放) – T-MESH-104
+            # 拡張キャッシュに保存
+            if self.config.enable_caching and self.cache_manager:
+                # メッシュサイズを推定
+                mesh_size = self._estimate_mesh_size(mesh)
+                self.cache_manager.put(cache_key, mesh, mesh_size)
+            
+            # 従来のキャッシュ更新 (旧メッシュを確実に解放) – T-MESH-104
             if self.cached_mesh is not None:
                 try:
                     del self.cached_mesh  # remove strong ref
@@ -200,7 +211,40 @@ class LODMeshGenerator:
         except Exception as e:
             logger.error(f"LOD mesh generation failed: {e}")
             return self.cached_mesh
-    
+
+    def _generate_cache_key(self, points_3d: np.ndarray, tracked_hands: List[TrackedHand]) -> str:
+        """キャッシュキーを生成"""
+        # 点群のハッシュ
+        points_hash = hash(points_3d.tobytes())
+        
+        # 手の位置のハッシュ
+        hands_hash = 0
+        for hand in tracked_hands:
+            hands_hash ^= hash(hand.position.tobytes())
+        
+        # 設定のハッシュ
+        config_hash = hash((
+            self.config.high_detail_radius,
+            self.config.medium_detail_radius,
+            self.config.low_detail_radius,
+            self.config.high_detail_density,
+            self.config.medium_detail_density,
+            self.config.low_detail_density
+        ))
+        
+        return f"lod_mesh_{points_hash}_{hands_hash}_{config_hash}"
+
+    def _estimate_mesh_size(self, mesh: TriangleMesh) -> int:
+        """メッシュのメモリサイズを推定"""
+        if mesh is None:
+            return 0
+        
+        # 頂点とインデックスのサイズを概算
+        vertices_size = mesh.vertices.nbytes if hasattr(mesh.vertices, 'nbytes') else 0
+        triangles_size = mesh.triangles.nbytes if hasattr(mesh.triangles, 'nbytes') else 0
+        
+        return vertices_size + triangles_size
+
     def _should_update_mesh(
         self,
         tracked_hands: List[TrackedHand],
@@ -237,7 +281,7 @@ class LODMeshGenerator:
         return False
     
     def _is_cache_valid(self, current_time: float) -> bool:
-        """キャッシュ有効性確認"""
+        """キャッシュ有効性確認（従来のキャッシュ用）"""
         if not self.config.enable_caching or self.cached_mesh is None:
             return False
         
@@ -409,6 +453,10 @@ class LODMeshGenerator:
     
     def clear_cache(self):
         """キャッシュクリア"""
+        if self.cache_manager:
+            self.cache_manager.clear()
+        
+        # 従来のキャッシュもクリア
         self.cached_mesh = None
         self.cache_timestamp = 0.0
         self.last_hand_positions = []

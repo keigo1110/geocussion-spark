@@ -25,7 +25,7 @@ from src.collision.sphere_tri import (
 )
 from src.collision.events import (
     CollisionEvent, CollisionEventQueue, EventType, CollisionIntensity,
-    create_collision_event, process_collision_events
+    create_collision_event, process_collision_events, reset_global_collision_queue
 )
 
 # 依存モジュール（モック用）
@@ -81,9 +81,9 @@ class TestCollisionSearch(unittest.TestCase):
         self.assertIsInstance(result, SearchResult)
         # 検索結果があることを確認（半径を大きくしたので見つかるはず）
         if len(result.triangle_indices) == 0:
-            logger.info(f"No triangles found at position {position} with radius 0.5")
-            logger.info(f"Mesh has {self.mesh.num_triangles} triangles")
-            logger.info(f"Triangle vertices: {self.mesh.vertices}")
+            print(f"No triangles found at position {position} with radius 0.5")
+            print(f"Mesh has {self.mesh.num_triangles} triangles")
+            print(f"Triangle vertices: {self.mesh.vertices}")
         
         self.assertLess(result.search_time_ms, 10.0)
 
@@ -152,7 +152,7 @@ class TestCollisionEvents(unittest.TestCase):
         )
         
         self.assertIsNotNone(event)
-        self.assertEqual(event.event_type, EventType.COLLISION_START)
+        self.assertEqual(event.event_type, EventType.COLLISION_IMPACT)
         self.assertGreater(event.intensity.value, 0)
 
 
@@ -234,6 +234,7 @@ def run_collision_tests():
     suite.addTests(loader.loadTestsFromTestCase(TestSphereTriangleCollision))
     suite.addTests(loader.loadTestsFromTestCase(TestCollisionEvents))
     suite.addTests(loader.loadTestsFromTestCase(TestCollisionEventQueue))
+    suite.addTests(loader.loadTestsFromTestCase(TestCollisionDebounce))  # 新しいテスト追加
     
     runner = unittest.TextTestRunner(verbosity=2)
     result = runner.run(suite)
@@ -244,6 +245,210 @@ def run_collision_tests():
     logger.info(f"エラー: {len(result.errors)}")
     
     return result.wasSuccessful()
+
+
+class TestCollisionDebounce(unittest.TestCase):
+    """一打＝一音の衝突デバウンステスト"""
+    
+    def setUp(self):
+        """テスト用データを準備"""
+        # グローバルキューをリセット
+        reset_global_collision_queue()
+        
+        # テスト用の衝突情報を作成
+        self.contact_point = ContactPoint(
+            position=np.array([0.0, 0.5, 0.0], dtype=np.float32),
+            normal=np.array([0.0, 1.0, 0.0], dtype=np.float32),
+            depth=0.01,
+            triangle_index=0,
+            barycentric=np.array([0.3, 0.3, 0.4], dtype=np.float32),
+            collision_type=CollisionType.FACE_COLLISION
+        )
+        
+        self.collision_info = CollisionInfo(
+            has_collision=True,
+            contact_points=[self.contact_point],
+            closest_point=self.contact_point,
+            total_penetration_depth=0.01,
+            collision_normal=np.array([0.0, 1.0, 0.0], dtype=np.float32),
+            collision_time_ms=1.0
+        )
+        
+        self.hand_position = np.array([0.0, 0.6, 0.0], dtype=np.float32)
+        self.hand_velocity = np.array([0.0, -0.1, 0.0], dtype=np.float32)
+        self.hand_id = "test_hand"
+    
+    def test_single_impact_generation(self):
+        """連続衝突フレームでもIMPACTは1回だけ生成されることを検証"""
+        queue = CollisionEventQueue(debounce_ms=50.0)
+        
+        events = []
+        # 5フレーム連続で同じ衝突を送信（100FPS想定で50ms）
+        for frame in range(5):
+            event = queue.create_event(
+                self.collision_info, 
+                self.hand_id, 
+                self.hand_position, 
+                self.hand_velocity
+            )
+            if event:
+                events.append(event)
+            # フレーム間隔をシミュレート（10ms = 100FPS）
+            time.sleep(0.01)
+        
+        # IMPACTは1回、CONTINUEは4回発生するはず
+        impact_events = [e for e in events if e.event_type == EventType.COLLISION_IMPACT]
+        continue_events = [e for e in events if e.event_type == EventType.COLLISION_CONTINUE]
+        
+        self.assertEqual(len(impact_events), 1, "IMPACTイベントは1回だけ生成されるべき")
+        self.assertEqual(len(continue_events), 4, "CONTINUEイベントは4回生成されるべき")
+        
+        # 統計確認
+        stats = queue.get_stats()
+        self.assertEqual(stats['impacts_created'], 1)
+        self.assertEqual(stats['impacts_debounced'], 0)  # 継続中はデバウンス統計に含まれない
+    
+    def test_debounce_prevention(self):
+        """デバウンス時間内の再衝突が抑制されることを検証"""
+        queue = CollisionEventQueue(debounce_ms=100.0)
+        
+        # 最初の衝突
+        event1 = queue.create_event(
+            self.collision_info, 
+            self.hand_id, 
+            self.hand_position, 
+            self.hand_velocity
+        )
+        self.assertIsNotNone(event1)
+        self.assertEqual(event1.event_type, EventType.COLLISION_IMPACT)
+        
+        # 衝突終了
+        no_collision = CollisionInfo(
+            has_collision=False,
+            contact_points=[],
+            closest_point=None,
+            total_penetration_depth=0.0,
+            collision_normal=np.zeros(3),
+            collision_time_ms=0.0
+        )
+        end_event = queue.create_event(no_collision, self.hand_id, self.hand_position)
+        self.assertIsNotNone(end_event)
+        self.assertEqual(end_event.event_type, EventType.COLLISION_END)
+        
+        # デバウンス時間内（50ms後）に再衝突を試行
+        time.sleep(0.05)
+        event2 = queue.create_event(
+            self.collision_info, 
+            self.hand_id, 
+            self.hand_position, 
+            self.hand_velocity
+        )
+        self.assertIsNone(event2, "デバウンス時間内の再衝突は抑制されるべき")
+        
+        # 統計確認
+        stats = queue.get_stats()
+        self.assertEqual(stats['impacts_created'], 1)
+        self.assertEqual(stats['impacts_debounced'], 1)
+    
+    def test_debounce_expiry_allows_new_impact(self):
+        """デバウンス時間経過後は新しいIMPACTが生成されることを検証"""
+        queue = CollisionEventQueue(debounce_ms=50.0)  # 短いデバウンス時間
+        
+        # 最初の衝突
+        event1 = queue.create_event(
+            self.collision_info, 
+            self.hand_id, 
+            self.hand_position, 
+            self.hand_velocity
+        )
+        self.assertIsNotNone(event1)
+        self.assertEqual(event1.event_type, EventType.COLLISION_IMPACT)
+        
+        # 衝突終了
+        no_collision = CollisionInfo(
+            has_collision=False,
+            contact_points=[],
+            closest_point=None,
+            total_penetration_depth=0.0,
+            collision_normal=np.zeros(3),
+            collision_time_ms=0.0
+        )
+        queue.create_event(no_collision, self.hand_id, self.hand_position)
+        
+        # デバウンス時間経過を待つ（60ms）
+        time.sleep(0.06)
+        
+        # 再衝突を試行
+        event2 = queue.create_event(
+            self.collision_info, 
+            self.hand_id, 
+            self.hand_position, 
+            self.hand_velocity
+        )
+        self.assertIsNotNone(event2, "デバウンス時間経過後は新しいIMPACTが生成されるべき")
+        self.assertEqual(event2.event_type, EventType.COLLISION_IMPACT)
+        
+        # 統計確認
+        stats = queue.get_stats()
+        self.assertEqual(stats['impacts_created'], 2)
+        self.assertEqual(stats['impacts_debounced'], 0)
+    
+    def test_multiple_hands_independent_debounce(self):
+        """複数の手のデバウンスが独立して動作することを検証"""
+        queue = CollisionEventQueue(debounce_ms=100.0)
+        
+        # 手1の衝突
+        event1 = queue.create_event(
+            self.collision_info, 
+            "hand1", 
+            self.hand_position, 
+            self.hand_velocity
+        )
+        self.assertIsNotNone(event1)
+        self.assertEqual(event1.event_type, EventType.COLLISION_IMPACT)
+        
+        # 手2の衝突（同じタイミング）
+        event2 = queue.create_event(
+            self.collision_info, 
+            "hand2", 
+            self.hand_position + np.array([0.1, 0, 0]), 
+            self.hand_velocity
+        )
+        self.assertIsNotNone(event2)
+        self.assertEqual(event2.event_type, EventType.COLLISION_IMPACT)
+        
+        # 統計確認：両方ともIMPACTが生成される
+        stats = queue.get_stats()
+        self.assertEqual(stats['impacts_created'], 2)
+        self.assertEqual(stats['impacts_debounced'], 0)
+    
+    def test_intensity_preserved_during_continue(self):
+        """CONTINUE中は初期IMPACTの強度が保持されることを検証"""
+        queue = CollisionEventQueue()
+        
+        # 最初の衝突（高強度）
+        high_velocity = np.array([0.0, -0.5, 0.0], dtype=np.float32)  # 高速
+        impact_event = queue.create_event(
+            self.collision_info, 
+            self.hand_id, 
+            self.hand_position, 
+            high_velocity
+        )
+        self.assertIsNotNone(impact_event)
+        initial_intensity = impact_event.intensity
+        
+        # 継続中（低速になっても強度は維持される）
+        low_velocity = np.array([0.0, -0.01, 0.0], dtype=np.float32)  # 低速
+        continue_event = queue.create_event(
+            self.collision_info, 
+            self.hand_id, 
+            self.hand_position, 
+            low_velocity
+        )
+        self.assertIsNotNone(continue_event)
+        self.assertEqual(continue_event.event_type, EventType.COLLISION_CONTINUE)
+        self.assertEqual(continue_event.intensity, initial_intensity, 
+                        "CONTINUEイベントは初期IMPACTの強度を保持するべき")
 
 
 if __name__ == '__main__':

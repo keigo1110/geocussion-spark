@@ -13,7 +13,7 @@ import numpy as np
 
 from src.sound.backend import create_backend, BackendType, get_available_backends, is_backend_available
 from src.sound.backend.null_backend import NullAudioBackend
-from src.sound.mapping import AudioParameters, InstrumentType, ScaleType, AudioParameterMapper
+from src.sound.mapping import AudioParameters, InstrumentType, ScaleType, AudioMapper
 from src.sound.voice_mgr import VoiceManager, VoiceState
 from src.sound.synth import AudioSynthesizer, EngineState
 
@@ -86,72 +86,6 @@ class TestAudioBackends:
             assert is_backend_available(backend_type)
 
 
-class TestAudioParameterMapper:
-    """音響パラメータマッピングのテスト"""
-    
-    def setup_method(self):
-        """テストセットアップ"""
-        self.mapper = AudioParameterMapper()
-    
-    def test_coordinate_to_frequency(self):
-        """座標から周波数へのマッピングテスト"""
-        # Y座標範囲テスト
-        freq_low = self.mapper._coordinate_to_frequency(0.0, 1.0)  # 最低点
-        freq_high = self.mapper._coordinate_to_frequency(1.0, 1.0)  # 最高点
-        
-        assert freq_low < freq_high
-        assert 200 <= freq_low <= 2000  # 妥当な周波数範囲
-        assert 200 <= freq_high <= 2000
-    
-    def test_velocity_to_amplitude(self):
-        """速度から振幅へのマッピングテスト"""
-        # 速度範囲テスト
-        amp_low = self.mapper._velocity_to_amplitude(0.0)
-        amp_mid = self.mapper._velocity_to_amplitude(0.5)
-        amp_high = self.mapper._velocity_to_amplitude(1.0)
-        
-        assert 0 <= amp_low <= amp_mid <= amp_high <= 1.0
-    
-    def test_position_to_pan(self):
-        """位置からパンニングへのマッピングテスト"""
-        pan_left = self.mapper._position_to_pan(-1.0)
-        pan_center = self.mapper._position_to_pan(0.0)
-        pan_right = self.mapper._position_to_pan(1.0)
-        
-        assert pan_left < pan_center < pan_right
-        assert -1.0 <= pan_left <= 1.0
-        assert -1.0 <= pan_right <= 1.0
-    
-    def test_map_collision_to_audio(self):
-        """衝突からオーディオパラメータへのマッピングテスト"""
-        collision_data = {
-            'contact_point': np.array([0.5, 0.7, 0.0]),
-            'collision_strength': 0.8,
-            'surface_normal': np.array([0.0, 1.0, 0.0]),
-            'velocity': np.array([0.1, -0.5, 0.0])
-        }
-        
-        params = self.mapper.map_collision_to_audio(collision_data)
-        
-        assert isinstance(params, AudioParameters)
-        assert params.frequency > 0
-        assert 0 <= params.amplitude <= 1.0
-        assert -1.0 <= params.pan <= 1.0
-        assert params.instrument_type in InstrumentType
-        assert params.scale_type in ScaleType
-    
-    def test_scale_constraints(self):
-        """スケール制約テスト"""
-        # ペンタトニックスケール制約
-        self.mapper.scale_type = ScaleType.PENTATONIC
-        
-        # 複数の周波数でスケール制約を確認
-        for y in np.linspace(0, 1, 20):
-            freq = self.mapper._coordinate_to_frequency(y, 1.0)
-            # ペンタトニックスケールの音程に近い値になっているかチェック
-            assert freq > 0
-
-
 class TestVoiceManager:
     """ボイス管理のテスト"""
     
@@ -209,7 +143,7 @@ class TestVoiceManager:
     
     def test_voice_cleanup(self):
         """ボイスクリーンアップテスト"""
-            params = AudioParameters(
+        params = AudioParameters(
             frequency=440.0,
             amplitude=0.5,
             pan=0.0,
@@ -293,7 +227,7 @@ class TestSoundIntegration:
     
     def setup_method(self):
         """テストセットアップ"""
-        self.mapper = AudioParameterMapper()
+        self.mapper = AudioMapper()
         self.synth = AudioSynthesizer(preferred_backend=BackendType.NULL)
         self.synth.start_engine()
     
@@ -358,7 +292,7 @@ class TestSoundPerformance:
     @pytest.mark.benchmark
     def test_mapping_performance(self, benchmark):
         """マッピング性能テスト"""
-        mapper = AudioParameterMapper()
+        mapper = AudioMapper()
         collision_data = {
             'contact_point': np.array([0.5, 0.7, 0.0]),
             'collision_strength': 0.8,

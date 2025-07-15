@@ -13,6 +13,13 @@ from .hands2d import (
     get_dominant_hand
 )
 
+from .hand_deduplication import (
+    HandDeduplicationFilter,
+    HandCluster,
+    filter_duplicate_hands,
+    create_hand_deduplication_filter
+)
+
 from .hands3d import (
     Hand3DProjector,
     Hand3DResult,
@@ -42,6 +49,12 @@ __all__ = [
     'create_mock_hand_result',
     'filter_hands_by_confidence',
     'get_dominant_hand',
+    
+    # 手検出重複排除
+    'HandDeduplicationFilter',
+    'HandCluster',
+    'filter_duplicate_hands',
+    'create_hand_deduplication_filter',
     
     # 3D投影
     'Hand3DProjector',

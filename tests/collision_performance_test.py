@@ -12,6 +12,15 @@ import sys
 import os
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 
+import logging
+logger = logging.getLogger("test")
+logger.setLevel(logging.INFO)
+if not logger.hasHandlers():
+    handler = logging.StreamHandler()
+    formatter = logging.Formatter('%(asctime)s [%(levelname)s] %(name)s: %(message)s')
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
+
 from src.collision.search import CollisionSearcher, SearchResult
 from src.collision.sphere_tri import SphereTriangleCollision, CollisionInfo, ContactPoint, CollisionType
 from src.collision.events import CollisionEventQueue, CollisionEvent

@@ -4,6 +4,7 @@ MediaPipe Hands 2D検出ラッパー
 GPU対応・batch処理・パフォーマンス最適化対応
 ROI トラッキングによるMediaPipe実行スキップ機能
 """
+from __future__ import annotations  # postpone evaluation of type hints
 
 import time
 from typing import List, Optional, Tuple, Dict, Any, NamedTuple
@@ -29,8 +30,31 @@ except ImportError:
 
 from .. import get_logger
 from ..data_types import HandednessType, HandLandmark, HandROI, HandDetectionResult, ROITrackingStats
+from .hand_deduplication import HandDeduplicationFilter, create_hand_deduplication_filter
 
 logger = get_logger(__name__)
+
+
+# -----------------------------------------------------------------------------
+# OpenCV compatibility shim
+# Some OpenCV builds (e.g. pip wheels without legacy modules) do not provide the
+# top-level attribute ``cv2.Tracker`` that is referenced in type annotations
+# below.  The absence of this symbol triggers an ``AttributeError`` *during
+# module import* (because type annotations are evaluated eagerly in Python <3.11
+# unless `from __future__ import annotations` is used).  We therefore (1) delay
+# evaluation via the future import above and (2) register a lightweight fallback
+# alias so that dynamic checks like ``hasattr(cv2, 'Tracker')`` succeed later.
+# -----------------------------------------------------------------------------
+if not hasattr(cv2, "Tracker"):
+    # Try to reuse the implementation living in the legacy namespace, or else
+    # create a dummy placeholder to satisfy type-checking / isinstance tests.
+    if hasattr(cv2, "legacy") and hasattr(cv2.legacy, "Tracker"):
+        cv2.Tracker = cv2.legacy.Tracker  # type: ignore
+    else:
+        class _DummyTracker:  # type: ignore
+            """Minimal placeholder when OpenCV is built without the legacy tracker."""
+            pass
+        cv2.Tracker = _DummyTracker  # type: ignore
 
 
 class MediaPipeHandsWrapper:
@@ -49,7 +73,10 @@ class MediaPipeHandsWrapper:
         skip_interval: int = 4,              # N フレームに1回 MediaPipe実行
         roi_confidence_threshold: float = 0.6,
         max_tracking_age: int = 15,
-        roi_expansion_factor: float = 1.2
+        roi_expansion_factor: float = 1.2,
+        # 重複排除設定
+        enable_deduplication: bool = True,
+        deduplication_distance: float = 0.15  # 15cm以内は同じ手と判定
     ):
         """
         初期化
@@ -80,6 +107,14 @@ class MediaPipeHandsWrapper:
         self.roi_confidence_threshold = roi_confidence_threshold
         self.max_tracking_age = max_tracking_age
         self.roi_expansion_factor = roi_expansion_factor
+        
+        # 重複排除設定
+        self.enable_deduplication = enable_deduplication
+        self.deduplication_filter = None
+        if enable_deduplication:
+            self.deduplication_filter = create_hand_deduplication_filter(
+                distance_threshold=deduplication_distance
+            )
         
         self.hands = None
         self.mp_hands = None
@@ -186,7 +221,16 @@ class MediaPipeHandsWrapper:
             return self._update_roi_tracking(image)
         
         # MediaPipe を実行
-        return self._run_mediapipe_detection(image)
+        raw_results = self._run_mediapipe_detection(image)
+        
+        # 重複排除フィルタを適用
+        if self.enable_deduplication and self.deduplication_filter and len(raw_results) > 1:
+            filtered_results = self.deduplication_filter.filter_duplicate_hands(raw_results)
+            if len(filtered_results) < len(raw_results):
+                logger.debug(f"Hand deduplication: {len(raw_results)} -> {len(filtered_results)} hands")
+            return filtered_results
+        
+        return raw_results
     
     def _should_run_mediapipe(self) -> bool:
         """MediaPipe手検出を実行すべきかを判定"""
@@ -221,6 +265,19 @@ class MediaPipeHandsWrapper:
         
         self.last_mediapipe_frame = self.frame_count
         self.roi_tracking_stats.mediapipe_executions += 1
+        
+        # 高速化: ROIトラッキングが安定している場合はMediaPipe頻度をさらに下げる
+        if self.enable_roi_tracking and len(self.current_rois) > 0:
+            # 全てのROIが高信頼度で追跡されている場合、MediaPipe頻度を動的に調整
+            stable_tracking = all(
+                self.frame_count - roi.last_updated_frame < self.max_tracking_age // 2
+                for roi in self.current_rois.values()
+            )
+            if stable_tracking and (self.frame_count - self.last_mediapipe_frame) < self.skip_interval * 2:
+                # 安定時はMediaPipeをさらにスキップ
+                detection_time = (time.perf_counter() - start_time) * 1000
+                self._update_stats(detection_time, 0)  # MediaPipeスキップを記録
+                return []  # ROIトラッキング結果を使用
         
         try:
             # BGR -> RGB 変換
@@ -295,7 +352,7 @@ class MediaPipeHandsWrapper:
                     hand_result = self._create_tracked_hand_result(roi, hand_id)
                     if hand_result:
                         hand_results.append(hand_result)
-                    
+                        
                     self.roi_tracking_stats.tracking_successes += 1
                     logger.debug(f"ROI tracking success for {hand_id}: confidence={confidence:.3f}")
                 else:
@@ -501,9 +558,13 @@ class MediaPipeHandsWrapper:
             # 信頼度
             confidence = handedness.classification[0].score
             
-            # ID生成
+            # ID生成（重複しにくい形式に改善）
             if not hand_id:
-                hand_id = f"{hand_type.value.lower()}_{int(time.time() * 1000) % 10000}"
+                # 左右と座標を組み合わせたより一意性の高いID生成
+                center_x = (bbox_x + bbox_w // 2) // 10  # 10ピクセル単位で離散化
+                center_y = (bbox_y + bbox_h // 2) // 10
+                timestamp_ms = int(time.time() * 1000) % 100000  # 5桁の時刻
+                hand_id = f"{hand_type.value.lower()}_{center_x}_{center_y}_{timestamp_ms}"
             
             return HandDetectionResult(
                 id=hand_id,

@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """
-Geocussion-SP リアルタイムデモ（衝突検出統合版）
-点群→メッシュ→衝突検出→音響合成の全パイプライン実装
+Geocussion-SP 60fps手追跡統合デモ（Complete Pipeline with 60fps Hand Tracking）
+MediaPipe + 60fps Kalman Tracker + メッシュ→衝突検出→音響合成の全パイプライン実装
 
 使用方法:
-  python3 demo_collision_detection.py                 # 通常実行
-  python3 demo_collision_detection.py --no-audio      # 音響無効化
-  python3 demo_collision_detection.py --test          # プリプロセッシング最適化テスト
+  python3 demo_60fps_tracking_fixed.py                    # デフォルト設定（60fps追跡）
+  python3 demo_60fps_tracking_fixed.py --no-audio         # 音響無効化
+  python3 demo_60fps_tracking_fixed.py --headless         # ヘッドレスモード
+  python3 demo_60fps_tracking_fixed.py --high-resolution  # 高解像度モード
 """
 
 import os
@@ -158,6 +159,27 @@ from src.detection.hands2d import MediaPipeHandsWrapper
 from src.input.stream import OrbbecCamera
 from src.detection.hands3d import Hand3DProjector
 from src.detection.tracker import Hand3DTracker
+
+# 60fps手追跡システム
+from src.detection.tracker_60fps import (
+    HighFrequencyHand3DTracker,
+    HighFrequencyKalmanConfig,
+    HighFrequencyTrackedHand,
+    create_high_frequency_tracker
+)
+from src.detection.unified_events import (
+    UnifiedHandEventStream,
+    UnifiedHandEvent,
+    UnifiedHandEventType,
+    create_unified_event_stream
+)
+from src.detection.integrated_controller import (
+    IntegratedHandTrackingController,
+    IntegratedControllerConfig,
+    create_integrated_controller_from_instances as create_integrated_controller,
+    create_integrated_controller as create_integrated_controller_from_config
+)
+
 from src.sound.synth import AudioSynthesizer, AudioConfig, EngineState, create_audio_synthesizer
 from src.sound.voice_mgr import VoiceManager, StealStrategy, SpatialMode, SpatialConfig, create_voice_manager, allocate_and_play
 from src.debug.dual_viewer import DualViewer
@@ -360,6 +382,14 @@ class FullPipelineViewer(DualViewer):
     
         # MediaPipe GPU 使用設定
         self.use_gpu_mediapipe = kwargs.pop('use_gpu_mediapipe', False)
+        
+        # 60fps手追跡システム設定
+        self.enable_60fps_tracking = kwargs.pop('enable_60fps_tracking', True)
+        self.target_fps = kwargs.pop('target_fps', 60)
+        self.mediapipe_detection_fps = kwargs.pop('mediapipe_detection_fps', 15)
+        self.enable_prediction = kwargs.pop('enable_prediction', True)
+        self.enable_interpolation = kwargs.pop('enable_interpolation', True)
+        self.max_concurrent_hands = kwargs.pop('max_concurrent_hands', 4)
     
     def _initialize_components(self):
         """コンポーネントを初期化"""
@@ -412,6 +442,16 @@ class FullPipelineViewer(DualViewer):
         # 3Dコンポーネント（後で初期化）
         self.projector_3d = None
         self.tracker = None
+        
+        # 60fps手追跡システム（後で初期化）
+        self.integrated_controller: Optional[IntegratedHandTrackingController] = None
+        self.tracker_60fps: Optional[HighFrequencyHand3DTracker] = None
+        self.event_stream: Optional[UnifiedHandEventStream] = None
+        
+        # 60fpsシステムの状態管理
+        self._60fps_system_failed = False
+        self._60fps_failure_count = 0
+        self._max_60fps_failures = 5  # 5回連続で失敗したら無効化
     
     def _initialize_mesh_generators(self):
         """メッシュ生成器を初期化 (T-MESH-101)"""
@@ -1461,18 +1501,23 @@ class FullPipelineViewer(DualViewer):
         return depth_image, color_image
     
     def _lazy_initialize_3d_components(self) -> None:
-        """3D手検出コンポーネントの遅延初期化"""
+        """3D手検出コンポーネントの遅延初期化（60fps対応）"""
         if not self._components_initialized and hasattr(self, 'camera') and self.camera is not None:
             try:
-                logger.info("Setting up 3D hand detection components...")
+                logger.info("Setting up 60fps hand tracking components...")
                 if self.camera.depth_intrinsics is not None:
                     # 3D投影器の初期化
                     self.projector_3d = Hand3DProjector(
                         self.camera.depth_intrinsics,
                         min_confidence_3d=0.1
                     )
-                    # トラッカーの初期化
+                    
+                    # 従来のトラッカー（フォールバック用）
                     self.tracker = Hand3DTracker()
+                    
+                    # 60fps手追跡システムの初期化
+                    if self.enable_60fps_tracking:
+                        self._initialize_60fps_tracking_system()
                     
                     # 点群コンバーターの初期化（まだない場合）
                     if not hasattr(self, 'pointcloud_converter') or self.pointcloud_converter is None:
@@ -1483,11 +1528,92 @@ class FullPipelineViewer(DualViewer):
                         )
                     
                     self._components_initialized = True
-                    logger.info("3D hand detection components initialized")
+                    tracking_mode = "60fps tracking" if self.enable_60fps_tracking else "standard tracking"
+                    logger.info(f"3D hand detection components initialized ({tracking_mode})")
                 else:
                     logger.warning("Camera depth intrinsics not available")
             except Exception as e:
                 logger.error(f"3D component initialization error: {e}")
+    
+    def _initialize_60fps_tracking_system(self) -> None:
+        """60fps手追跡システムの初期化"""
+        try:
+            logger.info("Initializing 60fps hand tracking system...")
+            
+            # 統合コントローラー設定
+            config = IntegratedControllerConfig(
+                # 60fps追跡設定
+                target_fps=self.target_fps,
+                mediapipe_detection_fps=self.mediapipe_detection_fps,
+                collision_check_fps=self.target_fps,
+                audio_synthesis_fps=self.target_fps,
+                
+                # MediaPipe設定
+                mediapipe_confidence=self.min_detection_confidence,
+                mediapipe_tracking_confidence=0.5,
+                use_gpu_mediapipe=self.use_gpu_mediapipe,
+                max_num_hands=2,
+                
+                # 統合システム設定
+                collision_sphere_radius=self.sphere_radius,
+                collision_enabled=self.enable_collision_detection,
+                audio_enabled=self.enable_audio_synthesis,
+                audio_cooldown_ms=50.0,
+                
+                # パフォーマンス設定
+                max_concurrent_hands=self.max_concurrent_hands,
+                enable_prediction=self.enable_prediction,
+                enable_interpolation=self.enable_interpolation,
+                enable_performance_monitoring=True,
+                stats_update_interval=60
+            )
+            
+            # 統合コントローラー作成
+            self.integrated_controller = IntegratedHandTrackingController(
+                config=config,
+                camera_intrinsics=self.camera.depth_intrinsics,
+                hands_2d=self.hands_2d,
+                hands_3d=self.projector_3d,
+                collision_searcher=self.collision_searcher,
+                audio_mapper=self.audio_mapper,
+                audio_synthesizer=self.audio_synthesizer
+            )
+            
+            # 統一イベントストリーム
+            self.event_stream = create_unified_event_stream(
+                max_events=1000,
+                event_retention_time=5.0
+            )
+            
+            # 60fpsトラッカー（直接アクセス用）
+            self.tracker_60fps = self.integrated_controller.tracker_60fps
+            
+            # イベントリスナー登録
+            self.integrated_controller.add_event_listener(self._handle_60fps_collision_event)
+            self.integrated_controller.add_event_listener(self._handle_60fps_audio_event)
+            
+            logger.info(f"60fps hand tracking system initialized: {self.target_fps}fps target")
+            
+        except Exception as e:
+            logger.error(f"60fps tracking system initialization failed: {e}")
+            self.enable_60fps_tracking = False
+            self._60fps_system_failed = True
+            self.integrated_controller = None
+            self.tracker_60fps = None
+            self.event_stream = None
+            logger.warning("Falling back to standard hand tracking")
+    
+    def _handle_60fps_collision_event(self, event: UnifiedHandEvent) -> None:
+        """60fps衝突イベントハンドラー"""
+        if event.event_type == UnifiedHandEventType.COLLISION_DETECTED:
+            self.performance_stats['collision_events_count'] += 1
+            logger.debug(f"60fps collision detected: hand_id={event.hand_id}")
+    
+    def _handle_60fps_audio_event(self, event: UnifiedHandEvent) -> None:
+        """60fps音響イベントハンドラー"""
+        if event.event_type == UnifiedHandEventType.AUDIO_TRIGGERED:
+            self.performance_stats['audio_notes_played'] += 1
+            logger.debug(f"60fps audio triggered: hand_id={event.hand_id}")
     
     def _extract_depth_image(self, frame_data: Any) -> Optional[np.ndarray]:
         """フレームデータから深度画像を抽出"""
@@ -1636,24 +1762,142 @@ class FullPipelineViewer(DualViewer):
         return hands_2d, hands_3d, tracked_hands
     
     def _perform_hand_detection(self, depth_image: np.ndarray) -> Tuple[List, List, List]:
-        """手検出処理を実行（パフォーマンス計測付き）"""
-        if self.enable_hand_detection and self.hands_2d is not None:
-            hand_start_time = time.perf_counter()
-            hands_2d, hands_3d, tracked_hands = self._process_hand_detection(depth_image)
-            self.performance_stats['hand_detection_time'] = (time.perf_counter() - hand_start_time) * 1000
-            
-            if self.frame_count % 10 == 0 and any([hands_2d, hands_3d, tracked_hands]):
-                logger.info(f"[HAND-DETECT] Frame {self.frame_count}: "
-                           f"2D:{len(hands_2d)}, 3D:{len(hands_3d)}, Tracked:{len(tracked_hands)} "
-                           f"({self.performance_stats['hand_detection_time']:.1f}ms)")
-            
-            return hands_2d, hands_3d, tracked_hands
-        else:
+        """手検出処理を実行（60fps対応・パフォーマンス計測付き）"""
+        if not self.enable_hand_detection:
             self.performance_stats['hand_detection_time'] = 0.0
             return [], [], []
+            
+        hand_start_time = time.perf_counter()
+        
+        try:
+            if (self.enable_60fps_tracking and 
+                self.integrated_controller is not None and 
+                not self._60fps_system_failed):
+                # 60fps統合コントローラーを使用
+                try:
+                    hands_2d, hands_3d, tracked_hands = self._perform_60fps_hand_detection(depth_image)
+                    # 結果が有効かチェック
+                    if (isinstance(hands_2d, list) and isinstance(hands_3d, list) and 
+                        isinstance(tracked_hands, list)):
+                        # 成功時のみカウンターをリセット（空のリストも成功扱い）
+                        if self._60fps_failure_count > 0:
+                            logger.info(f"60fps system recovered after {self._60fps_failure_count} failures")
+                            self._60fps_failure_count = 0
+                        return hands_2d, hands_3d, tracked_hands
+                    else:
+                        self._handle_60fps_failure(f"Invalid results returned: hands_2d={type(hands_2d)}, hands_3d={type(hands_3d)}, tracked_hands={type(tracked_hands)}")
+                        return self._perform_legacy_hand_detection(depth_image)
+                except Exception as e:
+                    import traceback
+                    error_details = traceback.format_exc()
+                    self._handle_60fps_failure(f"60fps system error: {e}\nDetails:\n{error_details}")
+                    return self._perform_legacy_hand_detection(depth_image)
+            else:
+                # 従来の手検出システムを使用（フォールバック）
+                return self._perform_legacy_hand_detection(depth_image)
+                
+        except Exception as e:
+            logger.error(f"Hand detection error: {e}")
+            # エラー時は従来システムでフォールバック
+            try:
+                return self._perform_legacy_hand_detection(depth_image)
+            except Exception as fallback_error:
+                logger.error(f"Fallback detection also failed: {fallback_error}")
+                return [], [], []
+        finally:
+            self.performance_stats['hand_detection_time'] = (time.perf_counter() - hand_start_time) * 1000
+    
+    def _perform_60fps_hand_detection(self, depth_image: np.ndarray) -> Tuple[List, List, List]:
+        """60fps統合コントローラーを使用した手検出"""
+        # カラー画像取得
+        color_image = getattr(self, '_last_color_frame', None)
+        if color_image is None:
+            return [], [], []
+        
+        try:
+            # 60fps統合コントローラーでフレーム処理
+            events = self.integrated_controller.process_frame(
+                color_image,
+                depth_image,
+                time.perf_counter()
+            )
+            
+            # 現在の手情報取得
+            tracked_hands = self.integrated_controller.get_current_hands()
+            
+            # 型チェック
+            if not isinstance(events, list):
+                events = []
+            if not isinstance(tracked_hands, list):
+                tracked_hands = []
+            
+            # 従来システムとの互換性のため、結果を変換
+            hands_2d = []
+            hands_3d = []
+            
+            # 簡易変換（実際の2D/3D検出結果は内部で処理済み）
+            for hand in tracked_hands:
+                if hand is not None:
+                    hands_2d.append(hand)  # 簡易実装
+                    hands_3d.append(hand)  # 簡易実装
+            
+            # 統計情報の更新
+            if hasattr(self.integrated_controller, 'get_performance_stats'):
+                controller_stats = self.integrated_controller.get_performance_stats()
+                # 統計情報をメインの統計に反映
+                if 'hand_detection_time_ms' in controller_stats:
+                    self.performance_stats['hand_detection_time'] = controller_stats['hand_detection_time_ms']
+            
+            # ログ出力
+            if self.frame_count % 10 == 0 and tracked_hands:
+                logger.info(f"[60FPS-DETECT] Frame {self.frame_count}: "
+                           f"Events:{len(events)}, Tracked:{len(tracked_hands)}")
+            
+            return hands_2d, hands_3d, tracked_hands
+            
+        except Exception as e:
+            logger.error(f"60fps hand detection error: {e}")
+            import traceback
+            logger.debug(f"60fps hand detection traceback: {traceback.format_exc()}")
+            # エラー時は空のリストを返す
+            return [], [], []
+    
+    def _perform_legacy_hand_detection(self, depth_image: np.ndarray) -> Tuple[List, List, List]:
+        """従来の手検出システム（フォールバック用）"""
+        hands_2d, hands_3d, tracked_hands = self._process_hand_detection(depth_image)
+        
+        # ログ出力
+        if self.frame_count % 10 == 0 and any([hands_2d, hands_3d, tracked_hands]):
+            logger.info(f"[LEGACY-DETECT] Frame {self.frame_count}: "
+                       f"2D:{len(hands_2d)}, 3D:{len(hands_3d)}, Tracked:{len(tracked_hands)} "
+                       f"({self.performance_stats['hand_detection_time']:.1f}ms)")
+        
+        return hands_2d, hands_3d, tracked_hands
+    
+    def _handle_60fps_failure(self, error_message: str) -> None:
+        """60fpsシステムの失敗を処理"""
+        self._60fps_failure_count += 1
+        logger.warning(f"60fps system failure ({self._60fps_failure_count}/{self._max_60fps_failures}): {error_message}")
+        
+        if self._60fps_failure_count >= self._max_60fps_failures:
+            self._60fps_system_failed = True
+            self.enable_60fps_tracking = False  # 60fps追跡を完全無効化
+            logger.error(f"60fps system permanently disabled after {self._max_60fps_failures} consecutive failures. Falling back to legacy system.")
+            # システムをクリーンアップ
+            self.integrated_controller = None
+            self.tracker_60fps = None
+            self.event_stream = None
     
     def _save_hand_detection_results(self, hands_2d: List, hands_3d: List, tracked_hands: List) -> None:
         """手検出結果を保存"""
+        # 型チェック
+        if not isinstance(hands_2d, list):
+            hands_2d = []
+        if not isinstance(hands_3d, list):
+            hands_3d = []
+        if not isinstance(tracked_hands, list):
+            tracked_hands = []
+            
         self.current_hands_2d = hands_2d
         self.current_hands_3d = hands_3d
         self.current_tracked_hands = tracked_hands
@@ -1665,15 +1909,20 @@ class FullPipelineViewer(DualViewer):
         # Update history per hand
         active_ids = set()
         for th in tracked_hands:
-            hid = th.id
-            active_ids.add(hid)
-            if hid not in self._hand_position_history:
-                self._hand_position_history[hid] = []
-            if th.position is not None:
-                self._hand_position_history[hid].append(np.array(th.position, dtype=float))
-            # Keep last 3 positions max
-            if len(self._hand_position_history[hid]) > 3:
-                self._hand_position_history[hid].pop(0)
+            try:
+                if hasattr(th, 'id') and hasattr(th, 'position'):
+                    hid = th.id
+                    active_ids.add(hid)
+                    if hid not in self._hand_position_history:
+                        self._hand_position_history[hid] = []
+                    if th.position is not None:
+                        self._hand_position_history[hid].append(np.array(th.position, dtype=float))
+                    # Keep last 3 positions max
+                    if len(self._hand_position_history[hid]) > 3:
+                        self._hand_position_history[hid].pop(0)
+            except Exception as e:
+                logger.debug(f"Error processing hand position history: {e}")
+                continue
 
         # Remove stale hands from history
         stale_ids = [hid for hid in self._hand_position_history.keys() if hid not in active_ids]
@@ -2512,6 +2761,7 @@ def create_argument_parser() -> argparse.ArgumentParser:
     )
     
     add_basic_arguments(parser)
+    add_60fps_tracking_arguments(parser)
     add_collision_arguments(parser)
     add_audio_arguments(parser)
     add_detection_arguments(parser)
@@ -2527,14 +2777,23 @@ def create_help_epilog() -> str:
     """ヘルプのエピローグを作成"""
     return """
 使用例:
-    python demo_collision_detection.py                    # デフォルト設定（低解像度424x240）
-    python demo_collision_detection.py --force-high-resolution # 高解像度848x480（低FPS注意）
-    python demo_collision_detection.py --depth-width 640 --depth-height 360 # カスタム解像度
-    python demo_collision_detection.py --no-collision     # 衝突検出無効
-    python demo_collision_detection.py --no-mesh          # メッシュ生成無効
-    python demo_collision_detection.py --no-audio         # 音響合成無効
-    python demo_collision_detection.py --sphere-radius 0.08 # 球半径8cm
-    python demo_collision_detection.py --audio-instrument BELL # ベル楽器
+    python demo_60fps_tracking_fixed.py                   # デフォルト設定（60fps手追跡）
+    python demo_60fps_tracking_fixed.py --no-60fps-tracking # 従来手追跡を使用
+    python demo_60fps_tracking_fixed.py --target-fps 120  # 120fps目標設定
+    python demo_60fps_tracking_fixed.py --mediapipe-fps 30 # MediaPipe30fps実行
+    python demo_60fps_tracking_fixed.py --headless        # ヘッドレスモード
+    python demo_60fps_tracking_fixed.py --no-collision    # 衝突検出無効
+    python demo_60fps_tracking_fixed.py --no-mesh         # メッシュ生成無効
+    python demo_60fps_tracking_fixed.py --no-audio        # 音響合成無効
+    python demo_60fps_tracking_fixed.py --sphere-radius 0.08 # 球半径8cm
+    python demo_60fps_tracking_fixed.py --audio-instrument BELL # ベル楽器
+
+60fps手追跡システムの特徴:
+    ⚡ 高速追跡: 60fpsでのリアルタイム手追跡
+    🎯 予測機能: Kalmanフィルタによる手位置予測
+    📐 補間機能: MediaPipe実行間の滑らかな手位置補間
+    🔄 統一イベント: 衝突・音響イベントの統合管理
+    📊 パフォーマンス監視: リアルタイム統計情報
 
 操作方法:
     RGB Window:
@@ -2548,7 +2807,7 @@ def create_help_epilog() -> str:
         V: 衝突可視化 ON/OFF
         N: メッシュ強制更新
         +/-: 球半径調整
-        P: パフォーマンス統計表示
+        P: パフォーマンス統計表示（60fps統計含む）
         
         A: 音響合成 ON/OFF
         S: 音階切り替え
@@ -2569,6 +2828,16 @@ def add_basic_arguments(parser: argparse.ArgumentParser):
     parser.add_argument('--no-hand-detection', action='store_true', help='手検出を無効にする')
     parser.add_argument('--no-tracking', action='store_true', help='トラッキングを無効にする')
     parser.add_argument('--gpu-mediapipe', action='store_true', help='MediaPipeでGPUを使用')
+
+
+def add_60fps_tracking_arguments(parser: argparse.ArgumentParser):
+    """60fps手追跡関連の引数を追加"""
+    parser.add_argument('--no-60fps-tracking', action='store_true', help='60fps手追跡を無効にする（従来方式を使用）')
+    parser.add_argument('--target-fps', type=int, default=60, help='目標FPS（デフォルト: 60）')
+    parser.add_argument('--mediapipe-fps', type=int, default=15, help='MediaPipe実行FPS（デフォルト: 15）')
+    parser.add_argument('--max-hands', type=int, default=4, help='最大同時追跡手数（デフォルト: 4）')
+    parser.add_argument('--no-prediction', action='store_true', help='手位置予測を無効にする')
+    parser.add_argument('--no-interpolation', action='store_true', help='手位置補間を無効にする')
 
 
 def add_collision_arguments(parser: argparse.ArgumentParser):
@@ -2710,6 +2979,17 @@ def display_configuration(args, depth_width: Optional[int], depth_height: Option
         print(f"  - ポリフォニー: {args.audio_polyphony}")
         print(f"  - 音量: {args.audio_volume:.1f}")
     
+    # 60fps手追跡システム情報
+    print(f"🚀 60fps手追跡: {'無効（従来方式）' if args.no_60fps_tracking else '有効'}")
+    if not args.no_60fps_tracking:
+        print(f"  - 目標FPS: {args.target_fps}fps")
+        print(f"  - MediaPipe実行FPS: {args.mediapipe_fps}fps")
+        print(f"  - 最大同時追跡手数: {args.max_hands}")
+        print(f"  - 手位置予測: {'無効' if args.no_prediction else '有効'}")
+        print(f"  - 手位置補間: {'無効' if args.no_interpolation else '有効'}")
+        fps_improvement = f"+{args.target_fps - 30}fps" if args.target_fps > 30 else "高精度追跡"
+        print(f"  - 期待効果: {fps_improvement}")
+    
     # ヘッドレスモード情報
     if args.headless:
         print(f"🖥️  ヘッドレスモード: 有効（GUI無効化でFPS向上）")
@@ -2792,7 +3072,7 @@ def apply_high_resolution_optimizations(width: Optional[int], height: Optional[i
 
 
 def create_viewer(args, audio_scale: ScaleType, audio_instrument: InstrumentType) -> FullPipelineViewer:
-    """ビューワーを作成"""
+    """ビューワーを作成（60fps対応）"""
     return FullPipelineViewer(
         enable_filter=not args.no_filter,
         enable_hand_detection=not args.no_hand_detection,
@@ -2815,7 +3095,14 @@ def create_viewer(args, audio_scale: ScaleType, audio_instrument: InstrumentType
         max_mesh_skip_frames=args.max_mesh_skip,
         headless_mode=args.headless,
         headless_duration=args.headless_duration,
-        pure_headless_mode=args.headless_pure
+        pure_headless_mode=args.headless_pure,
+        # 60fps手追跡システム設定
+        enable_60fps_tracking=not args.no_60fps_tracking,
+        target_fps=args.target_fps,
+        mediapipe_detection_fps=args.mediapipe_fps,
+        max_concurrent_hands=args.max_hands,
+        enable_prediction=not args.no_prediction,
+        enable_interpolation=not args.no_interpolation
     )
 
 

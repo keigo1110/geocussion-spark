@@ -23,7 +23,11 @@ from .sphere_tri import point_triangle_distance
 from .distance import point_triangle_distance_vectorized  # Numba最適化された距離計算
 from ..data_types import SearchStrategy, SearchResult
 from ..config import get_config
-from .optimization import optimize_array_operations, memory_efficient_context
+from .optimization import optimize_array_operations
+from ..utils.cache_manager import get_cache_manager
+from .. import get_logger
+
+logger = get_logger(__name__)
 
 
 class CollisionSearcher:
@@ -60,7 +64,10 @@ class CollisionSearcher:
         self.enable_caching = enable_caching if enable_caching is not None else True  # デフォルトTrue
         self.max_cache_size = max_cache_size if max_cache_size is not None else collision_config.max_cache_size
         
-        # キャッシュ
+        # 拡張キャッシュマネージャーを使用
+        self.cache_manager = get_cache_manager('collision_search')
+        
+        # 従来のキャッシュ（統計目的で残す）
         self.search_cache = {}  # {(x, y, z, radius): SearchResult}
         self.cache_hits = 0
         self.cache_misses = 0
@@ -174,7 +181,15 @@ class CollisionSearcher:
         """単一点の検索"""
         start_time = time.perf_counter()
         
-        # キャッシュチェック
+        # 拡張キャッシュからの取得試行
+        if self.enable_caching and self.cache_manager:
+            cache_key = self._make_cache_key_string(point, radius)
+            cached_result = self.cache_manager.get(cache_key)
+            if cached_result is not None:
+                self.cache_hits += 1
+                return cached_result
+        
+        # 従来のキャッシュチェック（移行期間用）
         if self.enable_caching:
             cache_key = self._make_cache_key(point, radius)
             cached_result = self.search_cache.get(cache_key)
@@ -205,7 +220,14 @@ class CollisionSearcher:
             num_nodes_visited=nodes_visited
         )
         
-        # キャッシュに保存
+        # 拡張キャッシュに保存
+        if self.enable_caching and self.cache_manager:
+            cache_key_str = self._make_cache_key_string(point, radius)
+            # 結果サイズを推定
+            result_size = self._estimate_result_size(result)
+            self.cache_manager.put(cache_key_str, result, result_size)
+        
+        # 従来のキャッシュに保存
         if self.enable_caching:
             self._cache_result(cache_key, result)
         
@@ -279,7 +301,26 @@ class CollisionSearcher:
         quantized_point = (point * 1000).astype(int)
         quantized_radius = int(radius * 1000)
         return (quantized_point[0], quantized_point[1], quantized_point[2], quantized_radius)
-    
+
+    def _make_cache_key_string(self, point: np.ndarray, radius: float) -> str:
+        """文字列キャッシュキーを生成（拡張キャッシュ用）"""
+        # 1mm精度で量子化
+        quantized_point = (point * 1000).astype(int)
+        quantized_radius = int(radius * 1000)
+        return f"search_{quantized_point[0]}_{quantized_point[1]}_{quantized_point[2]}_{quantized_radius}"
+
+    def _estimate_result_size(self, result: SearchResult) -> int:
+        """SearchResultのメモリサイズを推定"""
+        if result is None:
+            return 0
+        
+        # 基本サイズ + 三角形インデックス配列 + 距離配列
+        base_size = 100  # 基本オブジェクトサイズ
+        indices_size = len(result.triangle_indices) * 4  # int32想定
+        distances_size = len(result.distances) * 8  # float64想定
+        
+        return base_size + indices_size + distances_size
+
     def _cache_result(self, cache_key: Tuple, result: SearchResult):
         """結果をキャッシュに保存"""
         if len(self.search_cache) >= self.max_cache_size:
@@ -322,6 +363,10 @@ class CollisionSearcher:
     
     def clear_cache(self):
         """キャッシュをクリア"""
+        if self.cache_manager:
+            self.cache_manager.clear()
+        
+        # 従来のキャッシュもクリア
         self.search_cache.clear()
         self.cache_hits = 0
         self.cache_misses = 0

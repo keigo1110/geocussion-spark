@@ -137,7 +137,11 @@ class DepthFilter:
         self.max_valid_depth = max_valid_depth
         
         # CUDA & パフォーマンス設定
-        self.use_cuda = use_cuda and HAS_CUDA
+        # Enable CUDA only if OpenCV has required bilateralFilter implementation
+        cuda_available = use_cuda and HAS_CUDA and hasattr(cv2.cuda, "bilateralFilter")
+        if use_cuda and HAS_CUDA and not cuda_available:
+            logger.info("cv2.cuda.bilateralFilter not found – falling back to CPU version of DepthFilter")
+        self.use_cuda = cuda_available
         self.enable_multiscale = enable_multiscale
         self.enable_async = enable_async
         

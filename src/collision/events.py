@@ -89,15 +89,19 @@ class CollisionEvent:
 class CollisionEventQueue:
     """衝突イベントキューマネージャー"""
     
-    def __init__(self, max_queue_size: int = 1000):
+    def __init__(self, max_queue_size: int = 1000, debounce_ms: float = 80.0):
         self.max_queue_size = max_queue_size
+        self.debounce_ms = debounce_ms  # 打楽器的な連打抑制時間(ms)
         self.event_queue = deque(maxlen=max_queue_size)
-        self.active_events = {}
+        self.active_events = {}  # hand_id -> CollisionEvent
+        self.last_impact_times = {}  # hand_id -> timestamp (sec)
         self.event_counter = 0
         self.stats = {
             'total_events_created': 0,
             'collisions_detected': 0,
-            'queue_overflows': 0
+            'queue_overflows': 0,
+            'impacts_created': 0,
+            'impacts_debounced': 0
         }
     
     @optimize_array_operations
@@ -108,7 +112,9 @@ class CollisionEventQueue:
         hand_position: np.ndarray,
         hand_velocity: Optional[np.ndarray] = None
     ) -> Optional[CollisionEvent]:
-        """衝突イベントを作成（メモリ最適化版）"""
+        """衝突イベントを作成（一打＝一音対応版）"""
+        current_time = time.perf_counter()
+        
         if not collision_info.has_collision:
             return self._end_active_event(hand_id)
         
@@ -116,6 +122,25 @@ class CollisionEventQueue:
         if primary_contact is None:
             return None
         
+        # 既存のアクティブイベントがある場合
+        if hand_id in self.active_events:
+            return self._update_active_event(hand_id, collision_info, hand_position, hand_velocity, current_time)
+        
+        # 新規衝突の場合：デバウンス時間チェック
+        if self._is_debounced(hand_id, current_time):
+            self.stats['impacts_debounced'] += 1
+            return None
+        
+        # 手ID正規化（重複手IDの統合）
+        normalized_hand_id = self._normalize_hand_id(hand_id, primary_contact.position)
+        if normalized_hand_id != hand_id:
+            # 正規化されたIDでデバウンスチェックを再実行
+            if self._is_debounced(normalized_hand_id, current_time):
+                self.stats['impacts_debounced'] += 1
+                return None
+            hand_id = normalized_hand_id
+        
+        # 新規IMPACT イベントを作成
         velocity = np.linalg.norm(hand_velocity) if hand_velocity is not None else 0.0
         intensity = self._calculate_intensity(collision_info, velocity)
         
@@ -130,8 +155,8 @@ class CollisionEventQueue:
                 
                 event = CollisionEvent(
                     event_id=f"collision_{self.event_counter:06d}",
-                    event_type=EventType.COLLISION_START,
-                    timestamp=time.perf_counter(),
+                    event_type=EventType.COLLISION_IMPACT,  # 新規衝突は IMPACT
+                    timestamp=current_time,
                     duration_ms=0.0,
                     
                     # 配列参照のコピーを最小化
@@ -155,9 +180,102 @@ class CollisionEventQueue:
         
         self.event_counter += 1
         self.active_events[hand_id] = event
+        self.last_impact_times[hand_id] = current_time
+        self.stats['impacts_created'] += 1
         self._add_to_queue(event)
         
         return event
+    
+    def _normalize_hand_id(self, hand_id: str, contact_position: np.ndarray) -> str:
+        """
+        手IDを正規化して重複手IDを統合
+        
+        Args:
+            hand_id: 元の手ID
+            contact_position: 接触位置
+            
+        Returns:
+            正規化された手ID
+        """
+        try:
+            # hand_id の形式: "left_centerX_centerY_timestamp" or "right_centerX_centerY_timestamp"
+            parts = hand_id.split('_')
+            if len(parts) >= 2:
+                handedness = parts[0]  # "left" or "right"
+                
+                # 接触位置を基にした統一ID生成（10cm単位で離散化）
+                pos_x = int(contact_position[0] * 10)  # 10cm単位
+                pos_z = int(contact_position[2] * 10)  # Z軸も考慮
+                
+                normalized_id = f"{handedness}_pos_{pos_x}_{pos_z}"
+                return normalized_id
+            
+        except (IndexError, ValueError, AttributeError):
+            # ID解析失敗時は元のIDを返す
+            pass
+        
+        return hand_id
+    
+    def _is_debounced(self, hand_id: str, current_time: float) -> bool:
+        """デバウンス時間内かどうかを判定"""
+        if hand_id not in self.last_impact_times:
+            return False
+        
+        last_impact = self.last_impact_times[hand_id]
+        elapsed_ms = (current_time - last_impact) * 1000.0
+        return elapsed_ms < self.debounce_ms
+    
+    def _update_active_event(
+        self, 
+        hand_id: str, 
+        collision_info: CollisionInfo, 
+        hand_position: np.ndarray,
+        hand_velocity: Optional[np.ndarray],
+        current_time: float
+    ) -> Optional[CollisionEvent]:
+        """アクティブイベントを更新（CONTINUE イベント生成）"""
+        active_event = self.active_events[hand_id]
+        
+        # 継続イベントを作成
+        primary_contact = collision_info.closest_point
+        if primary_contact is None:
+            return None
+        
+        velocity = np.linalg.norm(hand_velocity) if hand_velocity is not None else 0.0
+        
+        continue_event = CollisionEvent(
+            event_id=f"collision_{self.event_counter:06d}",
+            event_type=EventType.COLLISION_CONTINUE,
+            timestamp=current_time,
+            duration_ms=(current_time - active_event.timestamp) * 1000.0,
+            
+            # 位置情報は更新
+            contact_position=primary_contact.position.copy(),
+            hand_position=hand_position.copy(),
+            surface_normal=primary_contact.normal.copy(),
+            
+            # 強度は初期値を維持（音量は最初のIMPACTで決定）
+            intensity=active_event.intensity,
+            velocity=velocity,
+            penetration_depth=primary_contact.depth,
+            contact_area=self._estimate_contact_area(collision_info),
+            
+            # 音響パラメータは初期値を維持
+            pitch_hint=active_event.pitch_hint,
+            timbre_hint=active_event.timbre_hint,
+            spatial_position=active_event.spatial_position.copy(),
+            
+            triangle_index=primary_contact.triangle_index,
+            hand_id=hand_id,
+            collision_type=primary_contact.collision_type
+        )
+        
+        self.event_counter += 1
+        # アクティブイベントを更新（最新の継続情報で置き換え）
+        self.active_events[hand_id] = continue_event
+        self._add_to_queue(continue_event)
+        
+        return continue_event
     
     def _calculate_intensity(self, collision_info: CollisionInfo, velocity: float) -> CollisionIntensity:
         """衝突強度を計算"""
@@ -195,11 +313,13 @@ class CollisionEventQueue:
         if active_event is None:
             return None
         
+        current_time = time.perf_counter()
+        
         end_event = CollisionEvent(
             event_id=f"collision_{self.event_counter:06d}",
             event_type=EventType.COLLISION_END,
-            timestamp=time.perf_counter(),
-            duration_ms=(time.perf_counter() - active_event.timestamp) * 1000,
+            timestamp=current_time,
+            duration_ms=(current_time - active_event.timestamp) * 1000,
             
             contact_position=active_event.contact_position,
             hand_position=active_event.hand_position,
@@ -220,6 +340,8 @@ class CollisionEventQueue:
         )
         
         self.event_counter += 1
+        # END イベント後にlast_impact_timeを更新（再衝突のデバウンス対策）
+        self.last_impact_times[hand_id] = current_time
         self._add_to_queue(end_event)
         return end_event
     
