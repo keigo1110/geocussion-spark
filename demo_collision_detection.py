@@ -308,6 +308,15 @@ class FullPipelineViewer(DualViewer):
         # 親クラス初期化
         super().__init__(**kwargs)
         
+        # ジオメトリ累積監視用カウンター
+        self._geometry_monitor = {
+            'frame_count': 0,
+            'last_geometry_count': 0,
+            'max_geometry_count': 0,
+            'cleanup_threshold': 10000,    # この数を超えたら強制クリーンアップ (急激な累積検出用)
+            'last_cleanup_frame': 0
+        }
+        
         # コンポーネントの初期化
         self._initialize_components()
         
@@ -1201,23 +1210,32 @@ class FullPipelineViewer(DualViewer):
         )
     
     def _update_mesh_visualization(self, mesh: Any) -> None:
+        logger.debug("[MESH-DEBUG] _update_mesh_visualization called")
         """メッシュ可視化を更新 (geometry re-use to reduce Open3D queue pressure)"""
         if self.vis is None:
+            logger.debug("[MESH-DEBUG] vis is None, returning")
             return
 
         # -------------------------------------------------------------
         # 1) 初回生成 – create geometry objects and add to visualizer
         # -------------------------------------------------------------
         if not hasattr(self, "_mesh_vis_objs"):
+            logger.debug("[MESH-DEBUG] Initializing _mesh_vis_objs")
             self._mesh_vis_objs = {}
 
         o3d_mesh = self._mesh_vis_objs.get("tri_mesh")  # type: ignore[attr-defined]
         wireframe = self._mesh_vis_objs.get("wire")     # type: ignore[attr-defined]
 
+        logger.debug(f"[MESH-DEBUG] o3d_mesh: {o3d_mesh is not None}, wireframe: {wireframe is not None}")
+        logger.debug(f"[MESH-DEBUG] _mesh_vis_objs keys: {list(self._mesh_vis_objs.keys())}")
+        if wireframe is not None:
+            logger.debug(f"[MESH-DEBUG] wireframe object id: {id(wireframe)}")
+
         import numpy as _np
         from open3d import geometry as _o3g, utility as _o3u
 
         if o3d_mesh is None:
+            logger.debug("[MESH-DEBUG] Initial creation - o3d_mesh is None")
             # 初回 – create mesh and wireframe, add once
             o3d_mesh = _o3g.TriangleMesh()
             o3d_mesh.vertices = _o3u.Vector3dVector(mesh.vertices.copy())
@@ -1230,54 +1248,62 @@ class FullPipelineViewer(DualViewer):
 
             # Faces hidden: we skip adding o3d_mesh (solid) and add only wireframe
             self.vis.add_geometry(wireframe, reset_bounding_box=False)
+            logger.debug("[MESH-DEBUG] Initial wireframe added to visualizer")
 
             self._mesh_vis_objs["wire"] = wireframe
+            self._mesh_vis_objs["tri_mesh"] = o3d_mesh  # CRITICAL: Store the o3d_mesh too!
         else:
             # ---------------------------------------------------------
             # 2) 更新 – 既存 geometry の頂点 / 三角形を最新メッシュに差し替え
             # ---------------------------------------------------------
             if wireframe is None:
+                logger.warning("[MESH-DEBUG] wireframe is None - THIS IS THE BUG! Creating new wireframe and adding to scene")
                 wireframe = _o3g.LineSet.create_from_triangle_mesh(o3d_mesh)
                 wireframe.paint_uniform_color([0.3, 0.3, 0.7])
                 self.vis.add_geometry(wireframe, reset_bounding_box=False)
                 self._mesh_vis_objs["wire"] = wireframe
+            else:
+                logger.debug("[MESH-DEBUG] wireframe exists - updating in-place")
 
             try:
                 o3d_mesh.vertices = _o3u.Vector3dVector(mesh.vertices.copy())
                 o3d_mesh.triangles = _o3u.Vector3iVector(mesh.triangles.copy())
                 o3d_mesh.compute_vertex_normals()
 
-                # ----- Update wireframe in-place to prevent geometry accumulation -----
-                try:
-                    temp_wire = _o3g.LineSet.create_from_triangle_mesh(
-                        _o3g.TriangleMesh(
-                            vertices=_o3u.Vector3dVector(mesh.vertices.copy()),
-                            triangles=_o3u.Vector3iVector(mesh.triangles.copy()),
-                        )
-                    )
+                # ------------------------------------------------------
+                # Efficient wireframe update:
+                #  • 直接 numpy でエッジ (2-tuple) を再計算
+                #  • LineSet の points / lines を置換
+                #  • 一切の add/remove 呼び出しを行わない
+                # ------------------------------------------------------
 
-                    # Replace the vertex/edge data of the existing wireframe instead of
-                    # removing and adding a brand-new object every time. This avoids the
-                    # gradual increase of geometry objects in the scene and keeps the
-                    # viewer responsive.
-                    wireframe.points = temp_wire.points
-                    wireframe.lines = temp_wire.lines
+                verts_np = _np.asarray(mesh.vertices)  # (N,3)
+                tris_np  = _np.asarray(mesh.triangles, dtype=_np.int64)  # (M,3)
 
-                    # Ensure uniform colour is preserved after the update
-                    if len(wireframe.lines) > 0:
-                        blue = _np.tile([0.3, 0.3, 0.7], (len(wireframe.lines), 1))
-                        wireframe.colors = _o3u.Vector3dVector(blue)
+                # Triangle → edge (3*M, 2) then unique 化
+                edges = _np.concatenate([
+                    tris_np[:, [0, 1]],
+                    tris_np[:, [1, 2]],
+                    tris_np[:, [2, 0]],
+                ], axis=0)
 
-                    # Register the change with the visualiser
-                    self.vis.update_geometry(wireframe)
+                # 重複辺を除去 (各辺の index を昇順ソートして set 化)
+                edges_sorted = _np.sort(edges, axis=1)
+                edges_unique = _np.unique(edges_sorted, axis=0)
 
-                    # Keep reference up-to-date
-                    self._mesh_vis_objs["wire"] = wireframe
-                except Exception as exc:  # pylint: disable=broad-except
-                    logger.debug("Wireframe in-place update failed: %s", exc)
+                # Open3D LineSet update
+                wireframe.points = _o3u.Vector3dVector(verts_np.copy())
+                wireframe.lines  = _o3u.Vector2iVector(edges_unique)
 
+                # Reapply uniform colour (エッジ数が変わる可能性がある)
+                if edges_unique.shape[0] > 0:
+                    blue = _np.tile([0.3, 0.3, 0.7], (edges_unique.shape[0], 1))
+                    wireframe.colors = _o3u.Vector3dVector(blue)
+
+                self.vis.update_geometry(wireframe)
+                self._mesh_vis_objs["wire"] = wireframe
             except Exception as exc:  # pylint: disable=broad-except
-                logger.debug("Mesh visualization update failed: %s", exc)
+                logger.debug("Wireframe in-place update failed: %s", exc)
 
         # Request redraw (non-blocking)
         try:
@@ -1287,101 +1313,184 @@ class FullPipelineViewer(DualViewer):
             pass
     
     def _update_collision_visualization(self) -> None:
-        """衝突可視化を更新"""
+        """衝突可視化を更新 - プール方式でジオメトリ累積防止"""
         if not hasattr(self, 'vis') or self.vis is None:
             return
         
-        # 既存の衝突ジオメトリを削除
-        for geom in self.collision_geometries:
-            self.vis.remove_geometry(geom, reset_bounding_box=False)
-        self.collision_geometries.clear()
-        
         if not self.enable_collision_visualization:
+            # 可視化無効時は全ての要素を遠方に退避
+            self._hide_all_collision_elements()
             return
         
         try:
-            # 接触点を可視化
+            # 接触点を可視化（プール方式）
             self._visualize_contact_points()
             
-            # 衝突球を可視化
+            # 衝突球を可視化（プール方式）
             self._visualize_collision_spheres()
         
         except Exception as e:
             logger.error(f"衝突可視化エラー: {e}")
+
+    def _hide_all_collision_elements(self) -> None:
+        """すべての衝突可視化要素を遠方に退避"""
+        if self.vis is None:
+            return
+            
+        try:
+            # 接触点プールを遠方に退避
+            if hasattr(self, '_contact_pool'):
+                far = np.array([1e6, 1e6, 1e6])
+                for sphere, line in self._contact_pool:
+                    sphere.translate(far - np.asarray(sphere.vertices).mean(axis=0), relative=True)
+                    line.points = o3d.utility.Vector3dVector([far, far + np.array([0, 0.05, 0])])
+                    self.vis.update_geometry(sphere)
+                    self.vis.update_geometry(line)
+            
+            # 衝突球プールを遠方に退避
+            if hasattr(self, '_sphere_pool'):
+                far_position = np.array([1e6, 1e6, 1e6])
+                for pool_entry in self._sphere_pool.values():
+                    wire = pool_entry['wire']
+                    current_pos = pool_entry['position']
+                    if not np.allclose(current_pos, far_position, atol=1e5):
+                        wire.translate(far_position - current_pos, relative=True)
+                        pool_entry['position'] = far_position
+                        self.vis.update_geometry(wire)
+                        
+        except Exception as e:
+            logger.debug(f"Collision element hiding failed: {e}")
     
     def _visualize_contact_points(self) -> None:
-        """接触点を可視化"""
+        """接触点を可視化 – 1 度生成したジオメトリを再利用してメモリ増加を防ぐ"""
         if self.vis is None:
             return
-        for contact in self.current_collision_points:
-            # ContactPointオブジェクトから直接アクセス
-            position = contact.position
-            normal = contact.normal
-            
-            # 接触点（球）
-            contact_sphere = o3d.geometry.TriangleMesh.create_sphere(radius=0.01)
-            contact_sphere.translate(position)
-            contact_sphere.paint_uniform_color([1.0, 0.0, 0.0])  # 赤色
-            
-            # 法線ベクトル（線分）
-            normal_end = position + normal * 0.05
-            normal_line = o3d.geometry.LineSet()
-            normal_line.points = o3d.utility.Vector3dVector([position, normal_end])
-            normal_line.lines = o3d.utility.Vector2iVector([[0, 1]])
-            normal_line.paint_uniform_color([1.0, 1.0, 0.0])  # 黄色
-            
-            self.vis.add_geometry(contact_sphere, reset_bounding_box=False)
-            self.vis.add_geometry(normal_line, reset_bounding_box=False)
-            
-            self.collision_geometries.extend([contact_sphere, normal_line])
+
+        # プール初期化
+        if not hasattr(self, "_contact_pool"):
+            # 各要素は (sphere_mesh, line_set)
+            self._contact_pool = []  # type: ignore[attr-defined]
+
+        required = len(self.current_collision_points)
+
+        # プール拡張: 不足分を生成して add_geometry (1 回のみ)
+        while len(self._contact_pool) < required:
+            sphere = o3d.geometry.TriangleMesh.create_sphere(radius=0.01)
+            sphere.paint_uniform_color([1.0, 0.0, 0.0])
+
+            line = o3d.geometry.LineSet()
+            line.points = o3d.utility.Vector3dVector([[0, 0, 0], [0, 0.05, 0]])
+            line.lines = o3d.utility.Vector2iVector([[0, 1]])
+            line.paint_uniform_color([1.0, 1.0, 0.0])
+
+            self.vis.add_geometry(sphere, reset_bounding_box=False)
+            self.vis.add_geometry(line, reset_bounding_box=False)
+
+            self._contact_pool.append((sphere, line))
+
+        # 更新
+        for idx, contact in enumerate(self.current_collision_points):
+            sphere, line = self._contact_pool[idx]
+
+            # 座標更新 (translate relative でジオメトリ再利用)
+            old_center = np.asarray(sphere.vertices).mean(axis=0)
+            delta = contact.position - old_center
+            sphere.translate(delta, relative=True)
+
+            # 法線更新
+            normal_end = contact.position + contact.normal * 0.05
+            line.points = o3d.utility.Vector3dVector([contact.position, normal_end])
+
+            # renderer へ更新通知
+            self.vis.update_geometry(sphere)
+            self.vis.update_geometry(line)
+
+        # 使わなくなったプール要素は遠方へ退避して "非表示" に (削除しない)
+        hide_start = len(self.current_collision_points)
+        for idx in range(hide_start, len(self._contact_pool)):
+            sphere, line = self._contact_pool[idx]
+            far = np.array([1e6, 1e6, 1e6])
+            sphere.translate(far - np.asarray(sphere.vertices).mean(axis=0), relative=True)
+            line.points = o3d.utility.Vector3dVector([far, far + np.array([0, 0.05, 0])])
+            self.vis.update_geometry(sphere)
+            self.vis.update_geometry(line)
     
     def _visualize_collision_spheres(self) -> None:
-        """衝突球を可視化"""
+        """衝突球を可視化 - プール方式でジオメトリ累積を防止"""
         if self.vis is None:
             return
 
-        # Persistent wireframes representing the collision spheres around each tracked hand.
-        if not hasattr(self, "_hand_wireframes"):
-            self._hand_wireframes = []  # type: ignore[attr-defined]
+        # 衝突球プール初期化 (hand_id -> {'wire': LineSet, 'radius': float, 'position': np.array})
+        if not hasattr(self, "_sphere_pool"):
+            self._sphere_pool = {}  # type: ignore[attr-defined]
 
+        current_hand_ids = {hand.id for hand in self.current_tracked_hands if hand.position is not None}
+        
         # ------------------------------------------------------------------
-        # 1) 追加: 新しい手が検出された分だけワイヤーフレームを生成
+        # 1) 新しい手ID用の球を生成（プールに追加）
         # ------------------------------------------------------------------
-        while len(self._hand_wireframes) < len(self.current_tracked_hands):
+        for hand in self.current_tracked_hands:
+            if hand.position is None or hand.id in self._sphere_pool:
+                continue
+                
+            # 新しい手用の衝突球を生成
             sphere_mesh = o3d.geometry.TriangleMesh.create_sphere(radius=self.sphere_radius)
             wire = o3d.geometry.LineSet.create_from_triangle_mesh(sphere_mesh)
             wire.paint_uniform_color([0.0, 0.8, 0.0])
+            
+            # 初期位置に配置
+            wire.translate(hand.position, relative=False)
+            
             self.vis.add_geometry(wire, reset_bounding_box=False)
-            self._hand_wireframes.append(wire)
+            
+            self._sphere_pool[hand.id] = {
+                'wire': wire,
+                'radius': self.sphere_radius,
+                'position': np.array(hand.position)
+            }
 
         # ------------------------------------------------------------------
-        # 2) 更新: 既存ワイヤーフレームの位置を手の現在位置へ移動
+        # 2) 既存の球を更新（位置・半径変更）
         # ------------------------------------------------------------------
-        for idx, tracked in enumerate(self.current_tracked_hands):
-            if tracked.position is None or idx >= len(self._hand_wireframes):
+        for hand in self.current_tracked_hands:
+            if hand.position is None or hand.id not in self._sphere_pool:
                 continue
-            wire = self._hand_wireframes[idx]
-            try:
-                verts = np.asarray(wire.points)
-                if verts.size == 0:
-                    continue
-                center_old = verts.mean(axis=0)
-                translation = np.array(tracked.position) - center_old
+                
+            pool_entry = self._sphere_pool[hand.id]
+            wire = pool_entry['wire']
+            old_position = pool_entry['position']
+            old_radius = pool_entry['radius']
+            
+            # 位置更新
+            if not np.allclose(old_position, hand.position, atol=1e-6):
+                translation = np.array(hand.position) - old_position
                 wire.translate(translation, relative=True)
-                self.vis.update_geometry(wire)
-            except Exception as exc:  # pylint: disable=broad-except
-                logger.debug("Failed to update hand wireframe: %s", exc)
+                pool_entry['position'] = np.array(hand.position)
+            
+            # 半径更新（必要な場合のみ）
+            if abs(old_radius - self.sphere_radius) > 1e-6:
+                scale_factor = self.sphere_radius / old_radius
+                center = pool_entry['position']
+                wire.translate(-center, relative=True)  # 原点へ移動
+                wire.scale(scale_factor, center=[0, 0, 0])  # スケール
+                wire.translate(center, relative=True)   # 元の位置へ戻す
+                pool_entry['radius'] = self.sphere_radius
+            
+            self.vis.update_geometry(wire)
 
         # ------------------------------------------------------------------
-        # 3) 削除: 消えた手に対応する余分なワイヤーフレームを除去
+        # 3) 使われなくなった手IDの球を遠方へ退避（削除しない）
         # ------------------------------------------------------------------
-        if len(self._hand_wireframes) > len(self.current_tracked_hands):
-            for i in range(len(self.current_tracked_hands), len(self._hand_wireframes)):
-                try:
-                    self.vis.remove_geometry(self._hand_wireframes[i], reset_bounding_box=False)
-                except Exception:
-                    pass
-            self._hand_wireframes = self._hand_wireframes[: len(self.current_tracked_hands)]
+        for hand_id, pool_entry in self._sphere_pool.items():
+            if hand_id not in current_hand_ids:
+                wire = pool_entry['wire']
+                far_position = np.array([1e6, 1e6, 1e6])
+                current_pos = pool_entry['position']
+                
+                if not np.allclose(current_pos, far_position, atol=1e5):
+                    wire.translate(far_position - current_pos, relative=True)
+                    pool_entry['position'] = far_position
+                    self.vis.update_geometry(wire)
     
     def _update_visualization(self) -> None:
         """可視化全体を更新"""
@@ -1615,6 +1724,9 @@ class FullPipelineViewer(DualViewer):
         # ------------------------------------------------------------------
         # Periodic memory cleanup to prevent long-run memory buildup (M-LEAK-001)
         # ------------------------------------------------------------------
+        # ジオメトリ累積監視
+        self._monitor_geometry_accumulation()
+        
         try:
             if self.frame_count % 300 == 0:  # every ~10s at 30 FPS
                 import gc
@@ -1946,7 +2058,7 @@ class FullPipelineViewer(DualViewer):
             points_3d,
             tracked_hands,
             hands_present_override=any_hands_present,
-            force=force_update,
+            force=True,  # TEMP: Force mesh update every frame for testing wireframe accumulation
         )
 
         if res.mesh is not None and (
@@ -1974,7 +2086,13 @@ class FullPipelineViewer(DualViewer):
                     res.mesh, mesh_attributes=mesh_attr_stub
                 )
 
-            self._update_mesh_visualization(res.mesh)
+            # Only update visualization when mesh geometry actually changes
+            if res.changed or res.needs_refresh:
+                logger.debug("[MESH-VIS] Updating mesh visualization due to geometry change")
+                self._update_mesh_visualization(res.mesh)
+            else:
+                logger.debug("[MESH-VIS] Skipping visualization update - no geometry change")
+                
             # Update mesh timestamp to throttle point-cloud generation
             self.last_mesh_update = self.frame_count
         
@@ -2802,6 +2920,113 @@ class FullPipelineViewer(DualViewer):
                 self.vis.update_renderer()
             except Exception:  # pragma: no cover – ensure never crashes
                 pass
+
+    def _monitor_geometry_accumulation(self) -> None:
+        """ジオメトリ累積を監視し、必要に応じて強制クリーンアップを実行"""
+        if not hasattr(self, 'vis') or self.vis is None:
+            return
+            
+        try:
+            # Open3D ジオメトリ数を取得
+            current_count = 0
+            if hasattr(self.vis, 'get_scene'):
+                scene = self.vis.get_scene()
+                if hasattr(scene, 'scene') and hasattr(scene.scene, 'geometry_ids'):
+                    current_count = len(scene.scene.geometry_ids)
+            
+            # 統計更新
+            self._geometry_monitor['frame_count'] += 1
+            self._geometry_monitor['last_geometry_count'] = current_count
+            self._geometry_monitor['max_geometry_count'] = max(
+                self._geometry_monitor['max_geometry_count'], 
+                current_count
+            )
+            
+            # 定期ログ出力（100フレームごと）
+            if self._geometry_monitor['frame_count'] % 100 == 0:
+                logger.info(f"[GEOM-MONITOR] Frame {self._geometry_monitor['frame_count']}: "
+                           f"Current={current_count}, Max={self._geometry_monitor['max_geometry_count']}")
+            
+            # 強制クリーンアップ判定
+            if current_count > self._geometry_monitor['cleanup_threshold']:
+                frames_since_cleanup = (self._geometry_monitor['frame_count'] - 
+                                      self._geometry_monitor['last_cleanup_frame'])
+                
+                # 最低50フレーム間隔でクリーンアップ実行
+                if frames_since_cleanup > 50:
+                    logger.warning(f"[GEOM-MONITOR] 強制クリーンアップ実行: {current_count} geometries")
+                    self._force_geometry_cleanup()
+                    self._geometry_monitor['last_cleanup_frame'] = self._geometry_monitor['frame_count']
+                    
+        except Exception as e:
+            logger.debug(f"Geometry monitoring failed: {e}")
+
+    def _force_geometry_cleanup(self) -> None:
+        """Open3D ジオメトリの強制クリーンアップ"""
+        if not hasattr(self, 'vis') or self.vis is None:
+            return
+            
+        try:
+            logger.info("[GEOM-CLEANUP] 全ジオメトリをクリア中...")
+            
+            # CRITICAL: Remove geometries from Open3D scene BEFORE clearing references
+            # Otherwise cleared references cause new geometries to be added while old ones remain
+            if hasattr(self, '_mesh_vis_objs'):
+                for geom_name, geom_obj in self._mesh_vis_objs.items():
+                    if geom_obj is not None:
+                        try:
+                            self.vis.remove_geometry(geom_obj, reset_bounding_box=False)
+                            logger.debug(f"[GEOM-CLEANUP] Removed {geom_name} from Open3D scene")
+                        except Exception as e:
+                            logger.debug(f"[GEOM-CLEANUP] Failed to remove {geom_name}: {e}")
+            
+            if hasattr(self, '_contact_pool'):
+                for sphere, line in self._contact_pool:
+                    try:
+                        self.vis.remove_geometry(sphere, reset_bounding_box=False)
+                        self.vis.remove_geometry(line, reset_bounding_box=False)
+                    except Exception:
+                        pass
+            
+            if hasattr(self, '_sphere_pool'):
+                for pool_entry in self._sphere_pool.values():
+                    wire = pool_entry.get('wire')
+                    if wire is not None:
+                        try:
+                            self.vis.remove_geometry(wire, reset_bounding_box=False)
+                        except Exception:
+                            pass
+            
+            # 既存のジオメトリ参照をクリア
+            if hasattr(self, '_mesh_vis_objs'):
+                self._mesh_vis_objs.clear()
+            if hasattr(self, '_contact_pool'):
+                self._contact_pool.clear()
+            if hasattr(self, '_sphere_pool'):
+                self._sphere_pool.clear()
+            if hasattr(self, 'collision_geometries'):
+                self.collision_geometries.clear()
+            
+            # Open3D visualizer の残り全ジオメトリをクリア (点群以外)
+            # Note: clear_geometries() removes ALL geometries including point cloud
+            # We'll let individual removes above handle cleanup, then clear any remaining
+            try:
+                self.vis.clear_geometries()
+            except Exception as e:
+                logger.debug(f"[GEOM-CLEANUP] clear_geometries failed: {e}")
+            
+            # 点群は親クラスで再追加される
+            if hasattr(self, 'pcd') and self.pcd is not None:
+                self.vis.add_geometry(self.pcd)
+            
+            # ガベージコレクション強制実行
+            import gc
+            gc.collect()
+            
+            logger.info("[GEOM-CLEANUP] クリーンアップ完了")
+            
+        except Exception as e:
+            logger.error(f"強制クリーンアップ失敗: {e}")
 
 
 # =============================================================================
