@@ -2058,7 +2058,7 @@ class FullPipelineViewer(DualViewer):
             points_3d,
             tracked_hands,
             hands_present_override=any_hands_present,
-            force=True,  # TEMP: Force mesh update every frame for testing wireframe accumulation
+            force=force_update,
         )
 
         if res.mesh is not None and (

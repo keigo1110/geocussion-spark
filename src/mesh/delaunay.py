@@ -80,20 +80,6 @@ class TriangleMesh:
             if not isinstance(areas, np.ndarray):
                 areas = np.array([areas], dtype=np.float64)
         return areas
-        
-        # ベクトル外積で面積計算
-        edge1 = v1 - v0
-        edge2 = v2 - v0
-        cross = np.cross(edge1, edge2)
-        
-        # 3D外積の長さは2倍の面積
-        if cross.ndim == 1:
-            areas = np.linalg.norm(cross) / 2.0
-        else:
-            areas = np.linalg.norm(cross, axis=1) / 2.0
-            if not isinstance(areas, np.ndarray):
-                areas = np.array([areas], dtype=np.float64)
-            return areas
 
 class DelaunayTriangulator:
     """Delaunay三角形分割クラス（GPU加速対応）"""
@@ -434,11 +420,16 @@ class DelaunayTriangulator:
         edge2 = v2 - v0
         cross = np.cross(edge1[:2], edge2[:2])  # 2D外積
         area = abs(cross) / 2.0
-        
+
         # 非常に小さい三角形のみ除去
-        if area < 1e-12:
+        # areaが配列や不正な型になることを防ぐ
+        try:
+            area_value = float(area)
+        except Exception:
             return False
-        
+        if area_value < 1e-12:
+            return False
+
         # エッジ長チェック（より緩い条件）
         # NumPy の戻り値 (np.floating) を純粋な float に変換して型エラーを回避
         edge_lengths: List[float] = [
