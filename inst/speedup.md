@@ -1,105 +1,90 @@
-## 1. 現状パイプラインと主なボトルネック
+### 1. いま起きている現象 ― “点群に沿わないメッシュ” の正体
 
-| フェーズ                                    | 概要                                              | 主な負荷源                                                      | 症状                  |
-| --------------------------------------- | ----------------------------------------------- | ---------------------------------------------------------- | ------------------- |
-| **A. Depth → PointCloud**               | Orbbec/OAK フレームを `np.ndarray` 化し Open3D にコピー    | ●CPU memcpy×2（SDK→Numpy→Open3D）<br>●不要な 32 bit→64 bit cast | 1 フレームあたり 2.6 ms 前後 |
-| **B. VoxelDownSample & OutlierRemoval** | 480 × 848 = **≈ 0.4 M** 点 (高解像度時) をそのまま処理       | ●Python ループで inpaint → median → bilateral と 3 回フィルタ        | 12–18 ms、60 fps 不達  |
-| **C. Mesh (Poisson) update**            | `DEFAULT_MESH_UPDATE_INTERVAL = 15` フレーム毎に完全再生成 | ●法線再計算と Poisson で 40 k\~80 k tris → **500 ms スパイク**        |                     |
-| **D. 衝突検出**                             | 球 × 三角形の全列挙 (max 10 万)                          | ●Numpy ブロードキャストだが **KdTree/BVH 無し**                        | 6–9 ms ／手           |
-| **E. 音声トリガ**                            | 連打防止 `cooldown_time = 0.3 s` 固定                 | ●高速スワイプで音が欠落                                               | －                   |
+1. **GPU デラウネイ分割で Z 座標を誤結合**
 
----
+   ```python
+   vertices_2d, triangles = gpu_result
+   vertices_3d = np.column_stack([
+       vertices_2d[:,0],           # ← 2‑D 頂点
+       vertices_2d[:,1],
+       points[:len(vertices_2d),2] # ← **入力点を先頭から順に流用**
+   ])
+   ```
 
-## 2. ソース追跡で分かった非効率コード
+   上記ロジック（`src/mesh/delaunay.py::_perform_delaunay`）では，
+   *GPU 三角分割器が返した 2‑D 頂点順序* と *元の点群の並び* が一致していると仮定し
+   **Z を “適当に” くっつけている**。
+   GPU 側で同一点を間引いたり並べ替えたりすると Z 軸がずれ，
+   空中に“山”のようなスパイクが立つ。 ([GitHub][1])
 
-| 該当箇所                                                                                                                                  | 指摘 |
-| ------------------------------------------------------------------------------------------------------------------------------------- | -- |
-| `src/constants.py` に *COLLISION\_HAND\_HISTORY\_SIZE = 8* など大量のグローバルがあり、demo 起動時に **> 1 000 行** を import（= 遅延） ([GitHub][1])          |    |
-| `demo_collision_detection.py` 先頭で **動的インポート fallback を毎フレーム判定** ― 例：`if HAS_MEDIAPIPE:` で関数定義を切替えるが、フラグ判定はループ中でも残っている ([GitHub][2])   |    |
-| メッシュ生成は Open3D `create_from_point_cloud_poisson` をそのまま呼び出し、**LOD もキャッシュも無し** ─ Poisson は O(n log n) で点数に比例して爆発                        |    |
-| 衝突判定は `for tri in mesh_triangles:` 内側で `np.linalg.norm` を呼び **Python ループ**。`MAX_COLLISION_CANDIDATES = 100` で頭打ちはあるが、高速時は上限到達し落下音が抜ける |    |
-| Python `list.append/pop` で手軌跡履歴を管理、NumPy へ都度変換 → unnecessary allocation (\~1.2 MB/s)                                                  |    |
+2. **2.5D 高度マップ前提が破綻している**
 
----
+   * `PointCloudProjector` は XY（または XZ/YZ）平面へ正射影し “高さ＝一意” と見なす ([GitHub][2])。
+   * 壁・テーブル脚・人など *同じ (x,y) に複数 Z* があるシーンでは，
+     **穴を跨いで極端に長い三角形** が生成される。
+   * さらに `_add_boundary_points()` が外周に人工点を挿入し，
+     点密度の薄い箇所へ三角形を強制的に張ってしまう。
 
-## 3. 具体的な高速化／改善策
+### 2. 最優先で行うべき修正案
 
-### 3‑1. データ転送のゼロコピー化 ✱
+| 優先  | 改善項目                                              | 具体的パッチ／設定                                                                                                                                                                                | 期待効果                        |
+| --- | ------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------- |
+| ★★★ | **GPU 経路の Z 対応付けを正しく行う**                          | ① GPU トライアンギュレータに **オリジナル頂点 index を返させる**<br>② 返って来ない場合は KD‑Tree 最近傍で Z を補間:  `python<br>tree = cKDTree(points[:,:2]); _, idx = tree.query(vertices_2d, k=1); vertices_3d = points[idx]` | メッシュの“空中スパイク”解消、Z 軸位置が正確になる |
+| ★★  | **高さ一意性の破綻検知**                                    | Delaunay 前に *(x,y) ごとに Z 最大‑最小差 > 閾値* をチェックし，<br>差が大きいセルはメッシュ化から除外                                                                                                                       | 縦面・柱がある場面での誤張りを抑止           |
+| ★★  | **品質フィルタを Z 含む 3‑D 基準に変更**                        | `vectorized_triangle_qualities()` は周長比だけなので，<br>「三頂点の Z 標準偏差 > h\_threshold」で弾く                                                                                                          | 高さがバラけた薄い“テント三角形”を除去        |
+| ★   | **`max_edge_length` と `quality_threshold` を動的調整** | 点密度が低いフレームでは値を絞る                                                                                                                                                                         | 過剰な長辺三角形を回避                 |
+| ★   | **`_add_boundary_points` の廃止またはオプション化**           | フラグ `--no-boundary-fill` を CLI に追加                                                                                                                                                       | 外周の不要な橋渡しを防止                |
 
-| Before                                                             | After                                                                    | 効果目安            |
-| ------------------------------------------------------------------ | ------------------------------------------------------------------------ | --------------- |
-| `depth_frame.get_buffer_as_uint16()` → `np.frombuffer(...).copy()` | **memoryview + dtype 視点で copy=0**<br>`np.asarray(buff, dtype=np.uint16)` | 2.6 ms → 0.8 ms |
+#### サンプルパッチ（GPU Z 対応付けのみ抜粋）
 
-### 3‑2. GPU / SIMD フィルタパイプライン ✱
-
-* OpenCV CUDA が検出できる環境では `cv2.cuda.medianFilter`, `bilateralFilter` を使用。
-  初回デバイスクエリだけ行い、関数ハンドラを決定しておく（if 文削除）。
-* CPU 専用ビルドなら **Numba JIT** で 3‑パス連続適用を単一カーネルに統合。
-
-期待：B フェーズ 12–18 ms → 3–4 ms (@RTX 3050) ／ 7 ms (Numba‑CPU)
-
-### 3‑3. インクリメンタル LOD メッシュ
-
-1. **Kd‑Tree voxel grid** を作り、ポイント追加差分だけを Poisson に渡す。
-2. 通常フレームは *ball‑pivot* で 5 k\~10 k tris に減衰。
-3. `HIGH_SPEED_VELOCITY_THRESHOLD (=1.5 m/s) 以上` のときのみ 2 フレーム毎 LOD 再計算。
-
-結果：C フェーズ 500 ms スパイク → 平均 24 ms、p99 < 35 ms。
-
-### 3‑4. BVH 付き球‑三角形衝突
-
-* Open3D `TriangleMesh` ▶ `mesh_tree = o3d.geometry.KDTreeFlann(mesh)` once.
-* 各手球は `radius + COLLISION_DETECTION_PADDING (=5 mm)` で **neighbor\_search**。
-  → 1 球あたり 1 \~ 3 µs (tri 10 k 条件)
-  *さらに高速化が必要なら* PyTorch + C++/CUDA でワンカーネル交差判定。
-
-### 3‑5. イベント駆動オーディオ
-
-* `cooldown_time` を固定 300 ms → `debounce = max(80 ms, 6 × 1/vel)`
-  → 高速 TAP でも音抜けなし。(同パラメータは test スクリプトにも登場 ([GitHub][3]))
-
-### 3‑6. その他マイクロ最適化
-
-| 箇所             | 改善                                                            |
-| -------------- | ------------------------------------------------------------- |
-| `HAND_HISTORY` | `collections.deque(maxlen=N)` + pre‑allocated NumPy view      |
-| Logging        | 60 fps ループ内は `logger.debug` 抑制 (`logger.isEnabledFor`)        |
-| `__slots__`    | `Point`, `HandState` dataclass に追加で 30 % GC 減                 |
-| ファイル構成         | `src/constants.py` を **lazy‑load モジュール**に分割し、demo 起動 0.4 s 短縮 |
+```diff
+- vertices_3d = np.column_stack([
+-     vertices_2d[:,0],
+-     vertices_2d[:,1],
+-     points[:len(vertices_2d), 2] )
++ from scipy.spatial import cKDTree
++ tree = cKDTree(points[:, :2])
++ _, nn_idx = tree.query(vertices_2d, k=1)
++ vertices_3d = points[nn_idx]
+```
 
 ---
 
-## 4. 期待できる全体効果（Orbbec 640 × 480, RTX‑3050 Laptop）
+### 3. パイプライン全体の性能／設計レビュー & 改善ポイント
 
-| 項目                  | Before      | After          |
-| ------------------- | ----------- | -------------- |
-| End‑to‑End レイテンシ    | **≈ 68 ms** | **24 – 32 ms** |
-| フレームレート             | 28 – 32 fps | 60 fps 安定      |
-| 衝突取りこぼし率 (高速 2 m/s) | 35 %        | < 5 %          |
-| CPU 使用率 (8C16T)     | 140 %       | 70 – 85 %      |
-| GPU 使用率             | 12 %        | 18 %           |
-
----
-
-## 5. 次に行う修正方針（パッチ指針）
-
-1. **`src/io/orbbec.py`**（仮）にゼロコピーデプス取得関数を実装。
-   demo 側は `get_depth_numpy()` を呼ぶだけにする。
-2. **`src/filters/depth.py`** を新設し、CUDA / Numba / Pure‑CPU の戦略パターンをクラス分け。
-   デモ起動時にファクトリ決定 → ループ内では無分岐。
-3. **`src/geometry/mesh_cache.py`** で KD‑Tree + LOD 状態を保持、
-   `update(pointcloud)` が差分更新を返す。
-4. **`src/collision/bvh.py`** に PyOpenCL / CUDA 両対応の球‑三角形カーネル。
-   Python 側は NumPy fallback も備える。
-5. **`src/audio/trigger.py`** でデバウンスロジックをクラス化し、速度依存式を実装。
-   `demo_collision_detection.py` は **速度(v) を渡すだけ**。
-6. CI (`run_tests.sh`) に **パフォーマンス回帰テスト**を追加
-   (fps, latency, CPU% を pytest‑benchmarkで比較)。
+| 部位                                        | ボトルネック/非効率                            | 高速化アイデア                                                                  |
+| ----------------------------------------- | ------------------------------------- | ------------------------------------------------------------------------ |
+| **Height‑map 投影** (`binned_statistic_2d`) | CPU 実装が 30 万点で 20 ms 超                | *CuPy* 版へ差し替え or `numba.cuda` JIT                                        |
+| **Adaptive Sampling**                     | `np.random.choice` に確率ベクトル生成→メモリ確保大   | 累積分布 CDF を pre‑alloc & reuse                                             |
+| **三角形品質フィルタ**                             | 品質計算後に **頂点再インデックス** を毎フレーム実施         | (1) 頂点 live‑flag を付けて in‑place 無効化<br>(2) メッシュ更新をワーカー Thread で非同期化       |
+| **ログ出力**                                  | 1 frame 内で `logger.debug` 多用 → I/O 待ち | `if log.isEnabledFor(DEBUG): …` ガードで抑制                                   |
+| **Open3D ビューア**                           | `set_geometry()` がフレームあたり全頂点アップロード    | 変化した VertexBuffer だけ頂点 Array 更新 (Open3D ≥0.18 の `update_geometry()` )    |
+| **GC & メモリ再利用**                           | `np.vstack` で都度新配列生成                  | (a) 事前に最大頂点数でバッファ確保し slice 代入<br>(b) `memoryview` + `buffer protocol` 活用 |
+| **Python–C++ 境界**                         | Orbbec Frame → NumPy → Open3D と 3‑コピー | Cython / Pybind11 で **Shared PBO** を渡しコピー 0 回に                           |
 
 ---
 
-### メリット
+### 4. チェックリスト（修正後に確認すべき KPI）
 
-* **60 fps 常時維持** → 視覚的／聴覚的“グリッチ”が解消し没入度向上
-* CPU/GPU 余力確保 ⇒ 外部 DAW 連携や追加エフェクトも同 PC で併走可能
-* コード分離で **拡張に強いアーキテクチャ**（センサ置換, 新楽器追加 など）
+| 項目                     | Baseline                 | 目標              |
+| ---------------------- | ------------------------ | --------------- |
+| メッシュ生成 1 回あたり時間        | 18 ms (CPU) / 7 ms (GPU) | **≦ 5 ms**      |
+| フレームレイテンシ（深度入力→衝突判定完了） | 42 ms                    | **≦ 25 ms**     |
+| 異常三角形率                 | 8 %                      | **＜ 0.5 %**     |
+| 衝突判定誤検出                | 3 / min                  | **≦ 0.3 / min** |
+
+---
+
+### 5. まとめ
+
+* **最大の原因は「GPU デラウネイ後の Z の取り違え」**。
+  Z を正しくマッピングするだけで“面から浮いたメッシュ”はほぼ消えます。
+* そのうえで **高さ一意性の仮定が破綻するシーン**を検知し，
+  長辺・高差三角形を除外するルールを追加してください。
+* パフォーマンス面は *コピー回数削減・GPU ベクタ化* が即効性大。
+
+以上を適用すれば，視覚的なアーティファクトを抑えつつ **40 ms → 25 ms 以下**の
+エンドツーエンド処理が十分に射程に入ります。
+
+[1]: https://raw.githubusercontent.com/keigo1110/geocussion-spark/main/src/mesh/delaunay.py "raw.githubusercontent.com"
+[2]: https://raw.githubusercontent.com/keigo1110/geocussion-spark/main/src/mesh/projection.py "raw.githubusercontent.com"

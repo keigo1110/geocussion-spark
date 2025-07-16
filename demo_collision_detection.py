@@ -409,10 +409,13 @@ class FullPipelineViewer(DualViewer):
         
         # 地形メッシュ生成コンポーネント
         self.projector = PointCloudProjector(
-            resolution=0.01,  # 1cm解像度
+            resolution=0.01,   # 1cm
             method=ProjectionMethod.MEDIAN_HEIGHT,
             fill_holes=True,
-            plane="xz",  # カメラ座標系に合わせて XZ 平面投影
+            plane="xz",
+            max_height_variation=0.30,   # 垂直面セルを除外 (>=30cm 高さ差)
+            min_points_per_cell=3,       # 信頼できるセルのみ採用
+            height_clip_percentile=0.995,
         )
         
         # LODメッシュ生成器
@@ -474,6 +477,8 @@ class FullPipelineViewer(DualViewer):
             adaptive_sampling=True,
             boundary_points=True,
             quality_threshold=0.3,
+            slope_threshold=2.0,
+            z_std_threshold=0.3,         # Z標準偏差30cm超の薄いテント三角形を除去
             use_gpu=True,
         )
 

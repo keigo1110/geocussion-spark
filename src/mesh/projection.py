@@ -81,6 +81,8 @@ class PointCloudProjector:
         fill_holes: bool = True,     # 穴埋め処理
         min_points_per_cell: int = 1, # セルあたりの最小点数
         plane: Literal["xy", "xz", "yz"] = "xy",  # 投影平面
+        max_height_variation: Optional[float] = None,  # 1セル内で許容される高さ差 (m) – 大きすぎる縦面セルを除外
+        height_clip_percentile: Optional[float] = None, # 高さ外れ値クリップのパーセンタイル (0-1)
     ):
         """
         初期化
@@ -99,6 +101,8 @@ class PointCloudProjector:
         self.fill_holes = fill_holes
         self.min_points_per_cell = min_points_per_cell
         self.plane = plane  # 新規: 投影平面
+        self.max_height_variation = max_height_variation
+        self.height_clip_percentile = height_clip_percentile
         
         # パフォーマンス統計
         self.stats = {
@@ -163,6 +167,20 @@ class PointCloudProjector:
         
         if not np.any(valid_mask):
             raise ValueError("No valid points in grid")
+
+        # --------------------------------------------------------------
+        # 高さ外れ値クリップ – 高位パーセンタイルを超える点を除去
+        # --------------------------------------------------------------
+        if hasattr(self, "height_clip_percentile") and self.height_clip_percentile is not None:
+            try:
+                perc_val = np.percentile(points[valid_mask][:, height_idx], self.height_clip_percentile * 100.0)
+                too_high = (points[:, height_idx] > perc_val)
+                if np.any(too_high & valid_mask):
+                    valid_mask &= ~too_high
+                    if not np.any(valid_mask):
+                        raise ValueError("All points removed by height clip")
+            except Exception:
+                pass
         
         valid_points = points[valid_mask]
         valid_grid_x = grid_x[valid_mask]
@@ -247,6 +265,37 @@ class PointCloudProjector:
         # 無効なピクセル（NaNや点数が足りないセル）をマスク
         valid_mask &= ~np.isnan(height_map)
         height_map[~valid_mask] = 0  # 無効領域を0で初期化
+
+        # ------------------------------------------------------------------
+        # 追加フィルタ: 1セル内の高さ差が大き過ぎるセルを無効化
+        # 垂直面や壁によるスパイクを排除して「山脈アーチファクト」を防ぐ
+        # ------------------------------------------------------------------
+        if self.max_height_variation is not None and self.max_height_variation > 0:
+            try:
+                # 各セルの min / max 高さを計算
+                h_min, _, _, _ = binned_statistic_2d(
+                    x=grid_y, y=grid_x, values=heights,
+                    statistic="min",
+                    bins=(grid_height, grid_width),
+                    range=[[0, grid_height], [0, grid_width]]
+                )
+                h_max, _, _, _ = binned_statistic_2d(
+                    x=grid_y, y=grid_x, values=heights,
+                    statistic="max",
+                    bins=(grid_height, grid_width),
+                    range=[[0, grid_height], [0, grid_width]]
+                )
+
+                variation = (h_max - h_min)
+                variation = np.nan_to_num(variation, nan=0.0)
+
+                # セル高さ差が閾値を超えるものを無効化
+                violent_mask = variation > self.max_height_variation
+                valid_mask &= ~violent_mask
+                height_map[violent_mask] = 0
+            except Exception:
+                # フィルタ計算に失敗してもクラッシュさせない
+                pass
 
         return height_map.astype(np.float32), density_map, valid_mask
     

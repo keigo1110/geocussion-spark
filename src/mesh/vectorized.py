@@ -137,35 +137,68 @@ def _get_jit_qualities_function():
 # 古い@njitデコレータは削除済み - フォールバック版を直接使用
 
 
-def vectorized_triangle_qualities(mesh: TriangleMesh) -> np.ndarray:
+def vectorized_triangle_qualities(mesh: TriangleMesh, z_std_threshold: float = 0.5) -> np.ndarray:
     """
-    三角形品質を完全ベクトル化で計算（JIT対応）
+    ベクトル化版三角形品質計算（Z標準偏差による3D品質チェック追加）
+    
+    品質メトリック:
+    - アスペクト比（元の品質）
+    - Z標準偏差（薄いテント三角形を検出）
     
     Args:
-        mesh: 入力メッシュ
+        mesh: 三角形メッシュ
+        z_std_threshold: Z座標標準偏差の許容上限（これを超える三角形は低品質とみなす）
         
     Returns:
-        品質配列 (M,) - 各三角形の品質 (0-1, 1が最高)
+        各三角形の品質スコア（0-1、高いほど良い）
     """
     if mesh.num_triangles == 0:
         return np.array([])
     
-    # 全三角形の頂点を一括取得 (M, 3, 3)
-    triangle_vertices = mesh.vertices[mesh.triangles]
+    # 三角形の頂点を取得 (M, 3, 3)
+    vertices = mesh.vertices[mesh.triangles]  
     
-    v0 = triangle_vertices[:, 0]  # (M, 3)
-    v1 = triangle_vertices[:, 1]  # (M, 3)
-    v2 = triangle_vertices[:, 2]  # (M, 3)
+    # エッジベクトル計算
+    v0, v1, v2 = vertices[:, 0], vertices[:, 1], vertices[:, 2]
+    edge1 = v1 - v0  # (M, 3)
+    edge2 = v2 - v0  # (M, 3)
+    edge3 = v2 - v1  # (M, 3)
     
-    # JIT関数を遅延取得
-    jit_func = _get_jit_qualities_function()
+    # エッジ長計算
+    len1 = np.linalg.norm(edge1, axis=1)  # (M,)
+    len2 = np.linalg.norm(edge2, axis=1)  # (M,)
+    len3 = np.linalg.norm(edge3, axis=1)  # (M,)
     
-    if jit_func is not None:
-        # JIT最適化版を使用
-        return jit_func(v0, v1, v2)
+    # 面積計算（外積）
+    cross_product = np.cross(edge1, edge2)
+    # 2Dの場合は最後の成分のみ、3Dの場合はベクトルのノルム
+    if cross_product.ndim == 1:
+        areas = np.abs(cross_product) / 2.0
     else:
-        # フォールバック版（既存のNumPy実装）
-        return _triangle_qualities_fallback(v0, v1, v2)
+        areas = np.linalg.norm(cross_product, axis=1) / 2.0
+    
+    # 周囲長計算
+    perimeters = len1 + len2 + len3
+    
+    # ゼロ除算を避ける
+    safe_perimeters = np.where(perimeters > 1e-12, perimeters, 1e-12)
+    safe_areas = np.where(areas > 1e-12, areas, 1e-12)
+    
+    # 【従来品質】アスペクト比品質（4 * sqrt(3) * 面積 / 周囲長^2）
+    aspect_qualities = (4.0 * np.sqrt(3.0) * safe_areas) / (safe_perimeters ** 2)
+    
+    # 【新規追加】Z座標標準偏差による3D品質チェック
+    z_coords = vertices[:, :, 2]  # (M, 3) - 各三角形の3頂点のZ座標
+    z_std = np.std(z_coords, axis=1)  # (M,) - 各三角形のZ標準偏差
+    
+    # Z標準偏差が閾値以下なら1.0、超えるにつれて0に近づく品質
+    z_qualities = np.exp(-np.maximum(0, z_std - z_std_threshold))
+    
+    # 最終品質 = アスペクト比品質 × Z品質
+    final_qualities = aspect_qualities * z_qualities
+    
+    # 0-1の範囲にクリップ
+    return np.clip(final_qualities, 0.0, 1.0)
 
 
 def _triangle_qualities_fallback(v0: np.ndarray, v1: np.ndarray, v2: np.ndarray) -> np.ndarray:
@@ -369,7 +402,8 @@ class VectorizedMeshProcessor:
     def filter_triangles_by_quality(
         self,
         mesh: TriangleMesh,
-        quality_threshold: float = 0.5
+        quality_threshold: float = 0.5,
+        z_std_threshold: float = 0.5
     ) -> TriangleMesh:
         """品質に基づく三角形フィルタリング（ベクトル化版）"""
         start_time = time.perf_counter()
@@ -377,8 +411,8 @@ class VectorizedMeshProcessor:
         if mesh.num_triangles == 0:
             return mesh
         
-        # 品質を一括計算
-        qualities = vectorized_triangle_qualities(mesh)
+        # 品質を一括計算（Z標準偏差チェック付き）
+        qualities = vectorized_triangle_qualities(mesh, z_std_threshold)
         
         # 閾値以上の三角形を選択
         good_mask = qualities >= quality_threshold

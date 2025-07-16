@@ -91,6 +91,8 @@ class DelaunayTriangulator:
         adaptive_sampling: bool = True,    # 適応的サンプリング
         boundary_points: bool = True,      # 境界点追加
         quality_threshold: float = 0.5,   # 品質閾値（0-1）
+        slope_threshold: float = 2.0,      # 高さ差/平均エッジ長 の許容上限 (≈tanθ)。2→約63°
+        z_std_threshold: float = 0.5,      # Z標準偏差の許容上限（薄いテント三角形除去）
         # GPU加速設定
         use_gpu: bool = True,              # GPU使用フラグ
         gpu_fallback_threshold: int = 300  # GPU使用の最小点数（より積極的に）
@@ -112,6 +114,8 @@ class DelaunayTriangulator:
         self.adaptive_sampling = adaptive_sampling
         self.boundary_points = boundary_points
         self.quality_threshold = quality_threshold
+        self.slope_threshold = slope_threshold
+        self.z_std_threshold = z_std_threshold
         self.use_gpu = use_gpu
         self.gpu_fallback_threshold = gpu_fallback_threshold
         
@@ -339,11 +343,37 @@ class DelaunayTriangulator:
                     vertices_2d, triangles = gpu_result
                     
                     # Z座標を復元して3D頂点作成
-                    vertices_3d = np.column_stack([
-                        vertices_2d[:, 0],
-                        vertices_2d[:, 1], 
-                        points[:len(vertices_2d), 2]  # 元のZ座標
-                    ])
+                    # 【修正】KD-Treeで最近傍検索により正確なZ座標を対応付け
+                    from scipy.spatial import cKDTree
+                    try:
+                        # 元の点群のXY座標でKD-Treeを構築
+                        tree = cKDTree(points[:, :2])
+                        # GPU結果の2D頂点に対して最近傍の元点を検索
+                        _, nn_indices = tree.query(vertices_2d, k=1)
+                        
+                        # 正しいZ座標で3D頂点を作成
+                        vertices_3d = np.column_stack([
+                            vertices_2d[:, 0],
+                            vertices_2d[:, 1], 
+                            points[nn_indices, 2]  # 最近傍のZ座標を使用
+                        ])
+                        
+                        import logging as _logging
+                        _logging.getLogger(__name__).debug(
+                            "[GPU-DELAUNAY] Z-mapping: %d vertices mapped via KD-Tree", len(vertices_2d)
+                        )
+                        
+                    except ImportError:
+                        # scipy.spatialが利用できない場合のフォールバック
+                        import logging as _logging
+                        _logging.getLogger(__name__).warning(
+                            "scipy.spatial not available, using direct Z mapping (may cause artifacts)"
+                        )
+                        vertices_3d = np.column_stack([
+                            vertices_2d[:, 0],
+                            vertices_2d[:, 1], 
+                            points[:len(vertices_2d), 2]  # 従来の方式
+                        ])
                     
                     # 有効な三角形のみフィルタリング
                     valid_triangles = []
@@ -443,6 +473,15 @@ class DelaunayTriangulator:
         if any(length > max_allowed_length for length in edge_lengths):
             return False
         
+        # ------------------------- 斜度チェック -------------------------
+        if self.slope_threshold is not None and self.slope_threshold > 0:
+            height_range = float(np.ptp(triangle_vertices[:, 2]))
+            avg_edge = sum(edge_lengths) / 3.0
+            if avg_edge > 1e-12:
+                slope_ratio = height_range / avg_edge
+                if slope_ratio > self.slope_threshold:
+                    return False  # ほぼ垂直な三角形を除外
+
         # 縦横比チェック（より緩い条件）
         min_edge = min(edge_lengths)
         max_edge = max(edge_lengths)
@@ -464,7 +503,7 @@ class DelaunayTriangulator:
         # 最適化されたベクトル化処理を使用
         from .vectorized import get_mesh_processor
         processor = get_mesh_processor()
-        return processor.filter_triangles_by_quality(mesh, self.quality_threshold)
+        return processor.filter_triangles_by_quality(mesh, self.quality_threshold, self.z_std_threshold)
     
     def _calculate_triangle_qualities(self, mesh: TriangleMesh) -> np.ndarray:
         """三角形の品質を計算（ベクトル化版）"""
