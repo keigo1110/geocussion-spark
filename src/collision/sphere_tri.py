@@ -17,9 +17,10 @@ from ..mesh.delaunay import TriangleMesh
 from ..mesh.attributes import MeshAttributes
 from ..data_types import CollisionType, ContactPoint, CollisionInfo, SearchResult
 from ..constants import (
-    COLLISION_TOLERANCE, 
+    COLLISION_TOLERANCE,
+    COLLISION_DETECTION_PADDING,
     MAX_CONTACTS_PER_SPHERE,
-    NUMERICAL_TOLERANCE
+    NUMERICAL_TOLERANCE,
 )
 
 
@@ -32,7 +33,8 @@ class SphereTriangleCollision:
         mesh_attributes: Optional[MeshAttributes] = None,
         collision_tolerance: float = COLLISION_TOLERANCE,      # 衝突判定の許容誤差
         enable_face_culling: bool = False,      # 裏面カリング
-        max_contacts_per_sphere: int = MAX_CONTACTS_PER_SPHERE       # 球あたりの最大接触点数
+        max_contacts_per_sphere: int = MAX_CONTACTS_PER_SPHERE,      # 球あたりの最大接触点数
+        detection_padding: float = COLLISION_DETECTION_PADDING,      # 衝突判定のパディング
     ):
         """
         初期化
@@ -49,6 +51,7 @@ class SphereTriangleCollision:
         self.collision_tolerance = collision_tolerance
         self.enable_face_culling = enable_face_culling
         self.max_contacts_per_sphere = max_contacts_per_sphere
+        self.detection_padding = detection_padding
         
         # パフォーマンス統計
         self.stats = {
@@ -154,8 +157,9 @@ class SphereTriangleCollision:
             sphere_center, vertices
         )
         
-        # 衝突判定
-        penetration_depth = sphere_radius - distance
+        # 衝突判定 (パディングを考慮)
+        effective_radius = sphere_radius + self.detection_padding
+        penetration_depth = effective_radius - distance
         if penetration_depth <= self.collision_tolerance:
             return None
         
