@@ -59,12 +59,27 @@ class TriangleMesh:
         v1 = self.vertices[self.triangles[:, 1]]
         v2 = self.vertices[self.triangles[:, 2]]
         return (v0 + v1 + v2) / 3.0
-    
+
     def get_triangle_areas(self) -> np.ndarray:
         """三角形の面積を計算"""
         v0 = self.vertices[self.triangles[:, 0]]
         v1 = self.vertices[self.triangles[:, 1]]
         v2 = self.vertices[self.triangles[:, 2]]
+
+        # ベクトル外積で面積計算
+        edge1 = v1 - v0
+        edge2 = v2 - v0
+        cross = np.cross(edge1, edge2)
+
+        # 3D外積の長さは2倍の面積
+        if cross.ndim == 1:
+            areas = np.linalg.norm(cross) / 2.0
+            areas = np.array([areas], dtype=np.float64)
+        else:
+            areas = np.linalg.norm(cross, axis=1) / 2.0
+            if not isinstance(areas, np.ndarray):
+                areas = np.array([areas], dtype=np.float64)
+        return areas
         
         # ベクトル外積で面積計算
         edge1 = v1 - v0
@@ -76,9 +91,9 @@ class TriangleMesh:
             areas = np.linalg.norm(cross) / 2.0
         else:
             areas = np.linalg.norm(cross, axis=1) / 2.0
-        
-        return areas
-
+            if not isinstance(areas, np.ndarray):
+                areas = np.array([areas], dtype=np.float64)
+            return areas
 
 class DelaunayTriangulator:
     """Delaunay三角形分割クラス（GPU加速対応）"""
@@ -118,14 +133,17 @@ class DelaunayTriangulator:
         self.gpu_triangulator = None
         if self.use_gpu and GPU_TRIANGULATION_AVAILABLE:
             try:
-                self.gpu_triangulator = create_gpu_triangulator(
-                    use_gpu=True,
-                    quality_threshold=self.quality_threshold,
-                    enable_caching=True,
-                    force_cpu=False  # 明示的にCPU強制を無効化
-                )
-                log_gpu_status("DelaunayTriangulator", self.gpu_triangulator.use_gpu)
-                
+                triangulator_factory = create_gpu_triangulator
+                if triangulator_factory is not None:
+                    self.gpu_triangulator = triangulator_factory(
+                        use_gpu=True,
+                        quality_threshold=self.quality_threshold,
+                        enable_caching=True,
+                        force_cpu=False  # 明示的にCPU強制を無効化
+                    )
+                    log_gpu_status("DelaunayTriangulator", self.gpu_triangulator.use_gpu)
+                else:
+                    self.gpu_triangulator = None
             except Exception as e:
                 import logging as _logging
                 _logging.getLogger(__name__).warning("GPU triangulator init failed: %s", e)
@@ -313,11 +331,11 @@ class DelaunayTriangulator:
         if len(points) < 3:
             raise ValueError("At least 3 points required for triangulation")
         
-        # GPU使用判定（閾値を下げて実用的に）
+        # GPU使用判定 – GPU をより積極的に使用するため閾値を 20 点に引き下げ
         use_gpu_for_this = (
             self.gpu_triangulator is not None and 
             self.gpu_triangulator.use_gpu and 
-            len(points) >= 50   # さらに低い閾値でGPU使用を積極化
+            len(points) >= 20   # 20点以上で GPU パスを試行
         )
         
         start_time = time.perf_counter()
@@ -327,6 +345,8 @@ class DelaunayTriangulator:
             try:
                 # XY平面での三角分割
                 points_2d = points[:, :2]
+                # mypy/pylint safety – self.gpu_triangulator is guaranteed non-None here
+                assert self.gpu_triangulator is not None
                 gpu_result = self.gpu_triangulator.triangulate_points_2d(points_2d)
                 
                 if gpu_result is not None:
@@ -420,10 +440,11 @@ class DelaunayTriangulator:
             return False
         
         # エッジ長チェック（より緩い条件）
-        edge_lengths = [
-            np.linalg.norm(v1 - v0),
-            np.linalg.norm(v2 - v1),
-            np.linalg.norm(v0 - v2)
+        # NumPy の戻り値 (np.floating) を純粋な float に変換して型エラーを回避
+        edge_lengths: List[float] = [
+            float(np.linalg.norm(v1 - v0)),
+            float(np.linalg.norm(v2 - v1)),
+            float(np.linalg.norm(v0 - v2)),
         ]
         
         # 非常に長いエッジのみ除去
@@ -466,7 +487,7 @@ class DelaunayTriangulator:
             return 0.0
         
         qualities = self._calculate_triangle_qualities(mesh)
-        return np.mean(qualities)
+        return float(np.mean(qualities))
     
     def _update_stats(self, elapsed_ms: float, num_points: int, num_triangles: int, quality: float):
         """パフォーマンス統計更新"""
