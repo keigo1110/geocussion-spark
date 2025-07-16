@@ -35,6 +35,7 @@ from src.constants import (
     LOW_RESOLUTION,
     HIGH_RESOLUTION,
     ESTIMATED_HIGH_RES_POINTS,
+    COLLISION_DETECTION_PADDING,
 )
 
 # プロジェクトルートをパスに追加
@@ -1117,8 +1118,10 @@ class FullPipelineViewer(DualViewer):
         from src.collision.sphere_tri import CollisionInfo, ContactPoint
         from src.data_types import CollisionType
         
-        # 衝突判定（半径内の距離）
-        collision_mask = distances[0] <= radius
+        # 衝突判定（半径 + パディング 内の距離）
+        from src.constants import COLLISION_DETECTION_PADDING  # ローカル import で循環防止
+        effective_radius = radius + COLLISION_DETECTION_PADDING
+        collision_mask = distances[0] <= effective_radius
         collision_triangle_indices = np.array(search_result.triangle_indices)[collision_mask]
         collision_distances = distances[0][collision_mask]
         
@@ -1136,10 +1139,11 @@ class FullPipelineViewer(DualViewer):
                 normal = normal / (np.linalg.norm(normal) + 1e-8)
                 
                 from numpy import array as _arr
+                penetration = effective_radius - collision_distances[i]
                 contact_point = ContactPoint(
                     position=centroid,
                     normal=normal,
-                    depth=float(radius - collision_distances[i]),
+                    depth=float(penetration),
                     triangle_index=int(tri_idx),
                     barycentric=_arr([1.0 / 3, 1.0 / 3, 1.0 / 3]),
                     collision_type=CollisionType.FACE_COLLISION,
