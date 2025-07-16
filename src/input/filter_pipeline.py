@@ -164,12 +164,12 @@ class UnifiedFilterPipeline:
         dummy_data = np.random.randint(500, 2000, (240, 424), dtype=np.uint16)
         dummy_prev = dummy_data.copy().astype(np.float32)
         
-                 try:
-             # 統合カーネルをwarmup
-             _ = _unified_filter_numba(dummy_data, dummy_prev, 0.8, 500, 5000)
-             logger.info("Numba kernels warmed up successfully")
-         except Exception as e:
-             logger.warning(f"Numba warmup failed: {e}")
+        try:
+            # 統合カーネルをwarmup
+            _ = _unified_filter_numba(dummy_data, dummy_prev, 0.8, 500, 5000)
+            logger.info("Numba kernels warmed up successfully")
+        except Exception as e:
+            logger.warning(f"Numba warmup failed: {e}")
     
     @profile_phase("filter_pipeline")
     def apply_filters(self, depth_image: np.ndarray) -> np.ndarray:
@@ -243,14 +243,14 @@ class UnifiedFilterPipeline:
                 self._temporal_state = depth_image.astype(np.float32)
                 return depth_image.copy()
             
-                         # 統合カーネル実行
-             filtered = _unified_filter_numba(
-                 depth_image, 
-                 self._temporal_state,
-                 self.config.temporal_alpha,
-                 int(self.config.min_depth * 1000),  # mm単位
-                 int(self.config.max_depth * 1000)   # mm単位
-             )
+            # 統合カーネル実行
+            filtered = _unified_filter_numba(
+                depth_image, 
+                self._temporal_state,
+                self.config.temporal_alpha,
+                int(self.config.min_depth * 1000),  # mm単位
+                int(self.config.max_depth * 1000)   # mm単位
+            )
             
             # 時間状態更新
             self._temporal_state = filtered.astype(np.float32)
