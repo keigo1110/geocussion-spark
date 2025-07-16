@@ -196,23 +196,51 @@ class SphereTriangleCollision:
         if penetration_depth <= self.collision_tolerance:
             return None
         
-        # 法線ベクトル計算
-        if self.mesh_attributes and self.mesh_attributes.triangle_normals is not None:
-            # 事前計算された法線を使用
-            triangle_normal = self.mesh_attributes.triangle_normals[triangle_idx]
+        # ------------------------------------------------------------------
+        # 接触法線の安定化: 頂点法線の重み付き補間を優先使用
+        # ------------------------------------------------------------------
+        contact_direction = sphere_center - closest_point  # ベース方向 (ペネトレーションベクトル)
+
+        contact_normal: np.ndarray
+
+        # 1) 頂点法線が利用可能な場合はバリセントリック補間
+        if (
+            self.mesh_attributes is not None and
+            getattr(self.mesh_attributes, "vertex_normals", None) is not None
+        ):
+            try:
+                v_normals = self.mesh_attributes.vertex_normals[triangle]  # shape (3,3)
+                interp_normal = (
+                    barycentric[0] * v_normals[0]
+                    + barycentric[1] * v_normals[1]
+                    + barycentric[2] * v_normals[2]
+                )
+                # 正規化
+                contact_normal = interp_normal / (np.linalg.norm(interp_normal) + 1e-8)
+            except Exception:
+                contact_normal = None  # フォールバックへ
         else:
-            # その場で計算
-            triangle_normal = self._calculate_triangle_normal(vertices)
-        
-        # 裏面カリング
-        if self.enable_face_culling:
-            to_sphere = sphere_center - closest_point
-            if np.dot(to_sphere, triangle_normal) < 0:
-                return None
-        
-        # 接触法線を計算
-        contact_direction = sphere_center - closest_point
-        contact_normal = contact_direction / (distance + 1e-8)
+            contact_normal = None
+
+        # 2) 頂点法線がない場合、三角形法線を使用
+        if contact_normal is None:
+            if (
+                self.mesh_attributes is not None and
+                getattr(self.mesh_attributes, "triangle_normals", None) is not None
+            ):
+                triangle_normal = self.mesh_attributes.triangle_normals[triangle_idx]
+            else:
+                triangle_normal = self._calculate_triangle_normal(vertices)
+
+            contact_normal = triangle_normal / (np.linalg.norm(triangle_normal) + 1e-8)
+
+        # 3) 法線方向を接触方向へ合わせる（外向き統一）
+        if np.dot(contact_normal, contact_direction) < 0:
+            contact_normal = -contact_normal
+
+        # 裏面カリング（法線が接触方向と反対向き → 衝突無視）
+        if self.enable_face_culling and np.dot(contact_direction, contact_normal) < 0:
+            return None
         
         return ContactPoint(
             position=closest_point,
