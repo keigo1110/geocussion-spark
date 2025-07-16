@@ -256,7 +256,8 @@ class DelaunayTriangulator:
         importance = gradient_magnitude / (np.max(gradient_magnitude) + 1e-8)
         
         # 重要度の高い点を優先的に選択
-        num_samples = min(len(points), int(len(points) * 0.7))
+        # より高精度のメッシュ生成のため、サンプリング率を 90% に引き上げ
+        num_samples = min(len(points), int(len(points) * 0.9))
         probabilities = importance + 0.1  # 最低確率を保証
         probabilities /= np.sum(probabilities)
         

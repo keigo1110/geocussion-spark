@@ -36,9 +36,9 @@ class LODConfig:
     low_detail_radius: float = 1.0       # 低解像度半径
     
     # 解像度設定
-    high_detail_density: float = 0.01    # 高解像度点間距離（1cm）
-    medium_detail_density: float = 0.03  # 中解像度点間距離（3cm）
-    low_detail_density: float = 0.10     # 低解像度点間距離（10cm）
+    high_detail_density: float = 0.01    # 高解像度点間距離（0.5cm,以前は1cm）
+    medium_detail_density: float = 0.02 # 中解像度点間距離（1.5cm,以前は3cm）
+    low_detail_density: float = 0.05     # 低解像度点間距離（5cm,以前は10cm）
     
     # メッシュ更新制御
     update_threshold_move: float = 0.05   # 手移動による更新閾値
@@ -46,7 +46,7 @@ class LODConfig:
     enable_temporal_stability: bool = True  # 時間的安定性制御
     
     # パフォーマンス設定
-    max_points_per_lod: int = 2000       # LODレベル毎の最大点数
+    max_points_per_lod: int = 4000       # LODレベル毎の最大点数（以前は2000）
     enable_caching: bool = True          # 結果キャッシュ
     cache_validity_time: float = 0.5     # キャッシュ有効時間（秒）
 
