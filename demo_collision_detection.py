@@ -450,7 +450,8 @@ class FullPipelineViewer(DualViewer):
         )
 
         # 統合 MeshPipeline
-        self.mesh_pipeline = create_mesh_pipeline(enable_incremental=False)
+        # Enable incremental mesh updates for higher FPS (P-PERF-003)
+        self.mesh_pipeline = create_mesh_pipeline(enable_incremental=True)
         # 1 Hz mesh update interval (configurable via scheduler)
         self.pipeline_manager = PipelineManager(self.mesh_pipeline, min_interval_sec=1.0)
         self._mesh_version = -1  # track version for viewer refresh
