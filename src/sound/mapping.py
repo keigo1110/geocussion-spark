@@ -103,7 +103,11 @@ class AudioMapper:
         volume_curve: str = "logarithmic",       # 音量カーブ（linear/logarithmic/exponential）
         spatial_range: float = 2.0,             # 空間範囲（メートル）
         default_instrument: InstrumentType = InstrumentType.MARIMBA,
-        enable_adaptive_mapping: bool = True     # 適応的マッピング
+        enable_adaptive_mapping: bool = True,    # 適応的マッピング
+        *,
+        depth_max: Optional[float] = None,
+        drum_depth: Optional[float] = None,
+        scale_depth: Optional[float] = None,
     ):
         """
         初期化
@@ -124,6 +128,18 @@ class AudioMapper:
         self.spatial_range = spatial_range
         self.default_instrument = default_instrument
         self.enable_adaptive_mapping = enable_adaptive_mapping
+
+        # --- depth-based mapping parameters (optional) -----------------
+        self.depth_max = depth_max
+        self.drum_depth = drum_depth
+        self.scale_depth = scale_depth
+        self.depth_mapping_enabled = (
+            self.depth_max is not None
+            and self.drum_depth is not None
+            and self.scale_depth is not None
+            and self.depth_max > self.drum_depth > 0.0
+            and self.scale_depth > 0.0
+        )
         
         # 音階パターンを初期化
         self.scale_patterns = self._initialize_scale_patterns()
@@ -216,7 +232,32 @@ class AudioMapper:
         return audio_params
 
     def _map_pitch(self, event: CollisionEvent) -> float:
-        """Y座標を音高にマッピング"""
+        """Y座標または深度(Z)を音高にマッピング"""
+        # ------------------------------------------------------------------
+        # 1) 優先: 深度ベースの音階マッピング（ユーザ設定）
+        # ------------------------------------------------------------------
+        if self.depth_mapping_enabled:
+            depth = float(event.contact_position[2])  # Z 座標 (m)
+            # ドラム領域の場合は最低音に固定（実際には打楽器なので音高は無視される）
+            if depth >= self.drum_depth:
+                return float(self.pitch_range[0])  # 最低音に固定
+
+            # 有効範囲: 0.0m (カメラ近) ～ drum_depth
+            depth_offset = max(0.0, self.drum_depth - depth)
+            steps = int(round(depth_offset / self.scale_depth))
+
+            scale_notes = self.scale_patterns[self.scale]
+            min_note, max_note = self.pitch_range
+            base_note = min_note  # drum_depth 位置を最低音とする
+
+            # スケールをオクターブ跨いで展開
+            octave_shift, scale_idx = divmod(steps, len(scale_notes))
+            note = base_note + octave_shift * 12 + scale_notes[scale_idx]
+            return max(min_note, min(max_note, note))
+
+        # ------------------------------------------------------------------
+        # 2) 従来のY座標ベースマッピング
+        # ------------------------------------------------------------------
         # Y座標を正規化（適応的範囲使用）
         y_min, y_max = self.adaptive_params['y_range']
         y_pos = event.contact_position[1]
@@ -305,35 +346,61 @@ class AudioMapper:
         return max(0.15, min(0.8, duration))
     
     def _select_instrument(self, event: CollisionEvent) -> InstrumentType:
-        """楽器を選択"""
-        # デフォルト楽器から開始
-        instrument = self.default_instrument
-        
-        # 衝突タイプによる楽器選択
-        if hasattr(event, 'collision_type'):
-            collision_type_str = str(event.collision_type)
-            if "FACE_COLLISION" in collision_type_str:
-                instrument = InstrumentType.MARIMBA
-            elif "EDGE_COLLISION" in collision_type_str:
-                instrument = InstrumentType.BELL
-            elif "VERTEX_COLLISION" in collision_type_str:
-                instrument = InstrumentType.CRYSTAL
-        
-        # 高度（Y座標）による楽器選択
-        y_pos = event.contact_position[1]
+        """楽器を選択（優先度ベースで決定）"""
+
+        # ------------------------------------------------------------------
+        # ❶ 深度がドラム領域に入っている場合は無条件で DRUM
+        # ------------------------------------------------------------------
+        if self.depth_mapping_enabled:
+            depth = float(event.contact_position[2])
+            if depth >= self.drum_depth:
+                return InstrumentType.DRUM
+
+        # 以下は “音程領域” 用の選択ロジック
+
+        # ------------------------------------------------------------------
+        # ❷ 衝突面積（山の大きさ）によるベース楽器決定
+        # ------------------------------------------------------------------
+        base_instrument: InstrumentType = self.default_instrument
+        area = float(getattr(event, "contact_area", 0.0))
+        if area >= 0.03:
+            base_instrument = InstrumentType.SYNTH_PAD    # 大きな山 → 持続感のある音
+        elif area >= 0.015:
+            base_instrument = InstrumentType.STRING       # 中くらい → 弦楽器系
+        else:
+            base_instrument = InstrumentType.MARIMBA      # 小さい山 → 打楽器的木琴
+
+        # ------------------------------------------------------------------
+        # ❸ 衝突タイプで上書き（エッジ/頂点等なら金属系など）
+        # ------------------------------------------------------------------
+        if hasattr(event, "collision_type"):
+            ctype = str(event.collision_type)
+            if "EDGE_COLLISION" in ctype:
+                base_instrument = InstrumentType.BELL
+            elif "VERTEX_COLLISION" in ctype:
+                base_instrument = InstrumentType.CRYSTAL
+
+        # ------------------------------------------------------------------
+        # ❹ 高度 (Y) による色付け – 高い所はベル系、低い所は弦系
+        # ------------------------------------------------------------------
+        y_pos = float(event.contact_position[1])
         if y_pos > 0.7:
-            instrument = InstrumentType.BELL
-        elif y_pos < 0.3:
-            instrument = InstrumentType.DRUM
-        
-        # 音色ヒントによる調整
-        if hasattr(event, 'timbre_hint'):
-            if event.timbre_hint > 0.8:
-                instrument = InstrumentType.CRYSTAL
-            elif event.timbre_hint < 0.2:
-                instrument = InstrumentType.WATER_DROP
-        
-        return instrument
+            base_instrument = InstrumentType.BELL
+        elif y_pos < 0.2 and base_instrument != InstrumentType.STRING:
+            # 低すぎる場合は弦でボトムを厚く
+            base_instrument = InstrumentType.STRING
+
+        # ------------------------------------------------------------------
+        # ❺ timbre_hint があれば最終的に反映
+        # ------------------------------------------------------------------
+        if hasattr(event, "timbre_hint"):
+            th = float(event.timbre_hint)
+            if th > 0.8:
+                base_instrument = InstrumentType.CRYSTAL
+            elif th < 0.2:
+                base_instrument = InstrumentType.WATER_DROP
+
+        return base_instrument
     
     def _map_timbre(self, event: CollisionEvent) -> float:
         """音色をマッピング"""

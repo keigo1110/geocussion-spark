@@ -375,6 +375,13 @@ class FullPipelineViewer(DualViewer):
         # MediaPipe GPU 使用設定
         self.use_gpu_mediapipe = kwargs.pop('use_gpu_mediapipe', False)
     
+        # 処理対象とする最大距離を制限 (例: 1.1 → 1.1m より奥は無視)
+        self.max_point_depth = kwargs.pop('max_point_depth', None)
+    
+        # NEW depth-based scale mapping options
+        self.drum_depth = kwargs.pop('drum_depth', None)
+        self.scale_depth = kwargs.pop('scale_depth', None)
+    
     def _initialize_components(self):
         """コンポーネントを初期化"""
         # ヘルプテキスト
@@ -1712,6 +1719,7 @@ class FullPipelineViewer(DualViewer):
 
             points_3d, _ = self.pointcloud_converter.numpy_to_pointcloud(
                 depth_image,
+                max_depth=self.max_point_depth if self.max_point_depth is not None else 10.0,
                 exclude_centers=exc_centers,
                 exclude_radii=exc_radii,
             )
@@ -1961,7 +1969,10 @@ class FullPipelineViewer(DualViewer):
                 scale=self.audio_scale,
                 default_instrument=self.audio_instrument,
                 pitch_range=(48, 84),  # C3-C6
-                enable_adaptive_mapping=True
+                enable_adaptive_mapping=True,
+                depth_max=self.max_point_depth,
+                drum_depth=self.drum_depth,
+                scale_depth=self.scale_depth
             )
             
             # 音響シンセサイザー初期化（シンプルpygame版）
@@ -2824,6 +2835,7 @@ def add_basic_arguments(parser: argparse.ArgumentParser):
     parser.add_argument('--no-hand-detection', action='store_true', help='手検出を無効にする')
     parser.add_argument('--no-tracking', action='store_true', help='トラッキングを無効にする')
     parser.add_argument('--gpu-mediapipe', action='store_true', help='MediaPipeでGPUを使用')
+    parser.add_argument('--max-depth', type=float, help='最大点群距離 (m)')
 
 
 def add_collision_arguments(parser: argparse.ArgumentParser):
@@ -2852,6 +2864,9 @@ def add_audio_arguments(parser: argparse.ArgumentParser):
                        help='最大同時発音数')
     parser.add_argument('--audio-volume', type=float, default=DEFAULT_MASTER_VOLUME, 
                        help='マスター音量 (0.0-1.0)')
+    # NEW depth-based scale mapping options
+    parser.add_argument('--drum-depth', type=float, help='ドラム音域の開始深度 (m)')
+    parser.add_argument('--scale-depth', type=float, help='音階ステップ間隔 (m)')
 
 
 def add_detection_arguments(parser: argparse.ArgumentParser):
@@ -2911,6 +2926,22 @@ def validate_arguments(args) -> bool:
     if args.audio_volume < 0.0 or args.audio_volume > 1.0:
         print("Error: --audio-volume must be between 0.0 and 1.0")
         return False
+    
+    if getattr(args, 'max_depth', None) is not None and args.max_depth <= 0.0:
+        print("Error: --max-depth must be positive")
+        return False
+    
+    # NEW validations for depth-based mapping
+    if getattr(args, 'drum_depth', None) is not None and args.drum_depth <= 0.0:
+        print("Error: --drum-depth must be positive")
+        return False
+    if getattr(args, 'scale_depth', None) is not None and args.scale_depth <= 0.0:
+        print("Error: --scale-depth must be positive")
+        return False
+    if getattr(args, 'drum_depth', None) is not None and getattr(args, 'max_depth', None) is not None:
+        if args.drum_depth >= args.max_depth:
+            print("Error: --drum-depth must be less than --max-depth")
+            return False
     
     return True
 
@@ -3004,6 +3035,8 @@ def apply_configuration(depth_width: Optional[int], depth_height: Optional[int],
                                                depth_height == LOW_RESOLUTION[1])
     config.input.depth_width = depth_width
     config.input.depth_height = depth_height
+    if getattr(args, 'max_depth', None) is not None:
+        config.input.max_depth = args.max_depth
     
     # 解像度に基づく最適化
     if config.input.enable_low_resolution_mode:
@@ -3070,7 +3103,10 @@ def create_viewer(args, audio_scale: ScaleType, audio_instrument: InstrumentType
         max_mesh_skip_frames=args.max_mesh_skip,
         headless_mode=args.headless,
         headless_duration=args.headless_duration,
-        pure_headless_mode=args.headless_pure
+        pure_headless_mode=args.headless_pure,
+        max_point_depth=args.max_depth,
+        drum_depth=args.drum_depth,
+        scale_depth=args.scale_depth
     )
 
 
