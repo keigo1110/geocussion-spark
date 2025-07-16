@@ -1,0 +1,26 @@
+{
+  "version": 1,
+  "filters": {
+    "SpatialFilter": {
+      "enable": true,
+      "delta": 4,
+      "eps": 0
+    },
+    "TemporalFilter": {
+      "enable": true,
+      "alpha": 0.4,
+      "history": 4
+    },
+    "HoleFilter": {
+      "enable": true,
+      "mode": 2
+    },
+    "EdgeFilter": {
+      "enable": true
+    },
+    "SpeckleFilter": {
+      "enable": true,
+      "max_size": 100
+    }
+  }
+} 

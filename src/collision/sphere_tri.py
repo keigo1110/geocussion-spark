@@ -17,9 +17,10 @@ from ..mesh.delaunay import TriangleMesh
 from ..mesh.attributes import MeshAttributes
 from ..data_types import CollisionType, ContactPoint, CollisionInfo, SearchResult
 from ..constants import (
-    COLLISION_TOLERANCE, 
+    COLLISION_TOLERANCE,
+    COLLISION_DETECTION_PADDING,
     MAX_CONTACTS_PER_SPHERE,
-    NUMERICAL_TOLERANCE
+    NUMERICAL_TOLERANCE,
 )
 
 
@@ -32,7 +33,8 @@ class SphereTriangleCollision:
         mesh_attributes: Optional[MeshAttributes] = None,
         collision_tolerance: float = COLLISION_TOLERANCE,      # 衝突判定の許容誤差
         enable_face_culling: bool = False,      # 裏面カリング
-        max_contacts_per_sphere: int = MAX_CONTACTS_PER_SPHERE       # 球あたりの最大接触点数
+        max_contacts_per_sphere: int = MAX_CONTACTS_PER_SPHERE,      # 球あたりの最大接触点数
+        detection_padding: float = COLLISION_DETECTION_PADDING,      # 衝突判定のパディング
     ):
         """
         初期化
@@ -49,8 +51,18 @@ class SphereTriangleCollision:
         self.collision_tolerance = collision_tolerance
         self.enable_face_culling = enable_face_culling
         self.max_contacts_per_sphere = max_contacts_per_sphere
+        self.detection_padding = detection_padding
         
-        # パフォーマンス統計
+        # ベクトル化距離計算関数（Numba JIT）を取得
+        try:
+            from .distance import _get_jit_batch_point_function as _jit_batch_point_func_factory  # type: ignore
+            self._batch_distance_func = _jit_batch_point_func_factory()
+        except Exception:
+            self._batch_distance_func = None
+
+        # ベクトル化適用閾値（候補三角形数）
+        self._vectorization_threshold = 24  # 24 以上で一括距離計算
+
         self.stats = {
             'total_tests': 0,
             'total_test_time_ms': 0.0,
@@ -84,20 +96,44 @@ class SphereTriangleCollision:
         start_time = time.perf_counter()
         
         contact_points = []
-        
+
+        tri_indices = search_result.triangle_indices
+
+        # -------- ベクトル化距離プリフィルター --------
+        distance_prefilter: Optional[np.ndarray] = None
+        if (
+            self._batch_distance_func is not None
+            and len(tri_indices) >= self._vectorization_threshold
+        ):
+            try:
+                # 三角形頂点配列を作成 (M,3,3)
+                tri_vertices = self.mesh.vertices[self.mesh.triangles[tri_indices]]
+                distance_prefilter = self._batch_distance_func(
+                    sphere_center.astype(np.float64), tri_vertices.astype(np.float64)
+                )
+            except Exception:
+                distance_prefilter = None  # フォールバック
+
         # 各三角形との衝突判定
-        for i, triangle_idx in enumerate(search_result.triangle_indices):
-            # 距離による早期除外
-            if search_result.distances[i] > sphere_radius * 2:
+        for local_idx, triangle_idx in enumerate(tri_indices):
+            # 1) 距離による早期除外
+            pre_dist = None
+            if distance_prefilter is not None:
+                pre_dist = distance_prefilter[local_idx]
+            else:
+                # Fallback: 検索結果の距離情報
+                pre_dist = search_result.distances[local_idx] if local_idx < len(search_result.distances) else None
+
+            if pre_dist is not None and pre_dist > sphere_radius * 2 + self.detection_padding:
                 continue
-                
+
             contact_point = self._test_sphere_triangle(
                 sphere_center, sphere_radius, triangle_idx
             )
-            
+
             if contact_point is not None:
                 contact_points.append(contact_point)
-                
+
                 # 最大接触点数制限
                 if len(contact_points) >= self.max_contacts_per_sphere:
                     break
@@ -154,28 +190,57 @@ class SphereTriangleCollision:
             sphere_center, vertices
         )
         
-        # 衝突判定
-        penetration_depth = sphere_radius - distance
+        # 衝突判定 (パディングを考慮)
+        effective_radius = sphere_radius + self.detection_padding
+        penetration_depth = effective_radius - distance
         if penetration_depth <= self.collision_tolerance:
             return None
         
-        # 法線ベクトル計算
-        if self.mesh_attributes and self.mesh_attributes.triangle_normals is not None:
-            # 事前計算された法線を使用
-            triangle_normal = self.mesh_attributes.triangle_normals[triangle_idx]
+        # ------------------------------------------------------------------
+        # 接触法線の安定化: 頂点法線の重み付き補間を優先使用
+        # ------------------------------------------------------------------
+        contact_direction = sphere_center - closest_point  # ベース方向 (ペネトレーションベクトル)
+
+        contact_normal: np.ndarray
+
+        # 1) 頂点法線が利用可能な場合はバリセントリック補間
+        if (
+            self.mesh_attributes is not None and
+            getattr(self.mesh_attributes, "vertex_normals", None) is not None
+        ):
+            try:
+                v_normals = self.mesh_attributes.vertex_normals[triangle]  # shape (3,3)
+                interp_normal = (
+                    barycentric[0] * v_normals[0]
+                    + barycentric[1] * v_normals[1]
+                    + barycentric[2] * v_normals[2]
+                )
+                # 正規化
+                contact_normal = interp_normal / (np.linalg.norm(interp_normal) + 1e-8)
+            except Exception:
+                contact_normal = None  # フォールバックへ
         else:
-            # その場で計算
-            triangle_normal = self._calculate_triangle_normal(vertices)
-        
-        # 裏面カリング
-        if self.enable_face_culling:
-            to_sphere = sphere_center - closest_point
-            if np.dot(to_sphere, triangle_normal) < 0:
-                return None
-        
-        # 接触法線を計算
-        contact_direction = sphere_center - closest_point
-        contact_normal = contact_direction / (distance + 1e-8)
+            contact_normal = None
+
+        # 2) 頂点法線がない場合、三角形法線を使用
+        if contact_normal is None:
+            if (
+                self.mesh_attributes is not None and
+                getattr(self.mesh_attributes, "triangle_normals", None) is not None
+            ):
+                triangle_normal = self.mesh_attributes.triangle_normals[triangle_idx]
+            else:
+                triangle_normal = self._calculate_triangle_normal(vertices)
+
+            contact_normal = triangle_normal / (np.linalg.norm(triangle_normal) + 1e-8)
+
+        # 3) 法線方向を接触方向へ合わせる（外向き統一）
+        if np.dot(contact_normal, contact_direction) < 0:
+            contact_normal = -contact_normal
+
+        # 裏面カリング（法線が接触方向と反対向き → 衝突無視）
+        if self.enable_face_culling and np.dot(contact_direction, contact_normal) < 0:
+            return None
         
         return ContactPoint(
             position=closest_point,

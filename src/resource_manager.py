@@ -275,6 +275,12 @@ class ResourceManager:
                 return self._resource_instances[resource_id]
             return None
     
+    def touch_resource(self, resource_id: str) -> None:
+        """Update last_accessed timestamp of a managed resource."""
+        with self._lock:
+            if resource_id in self._resources:
+                self._resources[resource_id].touch()
+    
     def cleanup_resource(self, resource_id: str) -> bool:
         """指定されたリソースをクリーンアップ"""
         with self._lock:

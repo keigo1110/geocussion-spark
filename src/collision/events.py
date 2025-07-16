@@ -197,23 +197,20 @@ class CollisionEventQueue:
         Returns:
             正規化された手ID
         """
+        # hand_id の形式が "left_<x>_<z>" のように座標を含む場合のみ正規化を行う。
+        # 座標情報を含まない汎用 ID (例: "left_hand") はそのまま返す。
         try:
-            # hand_id の形式: "left_centerX_centerY_timestamp" or "right_centerX_centerY_timestamp"
             parts = hand_id.split('_')
-            if len(parts) >= 2:
-                handedness = parts[0]  # "left" or "right"
-                
-                # 接触位置を基にした統一ID生成（10cm単位で離散化）
-                pos_x = int(contact_position[0] * 10)  # 10cm単位
-                pos_z = int(contact_position[2] * 10)  # Z軸も考慮
-                
-                normalized_id = f"{handedness}_pos_{pos_x}_{pos_z}"
-                return normalized_id
-            
-        except (IndexError, ValueError, AttributeError):
-            # ID解析失敗時は元のIDを返す
+            # parts[1] が数値 (座標) であることを確認
+            if len(parts) >= 3 and parts[1].lstrip('-').isdigit() and parts[2].lstrip('-').isdigit():
+                handedness = parts[0]
+                pos_x = int(contact_position[0] * 10)  # 10cm 単位
+                pos_z = int(contact_position[2] * 10)
+                return f"{handedness}_pos_{pos_x}_{pos_z}"
+        except Exception:
+            # 解析エラー時は元の ID を返す
             pass
-        
+
         return hand_id
     
     def _is_debounced(self, hand_id: str, current_time: float) -> bool:

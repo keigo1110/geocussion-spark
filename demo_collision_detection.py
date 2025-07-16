@@ -35,6 +35,7 @@ from src.constants import (
     LOW_RESOLUTION,
     HIGH_RESOLUTION,
     ESTIMATED_HIGH_RES_POINTS,
+    COLLISION_DETECTION_PADDING,
 )
 
 # プロジェクトルートをパスに追加
@@ -161,6 +162,10 @@ from src.mesh.pipeline import create_mesh_pipeline  # unified mesh pipeline
 from src.mesh.manager import PipelineManager  # NEW pipeline manager
 from src.mesh.update_scheduler import MeshUpdateScheduler  # NEW scheduler
 from src.mesh.terrain_change import TerrainChangeDetector  # NEW change detector
+from src.collision.continuous_detection import (  # NEW continuous collision detection
+    ContinuousCollisionDetector,
+    create_continuous_collision_detector
+)
 
 # GPU加速コンポーネントの動的インポート
 HAS_GPU_ACCELERATION = False
@@ -303,6 +308,15 @@ class FullPipelineViewer(DualViewer):
         # 親クラス初期化
         super().__init__(**kwargs)
         
+        # ジオメトリ累積監視用カウンター
+        self._geometry_monitor = {
+            'frame_count': 0,
+            'last_geometry_count': 0,
+            'max_geometry_count': 0,
+            'cleanup_threshold': 10000,    # この数を超えたら強制クリーンアップ (急激な累積検出用)
+            'last_cleanup_frame': 0
+        }
+        
         # コンポーネントの初期化
         self._initialize_components()
         
@@ -321,7 +335,23 @@ class FullPipelineViewer(DualViewer):
         # 初期化完了フラグ
         self._components_initialized = False
         
+        # 連続衝突検出器を初期化
+        self._initialize_continuous_collision_detector()
+        
         self._display_initialization_info()
+    
+    def _initialize_continuous_collision_detector(self):
+        """連続衝突検出器を初期化"""
+        try:
+            self.continuous_detector = create_continuous_collision_detector(
+                enable_interpolation=True,
+                enable_adaptive_radius=True,
+                base_radius=self.sphere_radius
+            )
+            logger.info("Continuous collision detector initialized")
+        except Exception as e:
+            logger.error(f"Failed to initialize continuous collision detector: {e}")
+            self.continuous_detector = None
     
     def _extract_configuration(self, kwargs):
         """設定値を抽出"""
@@ -354,6 +384,13 @@ class FullPipelineViewer(DualViewer):
         # MediaPipe GPU 使用設定
         self.use_gpu_mediapipe = kwargs.pop('use_gpu_mediapipe', False)
     
+        # 処理対象とする最大距離を制限 (例: 1.1 → 1.1m より奥は無視)
+        self.max_point_depth = kwargs.pop('max_point_depth', None)
+    
+        # NEW depth-based scale mapping options
+        self.drum_depth = kwargs.pop('drum_depth', None)
+        self.scale_depth = kwargs.pop('scale_depth', None)
+    
     def _initialize_components(self):
         """コンポーネントを初期化"""
         # ヘルプテキスト
@@ -382,18 +419,22 @@ class FullPipelineViewer(DualViewer):
         self.collision_tester: Optional[SphereTriangleCollision] = None
         self.event_queue: CollisionEventQueue = CollisionEventQueue()
         
+        # 連続衝突検出器（高速移動対応）
+        self.continuous_detector: Optional[ContinuousCollisionDetector] = None
+        
         # 音響生成コンポーネント
         self.audio_mapper: Optional[AudioMapper] = None
         self.audio_synthesizer: Optional[Any] = None
         self.voice_manager: Optional[VoiceManager] = None
         self.audio_enabled = False
         
-        # 音響クールダウン管理
-        self.audio_cooldown_time = DEFAULT_AUDIO_COOLDOWN_TIME
+        # 音響クールダウン管理（高速タップ対応で短縮）
+        self.audio_cooldown_time = DEFAULT_AUDIO_COOLDOWN_TIME * 0.5  # 50%短縮
         self.last_audio_trigger_time = {}
-        # 衝突デバウンス用: (hand_id, triangle_idx) -> last trigger time
+        # 衝突デバウンス用: (hand_id, triangle_idx) -> last trigger time（短縮）
         from typing import Tuple as _Tuple
         self._last_contact_trigger_time: Dict[_Tuple[str, int, int, int], float] = {}
+        self._debounce_time = 0.15  # 250ms -> 150ms
     
         # 手検出コンポーネント
         self.enable_hand_detection = True
@@ -426,14 +467,21 @@ class FullPipelineViewer(DualViewer):
         )
 
         # 統合 MeshPipeline
-        self.mesh_pipeline = create_mesh_pipeline(enable_incremental=False)
+        # Enable incremental mesh updates for higher FPS (P-PERF-003)
+        self.mesh_pipeline = create_mesh_pipeline(enable_incremental=True)
         # 1 Hz mesh update interval (configurable via scheduler)
         self.pipeline_manager = PipelineManager(self.mesh_pipeline, min_interval_sec=1.0)
         self._mesh_version = -1  # track version for viewer refresh
     
         # Mesh update scheduler & terrain change detector --------------------------------
         # Grace period extended to 2 s to absorb temporary detection dropouts
-        self.mesh_scheduler = MeshUpdateScheduler(base_interval_sec=1.0, grace_period_sec=2.0)
+        # High-speed prioritization: 1.5 m/s threshold, 0.5x interval ratio
+        self.mesh_scheduler = MeshUpdateScheduler(
+            base_interval_sec=1.0, 
+            grace_period_sec=2.0,
+            high_speed_threshold=1.5,  # m/s
+            high_speed_interval_ratio=0.5  # Faster updates for high-speed
+        )
         self.terrain_detector = TerrainChangeDetector()
         self.terrain_deforming: bool = False  # flag to pause audio
     
@@ -596,7 +644,9 @@ class FullPipelineViewer(DualViewer):
                 "V: 衝突可視化 ON/OFF",
                 "N: メッシュ強制更新",
                 "+/-: 球半径調整",
-                "P: パフォーマンス統計表示"
+                "P: パフォーマンス統計表示",
+                "E: 連続衝突検出 ON/OFF",
+                "D: デバウンス時間調整"
             ]),
             ("音響生成制御", [
                 "A: 音響合成 ON/OFF",
@@ -649,6 +699,10 @@ class FullPipelineViewer(DualViewer):
             ord('_'): self._decrease_sphere_radius,
             ord('p'): self._print_performance_stats,
             ord('P'): self._print_performance_stats,
+            ord('e'): self._toggle_continuous_detection,
+            ord('E'): self._toggle_continuous_detection,
+            ord('d'): self._adjust_debounce_time,
+            ord('D'): self._adjust_debounce_time,
             
             # 音響生成
             ord('a'): self._toggle_audio_synthesis,
@@ -820,9 +874,20 @@ class FullPipelineViewer(DualViewer):
             # 空間インデックスは「メッシュが変わったとき」のみ再構築
             if mesh_res.changed or self.spatial_index is None:
                 self.spatial_index = SpatialIndex(simplified_mesh, index_type=IndexType.BVH)
-                # 衝突検出コンポーネント初期化 / 更新
+                # 衝突検出コンポーネント初期化 / 更新（法線プリコンピュート版）
+                from types import SimpleNamespace
+                try:
+                    from src.mesh.attributes import calculate_face_normals  # 軽量計算
+                    tri_normals = calculate_face_normals(simplified_mesh)
+                    from typing import Any, cast
+                    mesh_attr_stub = cast(Any, SimpleNamespace(triangle_normals=tri_normals))
+                except Exception:
+                    mesh_attr_stub = None  # フォールバック
+
                 self.collision_searcher = CollisionSearcher(self.spatial_index)
-                self.collision_tester = SphereTriangleCollision(simplified_mesh)
+                self.collision_tester = SphereTriangleCollision(  # type: ignore[arg-type]
+                    simplified_mesh, mesh_attributes=mesh_attr_stub
+                )
             
             # メッシュ保存
             self.current_mesh = simplified_mesh
@@ -860,14 +925,36 @@ class FullPipelineViewer(DualViewer):
                        f"Y[{mesh_min[1]:.3f}, {mesh_max[1]:.3f}], Z[{mesh_min[2]:.3f}, {mesh_max[2]:.3f}]")
     
     def _detect_collisions(self, tracked_hands: List[TrackedHand]) -> List[Any]:
-        """衝突検出を実行"""
+        """衝突検出を実行（連続衝突検出対応版）"""
         if not self.collision_searcher:
             logger.debug("No collision searcher available")
             return []
         
+        # --------------------------------------------------------------
+        # GPU バッチ衝突検出パス  (複数手を一括で距離計算)
+        # --------------------------------------------------------------
+        batched_gpu_infos: Dict[str, Any] = {}
+        use_gpu_distance_global = (
+            self.gpu_acceleration_enabled and self.gpu_distance_calc is not None
+        )
+        if use_gpu_distance_global and len(tracked_hands) > 1:
+            try:
+                batched_gpu_infos = self._gpu_batch_collision_detection(tracked_hands)
+            except Exception as _exc:
+                logger.warning("Batch GPU collision detection failed: %s", _exc)
+                batched_gpu_infos = {}
+
         events = []
         self.current_collision_points = []
+        current_time = time.perf_counter()
         logger.debug(f"Processing {len(tracked_hands)} hands")
+        
+        # アクティブな手IDリストを生成（履歴クリーンアップ用）
+        active_hand_ids = [hand.id for hand in tracked_hands if hand.position is not None]
+        
+        # 連続衝突検出器の履歴をクリーンアップ
+        if self.continuous_detector:
+            self.continuous_detector.cleanup_old_tracks(active_hand_ids)
         
         # GPU加速距離計算の準備
         use_gpu_distance = (
@@ -881,52 +968,72 @@ class FullPipelineViewer(DualViewer):
                 logger.debug(f"Hand {i} has no position")
                 continue
             
-            # Prepare list of positions to test: current + historical (predictive)
-            pos_history = self._hand_position_history.get(hand.id, [])
-            positions_to_test: List[np.ndarray] = [np.array(hand.position)] + [np.array(p) for p in pos_history]
-
-            # Remove duplicates while preserving order
-            seen = set()
-            unique_positions = []
-            for p in positions_to_test:
-                tup = tuple(np.round(p, 4))
-                if tup not in seen:
-                    seen.add(tup)
-                    unique_positions.append(p)
-
-            hand_pos_np = unique_positions[0]
-            
-            logger.debug(f"Hand {i} position: ({hand_pos_np[0]:.3f}, {hand_pos_np[1]:.3f}, {hand_pos_np[2]:.3f})")
+            logger.debug(f"Hand {i} position: ({hand.position[0]:.3f}, {hand.position[1]:.3f}, {hand.position[2]:.3f})")
             
             try:
-                for ptest in unique_positions:
-                    # Adaptive radius: enlarge slightly based on velocity magnitude
-                    vel_mag = float(np.linalg.norm(getattr(hand, "velocity", np.zeros(3)))) if hasattr(hand, "velocity") else 0.0
-                    adaptive_radius = self.sphere_radius + min(0.03, vel_mag * 0.05)
+                # 1) GPU バッチ結果があれば優先利用
+                collision_info = batched_gpu_infos.get(hand.id) if batched_gpu_infos else None
 
-                    # Direct sphere query for the specific test point
-                    res = self.collision_searcher._search_point(ptest, adaptive_radius)
-
-                    if not res.triangle_indices:
-                        continue
-
-                    info = self._perform_collision_test(
-                        ptest, adaptive_radius, res, use_gpu_distance, i
+                # 2) 連続衝突検出
+                if (not collision_info or not collision_info.has_collision) and self.continuous_detector and self.collision_tester:
+                    collision_info = self.continuous_detector.detect_continuous_collision(
+                        hand, self.collision_searcher, self.collision_tester, current_time
                     )
-
-                    if info and info.has_collision:
-                        event = self._create_collision_event(hand, ptest, info)
-                        if event:
-                            events.append(event)
-                            self._update_collision_points(info)
-                        # Found collision, break predictive loop
-                        break
+                
+                # 3) 従来方式フォールバック
+                if (not collision_info or not collision_info.has_collision):
+                    collision_info = self._detect_collision_legacy(hand, use_gpu_distance, i)
+                
+                # 衝突が検出された場合
+                if collision_info and collision_info.has_collision:
+                    event = self._create_collision_event(hand, np.array(hand.position), collision_info)
+                    if event:
+                        events.append(event)
+                        self._update_collision_points(collision_info)
 
             except Exception as e:
                 logger.error(f"Error processing hand {i}: {e}")
         
         logger.debug(f"Total collision events: {len(events)}")
         return events
+    
+    def _detect_collision_legacy(self, hand: TrackedHand, use_gpu_distance: bool, hand_index: int) -> Optional[Any]:
+        """従来方式の衝突検出（フォールバック用）"""
+        # Prepare list of positions to test: current + historical (predictive)
+        pos_history = self._hand_position_history.get(hand.id, [])
+        positions_to_test: List[np.ndarray] = [np.array(hand.position)] + [np.array(p) for p in pos_history]
+
+        # Remove duplicates while preserving order
+        seen = set()
+        unique_positions = []
+        for p in positions_to_test:
+            tup = tuple(np.round(p, 4))
+            if tup not in seen:
+                seen.add(tup)
+                unique_positions.append(p)
+
+        for ptest in unique_positions:
+            # Enhanced adaptive radius using new constants
+            vel_mag = float(np.linalg.norm(getattr(hand, "velocity", np.zeros(3)))) if hasattr(hand, "velocity") else 0.0
+            from src.constants import COLLISION_ADAPTIVE_VELOCITY_COEFFICIENT, COLLISION_ADAPTIVE_MAX_RADIUS_EXTENSION
+            adaptive_radius = self.sphere_radius + min(COLLISION_ADAPTIVE_MAX_RADIUS_EXTENSION, vel_mag * COLLISION_ADAPTIVE_VELOCITY_COEFFICIENT)
+
+            # Direct sphere query for the specific test point
+            if self.collision_searcher is None:
+                continue
+            res = self.collision_searcher._search_point(ptest, adaptive_radius)
+
+            if not res.triangle_indices:
+                continue
+
+            info = self._perform_collision_test(
+                ptest, adaptive_radius, res, use_gpu_distance, hand_index
+            )
+
+            if info and info.has_collision:
+                return info
+        
+        return None
     
     def _perform_collision_test(self, hand_pos: np.ndarray, radius: float, 
                                search_result: Any, use_gpu: bool, hand_index: int) -> Any:
@@ -1043,8 +1150,10 @@ class FullPipelineViewer(DualViewer):
         from src.collision.sphere_tri import CollisionInfo, ContactPoint
         from src.data_types import CollisionType
         
-        # 衝突判定（半径内の距離）
-        collision_mask = distances[0] <= radius
+        # 衝突判定（半径 + パディング 内の距離）
+        from src.constants import COLLISION_DETECTION_PADDING  # ローカル import で循環防止
+        effective_radius = radius + COLLISION_DETECTION_PADDING
+        collision_mask = distances[0] <= effective_radius
         collision_triangle_indices = np.array(search_result.triangle_indices)[collision_mask]
         collision_distances = distances[0][collision_mask]
         
@@ -1062,10 +1171,11 @@ class FullPipelineViewer(DualViewer):
                 normal = normal / (np.linalg.norm(normal) + 1e-8)
                 
                 from numpy import array as _arr
+                penetration = effective_radius - collision_distances[i]
                 contact_point = ContactPoint(
                     position=centroid,
                     normal=normal,
-                    depth=float(radius - collision_distances[i]),
+                    depth=float(penetration),
                     triangle_index=int(tri_idx),
                     barycentric=_arr([1.0 / 3, 1.0 / 3, 1.0 / 3]),
                     collision_type=CollisionType.FACE_COLLISION,
@@ -1100,115 +1210,287 @@ class FullPipelineViewer(DualViewer):
         )
     
     def _update_mesh_visualization(self, mesh: Any) -> None:
-        """メッシュ可視化を更新"""
-        if not hasattr(self, 'vis') or self.vis is None:
+        logger.debug("[MESH-DEBUG] _update_mesh_visualization called")
+        """メッシュ可視化を更新 (geometry re-use to reduce Open3D queue pressure)"""
+        if self.vis is None:
+            logger.debug("[MESH-DEBUG] vis is None, returning")
             return
-        
-        # 既存のメッシュジオメトリを削除
-        for geom in self.mesh_geometries:
-            self.vis.remove_geometry(geom, reset_bounding_box=False)
-        self.mesh_geometries.clear()
-        
-        try:
-            # Open3Dメッシュを作成
-            o3d_mesh = o3d.geometry.TriangleMesh()
-            o3d_mesh.vertices = o3d.utility.Vector3dVector(mesh.vertices)
-            o3d_mesh.triangles = o3d.utility.Vector3iVector(mesh.triangles)
-            
-            # 法線計算
+
+        # -------------------------------------------------------------
+        # 1) 初回生成 – create geometry objects and add to visualizer
+        # -------------------------------------------------------------
+        if not hasattr(self, "_mesh_vis_objs"):
+            logger.debug("[MESH-DEBUG] Initializing _mesh_vis_objs")
+            self._mesh_vis_objs = {}
+
+        o3d_mesh = self._mesh_vis_objs.get("tri_mesh")  # type: ignore[attr-defined]
+        wireframe = self._mesh_vis_objs.get("wire")     # type: ignore[attr-defined]
+
+        logger.debug(f"[MESH-DEBUG] o3d_mesh: {o3d_mesh is not None}, wireframe: {wireframe is not None}")
+        logger.debug(f"[MESH-DEBUG] _mesh_vis_objs keys: {list(self._mesh_vis_objs.keys())}")
+        if wireframe is not None:
+            logger.debug(f"[MESH-DEBUG] wireframe object id: {id(wireframe)}")
+
+        import numpy as _np
+        from open3d import geometry as _o3g, utility as _o3u
+
+        if o3d_mesh is None:
+            logger.debug("[MESH-DEBUG] Initial creation - o3d_mesh is None")
+            # 初回 – create mesh and wireframe, add once
+            o3d_mesh = _o3g.TriangleMesh()
+            o3d_mesh.vertices = _o3u.Vector3dVector(mesh.vertices.copy())
+            o3d_mesh.triangles = _o3u.Vector3iVector(mesh.triangles.copy())
             o3d_mesh.compute_vertex_normals()
-            
-            # 半透明のマテリアル設定
-            o3d_mesh.paint_uniform_color([0.8, 0.8, 0.9])  # 薄青色
-            
-            # ワイヤーフレーム表示
-            wireframe = o3d.geometry.LineSet.create_from_triangle_mesh(o3d_mesh)
-            wireframe.paint_uniform_color([0.3, 0.3, 0.7])  # 青色
-            
-            # ジオメトリを追加
-            self.vis.add_geometry(o3d_mesh, reset_bounding_box=False)
+            o3d_mesh.paint_uniform_color([0.8, 0.8, 0.9])
+
+            wireframe = _o3g.LineSet.create_from_triangle_mesh(o3d_mesh)
+            wireframe.paint_uniform_color([0.3, 0.3, 0.7])
+
+            # Faces hidden: we skip adding o3d_mesh (solid) and add only wireframe
             self.vis.add_geometry(wireframe, reset_bounding_box=False)
-            
-            self.mesh_geometries.extend([o3d_mesh, wireframe])
-            
-            # -- Open3D バッファ更新 (T-MESH-106) --
+            logger.debug("[MESH-DEBUG] Initial wireframe added to visualizer")
+
+            self._mesh_vis_objs["wire"] = wireframe
+            self._mesh_vis_objs["tri_mesh"] = o3d_mesh  # CRITICAL: Store the o3d_mesh too!
+        else:
+            # ---------------------------------------------------------
+            # 2) 更新 – 既存 geometry の頂点 / 三角形を最新メッシュに差し替え
+            # ---------------------------------------------------------
+            if wireframe is None:
+                logger.warning("[MESH-DEBUG] wireframe is None - THIS IS THE BUG! Creating new wireframe and adding to scene")
+                wireframe = _o3g.LineSet.create_from_triangle_mesh(o3d_mesh)
+                wireframe.paint_uniform_color([0.3, 0.3, 0.7])
+                self.vis.add_geometry(wireframe, reset_bounding_box=False)
+                self._mesh_vis_objs["wire"] = wireframe
+            else:
+                logger.debug("[MESH-DEBUG] wireframe exists - updating in-place")
+
             try:
-                self.vis.update_geometry(o3d_mesh)
+                o3d_mesh.vertices = _o3u.Vector3dVector(mesh.vertices.copy())
+                o3d_mesh.triangles = _o3u.Vector3iVector(mesh.triangles.copy())
+                o3d_mesh.compute_vertex_normals()
+
+                # ------------------------------------------------------
+                # Efficient wireframe update:
+                #  • 直接 numpy でエッジ (2-tuple) を再計算
+                #  • LineSet の points / lines を置換
+                #  • 一切の add/remove 呼び出しを行わない
+                # ------------------------------------------------------
+
+                verts_np = _np.asarray(mesh.vertices)  # (N,3)
+                tris_np  = _np.asarray(mesh.triangles, dtype=_np.int64)  # (M,3)
+
+                # Triangle → edge (3*M, 2) then unique 化
+                edges = _np.concatenate([
+                    tris_np[:, [0, 1]],
+                    tris_np[:, [1, 2]],
+                    tris_np[:, [2, 0]],
+                ], axis=0)
+
+                # 重複辺を除去 (各辺の index を昇順ソートして set 化)
+                edges_sorted = _np.sort(edges, axis=1)
+                edges_unique = _np.unique(edges_sorted, axis=0)
+
+                # Open3D LineSet update
+                wireframe.points = _o3u.Vector3dVector(verts_np.copy())
+                wireframe.lines  = _o3u.Vector2iVector(edges_unique)
+
+                # Reapply uniform colour (エッジ数が変わる可能性がある)
+                if edges_unique.shape[0] > 0:
+                    blue = _np.tile([0.3, 0.3, 0.7], (edges_unique.shape[0], 1))
+                    wireframe.colors = _o3u.Vector3dVector(blue)
+
                 self.vis.update_geometry(wireframe)
-            except Exception as _exc:  # pylint: disable=broad-except
-                logger.debug("Open3D update_geometry failed: %s", _exc)
-            
-        except Exception as e:
-            logger.error(f"メッシュ可視化エラー: {e}")
+                self._mesh_vis_objs["wire"] = wireframe
+            except Exception as exc:  # pylint: disable=broad-except
+                logger.debug("Wireframe in-place update failed: %s", exc)
+
+        # Request redraw (non-blocking)
+        try:
+            self.vis.poll_events()
+            self.vis.update_renderer()
+        except Exception:
+            pass
     
     def _update_collision_visualization(self) -> None:
-        """衝突可視化を更新"""
+        """衝突可視化を更新 - プール方式でジオメトリ累積防止"""
         if not hasattr(self, 'vis') or self.vis is None:
             return
         
-        # 既存の衝突ジオメトリを削除
-        for geom in self.collision_geometries:
-            self.vis.remove_geometry(geom, reset_bounding_box=False)
-        self.collision_geometries.clear()
-        
         if not self.enable_collision_visualization:
+            # 可視化無効時は全ての要素を遠方に退避
+            self._hide_all_collision_elements()
             return
         
         try:
-            # 接触点を可視化
+            # 接触点を可視化（プール方式）
             self._visualize_contact_points()
             
-            # 衝突球を可視化
+            # 衝突球を可視化（プール方式）
             self._visualize_collision_spheres()
         
         except Exception as e:
             logger.error(f"衝突可視化エラー: {e}")
+
+    def _hide_all_collision_elements(self) -> None:
+        """すべての衝突可視化要素を遠方に退避"""
+        if self.vis is None:
+            return
+            
+        try:
+            # 接触点プールを遠方に退避
+            if hasattr(self, '_contact_pool'):
+                far = np.array([1e6, 1e6, 1e6])
+                for sphere, line in self._contact_pool:
+                    sphere.translate(far - np.asarray(sphere.vertices).mean(axis=0), relative=True)
+                    line.points = o3d.utility.Vector3dVector([far, far + np.array([0, 0.05, 0])])
+                    self.vis.update_geometry(sphere)
+                    self.vis.update_geometry(line)
+            
+            # 衝突球プールを遠方に退避
+            if hasattr(self, '_sphere_pool'):
+                far_position = np.array([1e6, 1e6, 1e6])
+                for pool_entry in self._sphere_pool.values():
+                    wire = pool_entry['wire']
+                    current_pos = pool_entry['position']
+                    if not np.allclose(current_pos, far_position, atol=1e5):
+                        wire.translate(far_position - current_pos, relative=True)
+                        pool_entry['position'] = far_position
+                        self.vis.update_geometry(wire)
+                        
+        except Exception as e:
+            logger.debug(f"Collision element hiding failed: {e}")
     
     def _visualize_contact_points(self) -> None:
-        """接触点を可視化"""
+        """接触点を可視化 – 1 度生成したジオメトリを再利用してメモリ増加を防ぐ"""
         if self.vis is None:
             return
-        for contact in self.current_collision_points:
-            # ContactPointオブジェクトから直接アクセス
-            position = contact.position
-            normal = contact.normal
-            
-            # 接触点（球）
-            contact_sphere = o3d.geometry.TriangleMesh.create_sphere(radius=0.01)
-            contact_sphere.translate(position)
-            contact_sphere.paint_uniform_color([1.0, 0.0, 0.0])  # 赤色
-            
-            # 法線ベクトル（線分）
-            normal_end = position + normal * 0.05
-            normal_line = o3d.geometry.LineSet()
-            normal_line.points = o3d.utility.Vector3dVector([position, normal_end])
-            normal_line.lines = o3d.utility.Vector2iVector([[0, 1]])
-            normal_line.paint_uniform_color([1.0, 1.0, 0.0])  # 黄色
-            
-            self.vis.add_geometry(contact_sphere, reset_bounding_box=False)
-            self.vis.add_geometry(normal_line, reset_bounding_box=False)
-            
-            self.collision_geometries.extend([contact_sphere, normal_line])
+
+        # プール初期化
+        if not hasattr(self, "_contact_pool"):
+            # 各要素は (sphere_mesh, line_set)
+            self._contact_pool = []  # type: ignore[attr-defined]
+
+        required = len(self.current_collision_points)
+
+        # プール拡張: 不足分を生成して add_geometry (1 回のみ)
+        while len(self._contact_pool) < required:
+            sphere = o3d.geometry.TriangleMesh.create_sphere(radius=0.01)
+            sphere.paint_uniform_color([1.0, 0.0, 0.0])
+
+            line = o3d.geometry.LineSet()
+            line.points = o3d.utility.Vector3dVector([[0, 0, 0], [0, 0.05, 0]])
+            line.lines = o3d.utility.Vector2iVector([[0, 1]])
+            line.paint_uniform_color([1.0, 1.0, 0.0])
+
+            self.vis.add_geometry(sphere, reset_bounding_box=False)
+            self.vis.add_geometry(line, reset_bounding_box=False)
+
+            self._contact_pool.append((sphere, line))
+
+        # 更新
+        for idx, contact in enumerate(self.current_collision_points):
+            sphere, line = self._contact_pool[idx]
+
+            # 座標更新 (translate relative でジオメトリ再利用)
+            old_center = np.asarray(sphere.vertices).mean(axis=0)
+            delta = contact.position - old_center
+            sphere.translate(delta, relative=True)
+
+            # 法線更新
+            normal_end = contact.position + contact.normal * 0.05
+            line.points = o3d.utility.Vector3dVector([contact.position, normal_end])
+
+            # renderer へ更新通知
+            self.vis.update_geometry(sphere)
+            self.vis.update_geometry(line)
+
+        # 使わなくなったプール要素は遠方へ退避して "非表示" に (削除しない)
+        hide_start = len(self.current_collision_points)
+        for idx in range(hide_start, len(self._contact_pool)):
+            sphere, line = self._contact_pool[idx]
+            far = np.array([1e6, 1e6, 1e6])
+            sphere.translate(far - np.asarray(sphere.vertices).mean(axis=0), relative=True)
+            line.points = o3d.utility.Vector3dVector([far, far + np.array([0, 0.05, 0])])
+            self.vis.update_geometry(sphere)
+            self.vis.update_geometry(line)
     
     def _visualize_collision_spheres(self) -> None:
-        """衝突球を可視化"""
+        """衝突球を可視化 - プール方式でジオメトリ累積を防止"""
         if self.vis is None:
             return
-        if self.current_tracked_hands:
-            for tracked in self.current_tracked_hands:
-                if tracked.position is not None:
-                    hand_sphere = o3d.geometry.TriangleMesh.create_sphere(
-                        radius=self.sphere_radius
-                    )
-                    hand_sphere.translate(tracked.position)
-                    hand_sphere.paint_uniform_color([0.0, 1.0, 0.0])  # 緑色
-                    
-                    # ワイヤーフレーム表示
-                    wireframe = o3d.geometry.LineSet.create_from_triangle_mesh(hand_sphere)
-                    wireframe.paint_uniform_color([0.0, 0.8, 0.0])
-                    
-                    self.vis.add_geometry(wireframe, reset_bounding_box=False)
-                    self.collision_geometries.append(wireframe)
+
+        # 衝突球プール初期化 (hand_id -> {'wire': LineSet, 'radius': float, 'position': np.array})
+        if not hasattr(self, "_sphere_pool"):
+            self._sphere_pool = {}  # type: ignore[attr-defined]
+
+        current_hand_ids = {hand.id for hand in self.current_tracked_hands if hand.position is not None}
+        
+        # ------------------------------------------------------------------
+        # 1) 新しい手ID用の球を生成（プールに追加）
+        # ------------------------------------------------------------------
+        for hand in self.current_tracked_hands:
+            if hand.position is None or hand.id in self._sphere_pool:
+                continue
+                
+            # 新しい手用の衝突球を生成
+            sphere_mesh = o3d.geometry.TriangleMesh.create_sphere(radius=self.sphere_radius)
+            wire = o3d.geometry.LineSet.create_from_triangle_mesh(sphere_mesh)
+            wire.paint_uniform_color([0.0, 0.8, 0.0])
+            
+            # 初期位置に配置
+            wire.translate(hand.position, relative=False)
+            
+            self.vis.add_geometry(wire, reset_bounding_box=False)
+            
+            self._sphere_pool[hand.id] = {
+                'wire': wire,
+                'radius': self.sphere_radius,
+                'position': np.array(hand.position)
+            }
+
+        # ------------------------------------------------------------------
+        # 2) 既存の球を更新（位置・半径変更）
+        # ------------------------------------------------------------------
+        for hand in self.current_tracked_hands:
+            if hand.position is None or hand.id not in self._sphere_pool:
+                continue
+                
+            pool_entry = self._sphere_pool[hand.id]
+            wire = pool_entry['wire']
+            old_position = pool_entry['position']
+            old_radius = pool_entry['radius']
+            
+            # 位置更新
+            if not np.allclose(old_position, hand.position, atol=1e-6):
+                translation = np.array(hand.position) - old_position
+                wire.translate(translation, relative=True)
+                pool_entry['position'] = np.array(hand.position)
+            
+            # 半径更新（必要な場合のみ）
+            if abs(old_radius - self.sphere_radius) > 1e-6:
+                scale_factor = self.sphere_radius / old_radius
+                center = pool_entry['position']
+                wire.translate(-center, relative=True)  # 原点へ移動
+                wire.scale(scale_factor, center=[0, 0, 0])  # スケール
+                wire.translate(center, relative=True)   # 元の位置へ戻す
+                pool_entry['radius'] = self.sphere_radius
+            
+            self.vis.update_geometry(wire)
+
+        # ------------------------------------------------------------------
+        # 3) 使われなくなった手IDの球を遠方へ退避（削除しない）
+        # ------------------------------------------------------------------
+        for hand_id, pool_entry in self._sphere_pool.items():
+            if hand_id not in current_hand_ids:
+                wire = pool_entry['wire']
+                far_position = np.array([1e6, 1e6, 1e6])
+                current_pos = pool_entry['position']
+                
+                if not np.allclose(current_pos, far_position, atol=1e5):
+                    wire.translate(far_position - current_pos, relative=True)
+                    pool_entry['position'] = far_position
+                    self.vis.update_geometry(wire)
     
     def _update_visualization(self) -> None:
         """可視化全体を更新"""
@@ -1235,6 +1517,27 @@ class FullPipelineViewer(DualViewer):
     def _force_mesh_update(self) -> None:
         """メッシュ強制更新をリクエスト"""
         self.force_mesh_update_requested = True
+    
+    def _toggle_continuous_detection(self) -> bool:
+        """連続衝突検出のON/OFF切り替え"""
+        if self.continuous_detector:
+            # 現在の設定を反転
+            self.continuous_detector.config.enable_interpolation_sampling = not self.continuous_detector.config.enable_interpolation_sampling
+            self.continuous_detector.config.enable_adaptive_radius = not self.continuous_detector.config.enable_adaptive_radius
+            status = "有効" if self.continuous_detector.config.enable_interpolation_sampling else "無効"
+            print(f"連続衝突検出: {status}")
+        else:
+            print("連続衝突検出器が初期化されていません")
+        return True
+    
+    def _adjust_debounce_time(self) -> bool:
+        """デバウンス時間を調整"""
+        if self._debounce_time <= 0.05:
+            self._debounce_time = 0.3  # 5ms -> 300ms にリセット
+        else:
+            self._debounce_time *= 0.7  # 30%減少
+        print(f"デバウンス時間: {self._debounce_time*1000:.0f}ms")
+        return True
     
     def _print_performance_stats(self) -> bool:
         """パフォーマンス統計を印刷"""
@@ -1286,6 +1589,15 @@ class FullPipelineViewer(DualViewer):
         if self.current_mesh:
             print(f"現在のメッシュ: {self.current_mesh.num_triangles}三角形")
         print(f"球半径: {self.sphere_radius*100:.1f}cm")
+        
+        # 連続衝突検出統計
+        if self.continuous_detector:
+            continuous_stats = self.continuous_detector.get_performance_stats()
+            print(f"連続衝突検出統計:")
+            print(f"  - 補間サンプル生成: {continuous_stats['interpolation_samples_generated']}")
+            print(f"  - 適応的半径適用: {continuous_stats['adaptive_radius_applied']}")
+            print(f"  - 高速移動検出: {continuous_stats['high_speed_detections']}")
+            print(f"  - 処理時間: {continuous_stats['continuous_collision_time_ms']:.1f}ms")
     
     def _print_audio_stats(self) -> None:
         """音響統計を印刷"""
@@ -1390,7 +1702,7 @@ class FullPipelineViewer(DualViewer):
         # Decide if we need to force mesh update via scheduler
         # --------------------------------------------------------------
         any_hands_present = prelim_hands_present or self.terrain_deforming
-        force_update = self.mesh_scheduler.should_update(any_hands_present)
+        force_update = self.mesh_scheduler.should_update(any_hands_present, tracked_hands)
         
         collision_events = self._process_collision_pipeline(
             points_3d, tracked_hands, force_update=force_update
@@ -1408,6 +1720,47 @@ class FullPipelineViewer(DualViewer):
                     return False
         
         self.frame_count += 1
+        
+        # ------------------------------------------------------------------
+        # Periodic memory cleanup to prevent long-run memory buildup (M-LEAK-001)
+        # ------------------------------------------------------------------
+        # ジオメトリ累積監視
+        self._monitor_geometry_accumulation()
+        
+        try:
+            if self.frame_count % 300 == 0:  # every ~10s at 30 FPS
+                import gc
+                gc.collect()
+
+                # Release unused CuPy GPU blocks if CuPy is available
+                try:
+                    import cupy as _cp  # pylint: disable=import-error
+                    _cp.get_default_memory_pool().free_all_blocks()
+                    _cp.get_default_pinned_memory_pool().free_all_blocks()
+                except Exception:  # CuPy not installed or other issue – ignore
+                    pass
+
+                # Trim large collision/event caches to fixed size (defensive)
+                if hasattr(self, "event_queue") and self.event_queue is not None:
+                    try:
+                        self.event_queue.pop_processed(max_length=256)
+                    except AttributeError:
+                        # Older versions – manually shrink deque length
+                        if len(self.event_queue.event_queue) > 512:
+                            while len(self.event_queue.event_queue) > 256:
+                                self.event_queue.event_queue.popleft()
+
+                # Prune _last_contact_trigger_time dict beyond 1 k entries
+                if hasattr(self, "_last_contact_trigger_time") and isinstance(self._last_contact_trigger_time, dict):
+                    if len(self._last_contact_trigger_time) > 1000:
+                        for _ in range(len(self._last_contact_trigger_time) - 800):
+                            try:
+                                self._last_contact_trigger_time.pop(next(iter(self._last_contact_trigger_time)))
+                            except Exception:
+                                break
+        except Exception:
+            # Cleanup should never crash the main loop
+            pass
         
         # パフォーマンス統計更新
         frame_time = (time.perf_counter() - frame_start_time) * 1000
@@ -1588,6 +1941,7 @@ class FullPipelineViewer(DualViewer):
 
             points_3d, _ = self.pointcloud_converter.numpy_to_pointcloud(
                 depth_image,
+                max_depth=self.max_point_depth if self.max_point_depth is not None else 10.0,
                 exclude_centers=exc_centers,
                 exclude_radii=exc_radii,
             )
@@ -1704,7 +2058,7 @@ class FullPipelineViewer(DualViewer):
             points_3d,
             tracked_hands,
             hands_present_override=any_hands_present,
-            force=force_update,
+            force=True,  # TEMP: Force mesh update every frame for testing wireframe accumulation
         )
 
         if res.mesh is not None and (
@@ -1717,10 +2071,28 @@ class FullPipelineViewer(DualViewer):
             # Rebuild index only when res.changed True
             if res.changed or self.spatial_index is None:
                 self.spatial_index = SpatialIndex(res.mesh, index_type=IndexType.BVH)
-                self.collision_searcher = CollisionSearcher(self.spatial_index)
-                self.collision_tester = SphereTriangleCollision(res.mesh)
+                # 衝突検出コンポーネント初期化 / 更新（法線プリコンピュート版）
+                from types import SimpleNamespace
+                try:
+                    from src.mesh.attributes import calculate_face_normals  # 軽量計算
+                    tri_normals = calculate_face_normals(res.mesh)
+                    from typing import Any, cast
+                    mesh_attr_stub = cast(Any, SimpleNamespace(triangle_normals=tri_normals))
+                except Exception:
+                    mesh_attr_stub = None  # フォールバック
 
-            self._update_mesh_visualization(res.mesh)
+                self.collision_searcher = CollisionSearcher(self.spatial_index)
+                self.collision_tester = SphereTriangleCollision(  # type: ignore[arg-type]
+                    res.mesh, mesh_attributes=mesh_attr_stub
+                )
+
+            # Only update visualization when mesh geometry actually changes
+            if res.changed or res.needs_refresh:
+                logger.debug("[MESH-VIS] Updating mesh visualization due to geometry change")
+                self._update_mesh_visualization(res.mesh)
+            else:
+                logger.debug("[MESH-VIS] Skipping visualization update - no geometry change")
+                
             # Update mesh timestamp to throttle point-cloud generation
             self.last_mesh_update = self.frame_count
         
@@ -1825,7 +2197,10 @@ class FullPipelineViewer(DualViewer):
                 scale=self.audio_scale,
                 default_instrument=self.audio_instrument,
                 pitch_range=(48, 84),  # C3-C6
-                enable_adaptive_mapping=True
+                enable_adaptive_mapping=True,
+                depth_max=self.max_point_depth,
+                drum_depth=self.drum_depth,
+                scale_depth=self.scale_depth
             )
             
             # 音響シンセサイザー初期化（シンプルpygame版）
@@ -1971,13 +2346,19 @@ class FullPipelineViewer(DualViewer):
         return True
     
     def _check_contact_debounce(self, event: Any) -> bool:
-        """手ID + 接触位置グリッド (≈2 cm) で 250 ms デバウンス"""
+        """手ID + 接触位置グリッド (≈2 cm) で動的デバウンス"""
         gx = int(round(event.contact_position[0] * 50))  # 1/50 m = 2 cm
         gy = int(round(event.contact_position[1] * 50))
         gz = int(round(event.contact_position[2] * 50))
         key = (event.hand_id, gx, gy, gz)
         last_t = self._last_contact_trigger_time.get(key, 0.0)
-        if (time.perf_counter() - last_t) < 0.25:  # 250 ms
+        
+        # 動的デバウンス時間: 手の速度に応じて調整
+        debounce_time = self._debounce_time
+        if hasattr(event, 'velocity') and event.velocity > 1.5:  # 高速時
+            debounce_time *= 0.6  # さらに短縮
+        
+        if (time.perf_counter() - last_t) < debounce_time:
             return False
         return True
     
@@ -2115,10 +2496,16 @@ class FullPipelineViewer(DualViewer):
             
             # キー入力処理
             key = cv2.waitKey(1) & 0xFF
-            return self.handle_key_event(key)
+            still_running = self.handle_key_event(key)
+
+            # ---- Pump Open3D viewer every frame to keep UI responsive ----
+            self._pump_3d_viewer()
+
+            return still_running
             
         except Exception as e:
             logger.error(f"RGB display error: {e}")
+            self._pump_3d_viewer()  # attempt to keep viewer alive even on error
             return True
     
     def _create_depth_visualization(self, depth_image: np.ndarray) -> np.ndarray:
@@ -2417,6 +2804,230 @@ class FullPipelineViewer(DualViewer):
             logger.error(f"従来方式メッシュ生成エラー: {e}")
             return None
 
+    # ------------------------------------------------------------------
+    # GPU batch collision detection helper
+    # ------------------------------------------------------------------
+    def _gpu_batch_collision_detection(self, tracked_hands: List[TrackedHand]) -> Dict[str, Any]:
+        """複数手をまとめて GPU 距離計算し、衝突判定を行う"""
+        from src.constants import (
+            COLLISION_ADAPTIVE_MAX_RADIUS_EXTENSION,
+            COLLISION_ADAPTIVE_VELOCITY_COEFFICIENT,
+        )
+
+        if self.current_mesh is None:
+            return {}
+
+        # --- 必要コンポーネント安全チェック (mypy対応) ---
+        if self.collision_searcher is None or self.gpu_distance_calc is None:
+            return {}
+
+        assert self.collision_searcher is not None  # for static analysers
+        assert self.gpu_distance_calc is not None
+
+        vertices = np.asarray(self.current_mesh.vertices)
+        triangles = np.asarray(self.current_mesh.triangles)
+
+        batched_points: List[np.ndarray] = []
+        search_results: List[Any] = []
+        radii: List[float] = []
+        hand_refs: List[TrackedHand] = []
+
+        # 検索フェーズ（CPU）
+        for hand in tracked_hands:
+            if hand.position is None:
+                continue
+
+            # 適応半径計算
+            vel_mag = float(np.linalg.norm(getattr(hand, "velocity", np.zeros(3)))) if hasattr(hand, "velocity") else 0.0
+            adaptive_radius = self.sphere_radius + min(
+                COLLISION_ADAPTIVE_MAX_RADIUS_EXTENSION,
+                vel_mag * COLLISION_ADAPTIVE_VELOCITY_COEFFICIENT,
+            )
+
+            # 空間検索
+            res = self.collision_searcher._search_point(np.array(hand.position), adaptive_radius)
+            if not res.triangle_indices:
+                continue  # 近傍に三角形なし -> 衝突なし確定
+
+            batched_points.append(np.array(hand.position))
+            search_results.append(res)
+            radii.append(adaptive_radius)
+            hand_refs.append(hand)
+
+        n_batch = len(batched_points)
+        if n_batch < 2:
+            return {}
+
+        # すべての候補三角形をユニークにまとめる
+        union_tri_indices: List[int] = sorted({idx for res in search_results for idx in res.triangle_indices})
+        if not union_tri_indices:
+            return {}
+
+        # union -> 連番マッピング
+        tri_index_map = {tidx: j for j, tidx in enumerate(union_tri_indices)}
+
+        target_triangles = triangles[union_tri_indices]  # (M, 3)
+
+        # GPU 距離計算
+        import time as _time
+        start_t = _time.perf_counter()
+        # 型チェッカーへのヒント
+        assert self.gpu_distance_calc is not None  # nosec B101 – checked above
+        distances = self.gpu_distance_calc.point_to_triangle_distance_batch(
+            np.vstack(batched_points), target_triangles, vertices
+        )
+        elapsed_ms = (_time.perf_counter() - start_t) * 1000.0
+
+        self.gpu_stats["distance_calculations"] += 1
+        self.gpu_stats["gpu_time_total_ms"] += elapsed_ms
+
+        infos: Dict[str, Any] = {}
+
+        for idx, hand in enumerate(hand_refs):
+            res = search_results[idx]
+            tri_local_indices = [tri_index_map[t] for t in res.triangle_indices]
+            if not tri_local_indices:
+                continue
+
+            dist_sub = distances[idx, tri_local_indices]
+            dist_sub = dist_sub.reshape(1, -1)  # (1, K)
+
+            info = self._create_collision_info_from_distances(
+                dist_sub,
+                batched_points[idx],
+                radii[idx],
+                vertices,
+                triangles,
+                res,
+                elapsed_ms,
+            )
+
+            infos[hand.id] = info
+
+            # 衝突点を可視化用リストに追加 (ここでやらず後でまとめて)
+
+        return infos
+
+    # ------------------------------------------------------------------
+    # Global viewer pump – call every main loop iteration to keep UI alive
+    # ------------------------------------------------------------------
+    def _pump_3d_viewer(self) -> None:
+        """Non-blocking poll of Open3D viewer every frame to avoid freeze."""
+        if hasattr(self, "vis") and self.vis is not None:
+            try:
+                # Even if no geometry changed, poll_events empties the queue
+                self.vis.poll_events()
+                self.vis.update_renderer()
+            except Exception:  # pragma: no cover – ensure never crashes
+                pass
+
+    def _monitor_geometry_accumulation(self) -> None:
+        """ジオメトリ累積を監視し、必要に応じて強制クリーンアップを実行"""
+        if not hasattr(self, 'vis') or self.vis is None:
+            return
+            
+        try:
+            # Open3D ジオメトリ数を取得
+            current_count = 0
+            if hasattr(self.vis, 'get_scene'):
+                scene = self.vis.get_scene()
+                if hasattr(scene, 'scene') and hasattr(scene.scene, 'geometry_ids'):
+                    current_count = len(scene.scene.geometry_ids)
+            
+            # 統計更新
+            self._geometry_monitor['frame_count'] += 1
+            self._geometry_monitor['last_geometry_count'] = current_count
+            self._geometry_monitor['max_geometry_count'] = max(
+                self._geometry_monitor['max_geometry_count'], 
+                current_count
+            )
+            
+            # 定期ログ出力（100フレームごと）
+            if self._geometry_monitor['frame_count'] % 100 == 0:
+                logger.info(f"[GEOM-MONITOR] Frame {self._geometry_monitor['frame_count']}: "
+                           f"Current={current_count}, Max={self._geometry_monitor['max_geometry_count']}")
+            
+            # 強制クリーンアップ判定
+            if current_count > self._geometry_monitor['cleanup_threshold']:
+                frames_since_cleanup = (self._geometry_monitor['frame_count'] - 
+                                      self._geometry_monitor['last_cleanup_frame'])
+                
+                # 最低50フレーム間隔でクリーンアップ実行
+                if frames_since_cleanup > 50:
+                    logger.warning(f"[GEOM-MONITOR] 強制クリーンアップ実行: {current_count} geometries")
+                    self._force_geometry_cleanup()
+                    self._geometry_monitor['last_cleanup_frame'] = self._geometry_monitor['frame_count']
+                    
+        except Exception as e:
+            logger.debug(f"Geometry monitoring failed: {e}")
+
+    def _force_geometry_cleanup(self) -> None:
+        """Open3D ジオメトリの強制クリーンアップ"""
+        if not hasattr(self, 'vis') or self.vis is None:
+            return
+            
+        try:
+            logger.info("[GEOM-CLEANUP] 全ジオメトリをクリア中...")
+            
+            # CRITICAL: Remove geometries from Open3D scene BEFORE clearing references
+            # Otherwise cleared references cause new geometries to be added while old ones remain
+            if hasattr(self, '_mesh_vis_objs'):
+                for geom_name, geom_obj in self._mesh_vis_objs.items():
+                    if geom_obj is not None:
+                        try:
+                            self.vis.remove_geometry(geom_obj, reset_bounding_box=False)
+                            logger.debug(f"[GEOM-CLEANUP] Removed {geom_name} from Open3D scene")
+                        except Exception as e:
+                            logger.debug(f"[GEOM-CLEANUP] Failed to remove {geom_name}: {e}")
+            
+            if hasattr(self, '_contact_pool'):
+                for sphere, line in self._contact_pool:
+                    try:
+                        self.vis.remove_geometry(sphere, reset_bounding_box=False)
+                        self.vis.remove_geometry(line, reset_bounding_box=False)
+                    except Exception:
+                        pass
+            
+            if hasattr(self, '_sphere_pool'):
+                for pool_entry in self._sphere_pool.values():
+                    wire = pool_entry.get('wire')
+                    if wire is not None:
+                        try:
+                            self.vis.remove_geometry(wire, reset_bounding_box=False)
+                        except Exception:
+                            pass
+            
+            # 既存のジオメトリ参照をクリア
+            if hasattr(self, '_mesh_vis_objs'):
+                self._mesh_vis_objs.clear()
+            if hasattr(self, '_contact_pool'):
+                self._contact_pool.clear()
+            if hasattr(self, '_sphere_pool'):
+                self._sphere_pool.clear()
+            if hasattr(self, 'collision_geometries'):
+                self.collision_geometries.clear()
+            
+            # Open3D visualizer の残り全ジオメトリをクリア (点群以外)
+            # Note: clear_geometries() removes ALL geometries including point cloud
+            # We'll let individual removes above handle cleanup, then clear any remaining
+            try:
+                self.vis.clear_geometries()
+            except Exception as e:
+                logger.debug(f"[GEOM-CLEANUP] clear_geometries failed: {e}")
+            
+            # 点群は親クラスで再追加される
+            if hasattr(self, 'pcd') and self.pcd is not None:
+                self.vis.add_geometry(self.pcd)
+            
+            # ガベージコレクション強制実行
+            import gc
+            gc.collect()
+            
+            logger.info("[GEOM-CLEANUP] クリーンアップ完了")
+            
+        except Exception as e:
+            logger.error(f"強制クリーンアップ失敗: {e}")
+
 
 # =============================================================================
 # メイン関数
@@ -2578,6 +3189,7 @@ def add_basic_arguments(parser: argparse.ArgumentParser):
     parser.add_argument('--no-hand-detection', action='store_true', help='手検出を無効にする')
     parser.add_argument('--no-tracking', action='store_true', help='トラッキングを無効にする')
     parser.add_argument('--gpu-mediapipe', action='store_true', help='MediaPipeでGPUを使用')
+    parser.add_argument('--max-depth', type=float, help='最大点群距離 (m)')
 
 
 def add_collision_arguments(parser: argparse.ArgumentParser):
@@ -2606,6 +3218,9 @@ def add_audio_arguments(parser: argparse.ArgumentParser):
                        help='最大同時発音数')
     parser.add_argument('--audio-volume', type=float, default=DEFAULT_MASTER_VOLUME, 
                        help='マスター音量 (0.0-1.0)')
+    # NEW depth-based scale mapping options
+    parser.add_argument('--drum-depth', type=float, help='ドラム音域の開始深度 (m)')
+    parser.add_argument('--scale-depth', type=float, help='音階ステップ間隔 (m)')
 
 
 def add_detection_arguments(parser: argparse.ArgumentParser):
@@ -2665,6 +3280,22 @@ def validate_arguments(args) -> bool:
     if args.audio_volume < 0.0 or args.audio_volume > 1.0:
         print("Error: --audio-volume must be between 0.0 and 1.0")
         return False
+    
+    if getattr(args, 'max_depth', None) is not None and args.max_depth <= 0.0:
+        print("Error: --max-depth must be positive")
+        return False
+    
+    # NEW validations for depth-based mapping
+    if getattr(args, 'drum_depth', None) is not None and args.drum_depth <= 0.0:
+        print("Error: --drum-depth must be positive")
+        return False
+    if getattr(args, 'scale_depth', None) is not None and args.scale_depth <= 0.0:
+        print("Error: --scale-depth must be positive")
+        return False
+    if getattr(args, 'drum_depth', None) is not None and getattr(args, 'max_depth', None) is not None:
+        if args.drum_depth >= args.max_depth:
+            print("Error: --drum-depth must be less than --max-depth")
+            return False
     
     return True
 
@@ -2758,6 +3389,8 @@ def apply_configuration(depth_width: Optional[int], depth_height: Optional[int],
                                                depth_height == LOW_RESOLUTION[1])
     config.input.depth_width = depth_width
     config.input.depth_height = depth_height
+    if getattr(args, 'max_depth', None) is not None:
+        config.input.max_depth = args.max_depth
     
     # 解像度に基づく最適化
     if config.input.enable_low_resolution_mode:
@@ -2824,7 +3457,10 @@ def create_viewer(args, audio_scale: ScaleType, audio_instrument: InstrumentType
         max_mesh_skip_frames=args.max_mesh_skip,
         headless_mode=args.headless,
         headless_duration=args.headless_duration,
-        pure_headless_mode=args.headless_pure
+        pure_headless_mode=args.headless_pure,
+        max_point_depth=args.max_depth,
+        drum_depth=args.drum_depth,
+        scale_depth=args.scale_depth
     )
 
 

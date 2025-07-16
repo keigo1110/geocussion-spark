@@ -140,6 +140,12 @@ class DualViewer:
         # contiguous buffer that we copy depth & color images into.
         disp_h, disp_w = self.rgb_window_size[1], self.rgb_window_size[0] * 2
         self._combined_buffer = np.zeros((disp_h, disp_w, 3), dtype=np.uint8)
+
+        # ---- Hand-marker update throttling -----------------------------
+        # Open3D に毎フレーム add/remove_geometry すると内部メッセージ
+        # キューが飽和し UI が固まる。フレーム N おきにまとめて更新する。
+        self._marker_update_interval = 10   # 更新間隔 (frames)
+        self._next_marker_update = 0        # 次回更新フレーム番号
         
     def set_camera(self, camera):
         """外部からカメラを設定（OAK-D対応）"""
@@ -511,18 +517,34 @@ class DualViewer:
             if hasattr(self, "_last_depth_image_filtered") and self._last_depth_image_filtered is not None:
                 depth_image = self._last_depth_image_filtered
             else:
-                depth_data = np.frombuffer(frame_data.depth_frame.get_data(), dtype=np.uint16)
-                depth_image = depth_data.reshape(
-                    (self.camera.depth_intrinsics.height, self.camera.depth_intrinsics.width)
-                )
+                # --- Robust depth extraction (handles missing intrinsics) ---
+                depth_image = self._extract_depth_image(frame_data)
+
+                # Guard against extraction failure
+                if depth_image is None:
+                    # Skip this frame gracefully
+                    return True
+
                 # フィルタ適用（必要な場合）
                 if self.depth_filter is not None:
                     depth_image = self.depth_filter.apply_filter(depth_image)
             
-            # 点群生成
+            # ---------------------------------------------------------------
+            # ❶ カラー点群統一 : color_frame が欠落しているフレームでは
+            #    直前に取得したカラー画像を使うことで深度カラー ↔︎ RGB の
+            #    フリッカを防止する。
+            # ---------------------------------------------------------------
+            if hasattr(frame_data, "color_frame") and frame_data.color_frame is not None:
+                color_src = frame_data.color_frame
+                # 最新カラーをキャッシュ
+                self._last_color_frame_for_pcd = color_src  # type: ignore[attr-defined]
+            else:
+                color_src = getattr(self, "_last_color_frame_for_pcd", None)
+
+            # 点群生成（color_src が None の場合は colors=None → 単色表示）
             points, colors = self.pointcloud_converter.depth_to_pointcloud(
-                frame_data.depth_frame, 
-                frame_data.color_frame
+                frame_data.depth_frame,
+                color_src,
             )
             
             self.performance_stats['pointcloud_time'] = (time.perf_counter() - pointcloud_start_time) * 1000
@@ -853,7 +875,14 @@ class DualViewer:
     def _update_hand_markers(self) -> None:
         """3D点群ビューワーの手マーカーを更新"""
         try:
-            # 古いマーカーを削除
+            # ---------------- Throttle updates -------------------
+            if self.frame_count < getattr(self, "_next_marker_update", 0):
+                return
+
+            # 次回実行フレームを設定
+            self._next_marker_update = self.frame_count + getattr(self, "_marker_update_interval", 10)
+
+            # 既存マーカーを一括削除（間引きにより頻度は低い）
             for marker in self.hand_markers:
                 self.vis.remove_geometry(marker, reset_bounding_box=False)
             self.hand_markers.clear()
@@ -901,8 +930,14 @@ class DualViewer:
                         except:
                             pass
             
-        except Exception as e:
-            # エラーは無視（マーカー更新は重要ではない）
+            # 描画キューを確実にフラッシュ
+            try:
+                self.vis.update_renderer()
+            except Exception:
+                pass
+
+        except Exception:
+            # Marker update should never interrupt pipeline
             pass
 
     def _create_depth_visualization(self, depth_image: np.ndarray) -> np.ndarray:
