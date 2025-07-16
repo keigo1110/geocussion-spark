@@ -53,7 +53,16 @@ class SphereTriangleCollision:
         self.max_contacts_per_sphere = max_contacts_per_sphere
         self.detection_padding = detection_padding
         
-        # パフォーマンス統計
+        # ベクトル化距離計算関数（Numba JIT）を取得
+        try:
+            from .distance import _get_jit_batch_point_function as _jit_batch_point_func_factory  # type: ignore
+            self._batch_distance_func = _jit_batch_point_func_factory()
+        except Exception:
+            self._batch_distance_func = None
+
+        # ベクトル化適用閾値（候補三角形数）
+        self._vectorization_threshold = 24  # 24 以上で一括距離計算
+
         self.stats = {
             'total_tests': 0,
             'total_test_time_ms': 0.0,
@@ -87,20 +96,44 @@ class SphereTriangleCollision:
         start_time = time.perf_counter()
         
         contact_points = []
-        
+
+        tri_indices = search_result.triangle_indices
+
+        # -------- ベクトル化距離プリフィルター --------
+        distance_prefilter: Optional[np.ndarray] = None
+        if (
+            self._batch_distance_func is not None
+            and len(tri_indices) >= self._vectorization_threshold
+        ):
+            try:
+                # 三角形頂点配列を作成 (M,3,3)
+                tri_vertices = self.mesh.vertices[self.mesh.triangles[tri_indices]]
+                distance_prefilter = self._batch_distance_func(
+                    sphere_center.astype(np.float64), tri_vertices.astype(np.float64)
+                )
+            except Exception:
+                distance_prefilter = None  # フォールバック
+
         # 各三角形との衝突判定
-        for i, triangle_idx in enumerate(search_result.triangle_indices):
-            # 距離による早期除外
-            if search_result.distances[i] > sphere_radius * 2:
+        for local_idx, triangle_idx in enumerate(tri_indices):
+            # 1) 距離による早期除外
+            pre_dist = None
+            if distance_prefilter is not None:
+                pre_dist = distance_prefilter[local_idx]
+            else:
+                # Fallback: 検索結果の距離情報
+                pre_dist = search_result.distances[local_idx] if local_idx < len(search_result.distances) else None
+
+            if pre_dist is not None and pre_dist > sphere_radius * 2 + self.detection_padding:
                 continue
-                
+
             contact_point = self._test_sphere_triangle(
                 sphere_center, sphere_radius, triangle_idx
             )
-            
+
             if contact_point is not None:
                 contact_points.append(contact_point)
-                
+
                 # 最大接触点数制限
                 if len(contact_points) >= self.max_contacts_per_sphere:
                     break

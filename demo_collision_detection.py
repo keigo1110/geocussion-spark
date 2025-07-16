@@ -857,9 +857,20 @@ class FullPipelineViewer(DualViewer):
             # 空間インデックスは「メッシュが変わったとき」のみ再構築
             if mesh_res.changed or self.spatial_index is None:
                 self.spatial_index = SpatialIndex(simplified_mesh, index_type=IndexType.BVH)
-                # 衝突検出コンポーネント初期化 / 更新
+                # 衝突検出コンポーネント初期化 / 更新（法線プリコンピュート版）
+                from types import SimpleNamespace
+                try:
+                    from src.mesh.attributes import calculate_face_normals  # 軽量計算
+                    tri_normals = calculate_face_normals(simplified_mesh)
+                    from typing import Any, cast
+                    mesh_attr_stub = cast(Any, SimpleNamespace(triangle_normals=tri_normals))
+                except Exception:
+                    mesh_attr_stub = None  # フォールバック
+
                 self.collision_searcher = CollisionSearcher(self.spatial_index)
-                self.collision_tester = SphereTriangleCollision(simplified_mesh)
+                self.collision_tester = SphereTriangleCollision(  # type: ignore[arg-type]
+                    simplified_mesh, mesh_attributes=mesh_attr_stub
+                )
             
             # メッシュ保存
             self.current_mesh = simplified_mesh
@@ -1810,8 +1821,20 @@ class FullPipelineViewer(DualViewer):
             # Rebuild index only when res.changed True
             if res.changed or self.spatial_index is None:
                 self.spatial_index = SpatialIndex(res.mesh, index_type=IndexType.BVH)
+                # 衝突検出コンポーネント初期化 / 更新（法線プリコンピュート版）
+                from types import SimpleNamespace
+                try:
+                    from src.mesh.attributes import calculate_face_normals  # 軽量計算
+                    tri_normals = calculate_face_normals(res.mesh)
+                    from typing import Any, cast
+                    mesh_attr_stub = cast(Any, SimpleNamespace(triangle_normals=tri_normals))
+                except Exception:
+                    mesh_attr_stub = None  # フォールバック
+
                 self.collision_searcher = CollisionSearcher(self.spatial_index)
-                self.collision_tester = SphereTriangleCollision(res.mesh)
+                self.collision_tester = SphereTriangleCollision(  # type: ignore[arg-type]
+                    res.mesh, mesh_attributes=mesh_attr_stub
+                )
 
             self._update_mesh_visualization(res.mesh)
             # Update mesh timestamp to throttle point-cloud generation
