@@ -382,10 +382,10 @@ class SpatialIndex:
                     result.append(tri_idx)
         else:
             # 内部ノード: 子ノードを再帰的に探索
-            # 両方の子ノードを対称的に探索（max_nodes制限は内部でチェック）
-            if node.left_child:
+            # max_nodes制限を対称的にチェックして探索
+            if node.left_child and counter[0] < max_nodes:
                 self._query_bvh_point_recursive(node.left_child, point, radius, result, max_nodes, counter)
-            if node.right_child:
+            if node.right_child and counter[0] < max_nodes:
                 self._query_bvh_point_recursive(node.right_child, point, radius, result, max_nodes, counter)
     
     def _query_bvh_ray(self, origin: np.ndarray, direction: np.ndarray, max_distance: float) -> List[int]:

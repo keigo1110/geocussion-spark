@@ -148,6 +148,8 @@ class UnifiedFilterPipeline:
             self.config.bilateral_sigma_color, 
             self.config.bilateral_sigma_space
         )
+        # CUDA stream initialization for sequential CUDA strategy
+        self._cuda_stream = cv2.cuda.Stream()
     
     def _initialize_sequential_cpu(self):
         """逐次CPU初期化"""
