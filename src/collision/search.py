@@ -58,6 +58,10 @@ class CollisionSearcher:
         collision_config = config.collision
         
         self.spatial_index = spatial_index
+        # BVH 早期打ち切りのデフォルト値（過度なノード訪問を防ぐ）
+        if not hasattr(self.spatial_index, "max_nodes_per_query"):
+            # 経験的に 400 ノード ≒ 深さ 9 相当で十分
+            self.spatial_index.max_nodes_per_query = 400  # type: ignore[attr-defined]
         self.default_radius = default_radius if default_radius is not None else collision_config.default_search_radius
         self.max_radius = max_radius if max_radius is not None else collision_config.max_search_radius
         self.strategy = strategy

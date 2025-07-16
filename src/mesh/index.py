@@ -345,17 +345,28 @@ class SpatialIndex:
         
         return left_indices, right_indices
     
+    # ------------------------------
+    #  BVH 検索 (早期打ち切り付き)
+    # ------------------------------
     def _query_bvh_point(self, point: np.ndarray, radius: float) -> List[int]:
-        """BVHを使って点の近傍検索"""
+        """BVHによる点検索 (max_nodes_per_query で早期停止)"""
         if self.root_node is None:
             return []
-        
-        result = []
-        self._query_bvh_point_recursive(self.root_node, point, radius, result)
+
+        result: List[int] = []
+        max_nodes = getattr(self, "max_nodes_per_query", None)
+        # nodes_visited をリストで渡し、参照でカウント
+        counter = [0]  # list をミュータブル参照として使用
+        self._query_bvh_point_recursive(self.root_node, point, radius, result, max_nodes, counter)
         return result
     
-    def _query_bvh_point_recursive(self, node: BVHNode, point: np.ndarray, radius: float, result: List[int]):
-        """BVH点検索の再帰処理"""
+    def _query_bvh_point_recursive(self, node: BVHNode, point: np.ndarray, radius: float, result: List[int], max_nodes: Optional[int], counter: List[int]):
+        """再帰的BVH検索"""
+        # 早期打ち切り
+        counter[0] += 1
+        if max_nodes is not None and counter[0] > max_nodes:
+            return
+        
         # バウンディングボックスと球の交差チェック
         if not node.bounding_box.intersects_sphere(point, radius):
             return
@@ -372,9 +383,9 @@ class SpatialIndex:
         else:
             # 内部ノード: 子ノードを再帰的に探索
             if node.left_child:
-                self._query_bvh_point_recursive(node.left_child, point, radius, result)
-            if node.right_child:
-                self._query_bvh_point_recursive(node.right_child, point, radius, result)
+                self._query_bvh_point_recursive(node.left_child, point, radius, result, max_nodes, counter)
+            if node.right_child and (max_nodes is None or counter[0] <= max_nodes):
+                self._query_bvh_point_recursive(node.right_child, point, radius, result, max_nodes, counter)
     
     def _query_bvh_ray(self, origin: np.ndarray, direction: np.ndarray, max_distance: float) -> List[int]:
         """BVHを使ってレイ検索"""
