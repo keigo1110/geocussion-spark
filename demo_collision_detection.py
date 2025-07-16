@@ -390,11 +390,22 @@ class FullPipelineViewer(DualViewer):
         # NEW depth-based scale mapping options
         self.drum_depth = kwargs.pop('drum_depth', None)
         self.scale_depth = kwargs.pop('scale_depth', None)
+        
+        # speedup.md最適化オプション
+        self.enable_zero_copy_optimization = kwargs.pop('enable_zero_copy_optimization', True)
+        self.enable_unified_filter_pipeline = kwargs.pop('enable_unified_filter_pipeline', True)
+        self.enable_optimized_bvh = kwargs.pop('enable_optimized_bvh', True)
+        
+        # 最適化統計表示オプション（DualViewerに渡さない）
+        self.print_optimization_stats = kwargs.pop('print_optimization_stats', False)
     
     def _initialize_components(self):
         """コンポーネントを初期化"""
         # ヘルプテキスト
         self.help_text = ""
+        
+        # パフォーマンスプロファイラーの初期化
+        self._initialize_speedup_optimizations()
         
         # 地形メッシュ生成コンポーネント
         self.projector = PointCloudProjector(
@@ -558,6 +569,44 @@ class FullPipelineViewer(DualViewer):
             'gpu_time_total_ms': 0.0,
             'cpu_fallbacks': 0
         }
+    
+    def _initialize_speedup_optimizations(self):
+        """speedup.md最適化機能を初期化"""
+        try:
+            # パフォーマンスプロファイラーの初期化
+            if self.print_optimization_stats:
+                from src.performance.profiler import PerformanceProfiler
+                self.profiler = PerformanceProfiler(enable_detailed_profiling=True)
+                logger.info("🔍 Performance profiler enabled")
+            else:
+                self.profiler = None
+            
+            # ゼロコピー最適化の初期化
+            if self.enable_zero_copy_optimization:
+                from src.input.zero_copy import get_zero_copy_extractor
+                self.zero_copy_extractor = get_zero_copy_extractor()
+                logger.info("🚀 Zero-copy optimization enabled")
+            else:
+                self.zero_copy_extractor = None
+            
+            # 統合フィルタパイプラインの初期化
+            if self.enable_unified_filter_pipeline:
+                from src.input.filter_pipeline import UnifiedFilterPipeline
+                self.unified_filter = UnifiedFilterPipeline()
+                logger.info("🚀 Unified filter pipeline enabled")
+            else:
+                self.unified_filter = None
+            
+            # 最適化BVHは後でメッシュが利用可能になってから初期化
+            self.optimized_bvh = None
+                
+        except Exception as e:
+            logger.error(f"Failed to initialize speedup optimizations: {e}")
+            # フォールバック: 全ての最適化を無効化
+            self.profiler = None
+            self.zero_copy_extractor = None
+            self.unified_filter = None
+            self.optimized_bvh = None
     
     def _initialize_gpu_acceleration(self):
         """GPU加速を初期化"""
@@ -888,6 +937,15 @@ class FullPipelineViewer(DualViewer):
                 self.collision_tester = SphereTriangleCollision(  # type: ignore[arg-type]
                     simplified_mesh, mesh_attributes=mesh_attr_stub
                 )
+                
+                # 最適化BVHを初期化（メッシュが利用可能になった時点で）
+                if self.enable_optimized_bvh and self.optimized_bvh is None:
+                    try:
+                        from src.collision.bvh_optimized import create_optimized_collision_searcher
+                        self.optimized_bvh = create_optimized_collision_searcher(simplified_mesh)
+                        logger.info("🚀 Optimized BVH collision detection initialized")
+                    except Exception as e:
+                        logger.warning(f"Failed to initialize optimized BVH: {e}")
             
             # メッシュ保存
             self.current_mesh = simplified_mesh
@@ -1617,6 +1675,10 @@ class FullPipelineViewer(DualViewer):
         """1フレーム処理（統一版）"""
         frame_start_time = time.perf_counter()
         
+        # プロファイラーでフレーム開始を記録
+        if hasattr(self, 'profiler') and self.profiler is not None:
+            self.profiler.start_frame()
+        
         # 3D手検出コンポーネントの遅延初期化
         self._lazy_initialize_3d_components()
         
@@ -1767,6 +1829,17 @@ class FullPipelineViewer(DualViewer):
         self.performance_stats['frame_time'] = frame_time
         self.performance_stats['fps'] = 1000.0 / frame_time if frame_time > 0 else 0.0
         
+        # プロファイラーでフレーム終了を記録
+        if hasattr(self, 'profiler') and self.profiler is not None:
+            try:
+                metrics = self.profiler.end_frame()
+                if self.print_optimization_stats and self.frame_count % 30 == 0:  # 30フレームごとに統計表示
+                    logger.info(f"[PROFILER] Frame {self.frame_count}: FPS={metrics.fps:.1f}, "
+                               f"Frame={metrics.frame_time_ms:.1f}ms, CPU={metrics.cpu_percent:.1f}%, "
+                               f"Mem={metrics.memory_mb:.1f}MB")
+            except Exception as e:
+                logger.debug(f"Profiler error: {e}")
+        
         # pygame版: オーディオ一時停止制御はスキップ（必要に応じて個別対応）
         # pygame版では VoiceManager を使用していないため、個別にボイス停止が必要な場合は
         # synthesizer.stop_all_voices() などの実装が必要
@@ -1836,8 +1909,14 @@ class FullPipelineViewer(DualViewer):
                 logger.error(f"3D component initialization error: {e}")
     
     def _extract_depth_image(self, frame_data: Any) -> Optional[np.ndarray]:
-        """フレームデータから深度画像を抽出（OAK-D/Orbbec対応）"""
+        """フレームデータから深度画像を抽出（OAK-D/Orbbec対応、ゼロコピー最適化）"""
         try:
+            # ゼロコピー最適化を優先適用
+            if hasattr(self, 'zero_copy_extractor') and self.zero_copy_extractor is not None:
+                depth_image = self.zero_copy_extractor.extract_depth_zero_copy(frame_data.depth_frame)
+                if depth_image is not None:
+                    return depth_image
+                # フォールバック: 従来方式
             if self.camera is None or self.camera.depth_intrinsics is None:
                 # --------------------------------------------------------------
                 # Determine frame dimensions in a robust manner
@@ -1914,9 +1993,24 @@ class FullPipelineViewer(DualViewer):
             return None
     
     def _apply_depth_filter(self, depth_image: np.ndarray) -> np.ndarray:
-        """深度フィルタを適用"""
-        if self.depth_filter is not None and self.enable_filter:
-            filter_start_time = time.perf_counter()
+        """深度フィルタを適用（統合フィルタパイプライン優先）"""
+        if not self.enable_filter:
+            self.performance_stats['filter_time'] = 0.0
+            return depth_image
+        
+        filter_start_time = time.perf_counter()
+        
+        # 統合フィルタパイプラインを優先使用
+        if hasattr(self, 'unified_filter') and self.unified_filter is not None:
+            try:
+                filtered = self.unified_filter.apply_filters(depth_image)
+                self.performance_stats['filter_time'] = (time.perf_counter() - filter_start_time) * 1000
+                return filtered
+            except Exception as e:
+                logger.debug(f"Unified filter failed, falling back to standard filter: {e}")
+        
+        # フォールバック: 従来のフィルタ
+        if self.depth_filter is not None:
             filtered = self.depth_filter.apply_filter(depth_image)
             self.performance_stats['filter_time'] = (time.perf_counter() - filter_start_time) * 1000
             return filtered
@@ -2058,7 +2152,7 @@ class FullPipelineViewer(DualViewer):
             points_3d,
             tracked_hands,
             hands_present_override=any_hands_present,
-            force=True,  # TEMP: Force mesh update every frame for testing wireframe accumulation
+            force=force_update,
         )
 
         if res.mesh is not None and (
@@ -3077,6 +3171,14 @@ def main():
         run_headless_fps_comparison_test()
         return 0
     
+    # speedup.mdベンチマークモード
+    if args.run_speedup_benchmark:
+        print("🚀 Running speedup.md optimization benchmark...")
+        from tests.test_speedup_optimizations import SpeedupTestSuite
+        suite = SpeedupTestSuite()
+        results = suite.run_all_tests()
+        return 0
+    
     # 設定の適用
     apply_configuration(depth_width, depth_height, args)
     
@@ -3139,6 +3241,7 @@ def create_argument_parser() -> argparse.ArgumentParser:
     add_window_arguments(parser)
     add_mode_arguments(parser)
     add_camera_arguments(parser)
+    add_optimization_arguments(parser)
     
     return parser
 
@@ -3221,6 +3324,15 @@ def add_audio_arguments(parser: argparse.ArgumentParser):
     # NEW depth-based scale mapping options
     parser.add_argument('--drum-depth', type=float, help='ドラム音域の開始深度 (m)')
     parser.add_argument('--scale-depth', type=float, help='音階ステップ間隔 (m)')
+
+
+def add_optimization_arguments(parser: argparse.ArgumentParser):
+    """speedup.md最適化関連の引数を追加"""
+    parser.add_argument('--no-zero-copy', action='store_true', help='ゼロコピー最適化を無効にする')
+    parser.add_argument('--no-unified-filter', action='store_true', help='統合フィルタパイプラインを無効にする')
+    parser.add_argument('--no-optimized-bvh', action='store_true', help='最適化BVHを無効にする')
+    parser.add_argument('--run-speedup-benchmark', action='store_true', help='speedup.md最適化のベンチマークを実行')
+    parser.add_argument('--print-optimization-stats', action='store_true', help='最適化統計を定期的に表示')
 
 
 def add_detection_arguments(parser: argparse.ArgumentParser):
@@ -3460,7 +3572,12 @@ def create_viewer(args, audio_scale: ScaleType, audio_instrument: InstrumentType
         pure_headless_mode=args.headless_pure,
         max_point_depth=args.max_depth,
         drum_depth=args.drum_depth,
-        scale_depth=args.scale_depth
+        scale_depth=args.scale_depth,
+        # speedup.md最適化オプション
+        enable_zero_copy_optimization=not args.no_zero_copy,
+        enable_unified_filter_pipeline=not args.no_unified_filter,
+        enable_optimized_bvh=not args.no_optimized_bvh,
+        print_optimization_stats=args.print_optimization_stats
     )
 
 

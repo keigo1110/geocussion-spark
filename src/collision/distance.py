@@ -651,4 +651,19 @@ def get_distance_calculator() -> OptimizedDistanceCalculator:
     return _global_distance_calculator
 
 
+def point_to_triangle_distance(point: np.ndarray, triangle_vertices: np.ndarray) -> float:
+    """
+    点と三角形の最短距離を計算
+    
+    Args:
+        point: 点座標 (3,)
+        triangle_vertices: 三角形の3頂点 (3, 3)
+    
+    Returns:
+        float: 最短距離
+    """
+    calculator = get_distance_calculator()
+    return calculator.calculate_point_triangle_distance(point, triangle_vertices)
+
+
 # 統一設定でウォームアップ済み
