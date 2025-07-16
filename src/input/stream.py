@@ -267,6 +267,9 @@ class OrbbecCamera(ManagedResource):
         self.has_color = False
         self.is_started = False
         self.frame_count = 0
+        # --- stability helpers ---
+        self._null_frame_streak: int = 0  # consecutive None frames counter
+        self._max_null_streak: int = 30   # threshold before restart (~1 s @30 FPS)
         
         # 高速リサイズ処理
         self.fast_resize = FastResize() if use_fast_resize else None
@@ -638,7 +641,17 @@ class OrbbecCamera(ManagedResource):
         try:
             frames = self.pipeline.wait_for_frames(timeout_ms)
             if frames is None:
+                # Consecutive-null frame tracking ---------------------------
+                self._null_frame_streak += 1
+                if self._null_frame_streak >= self._max_null_streak:
+                    logger.warning("Null frame streak %d reached – attempting pipeline restart", self._null_frame_streak)
+                    self._restart_pipeline()
+                    # reset counter after restart attempt
+                    self._null_frame_streak = 0
                 return None
+            else:
+                # Successful frame → reset streak
+                self._null_frame_streak = 0
             
             frame_data = FrameData(
                 depth_frame=frames.get_depth_frame(),
@@ -698,3 +711,15 @@ class OrbbecCamera(ManagedResource):
             base_memory += 30 * 1024 * 1024  # カラーで+30MB
         frame_buffer_memory = self.frame_count * 1024  # 1KB/フレーム
         return base_memory + frame_buffer_memory 
+
+    def _restart_pipeline(self) -> None:
+        """Stop and restart camera pipeline to recover from timeouts."""
+        try:
+            self.stop()
+            time.sleep(0.2)
+            if not self.start():
+                logger.error("Pipeline restart failed – will retry on next streak")
+            else:
+                logger.info("Pipeline successfully restarted")
+        except Exception as exc:
+            logger.error("Pipeline restart exception: %s", exc) 

@@ -1201,46 +1201,73 @@ class FullPipelineViewer(DualViewer):
         )
     
     def _update_mesh_visualization(self, mesh: Any) -> None:
-        """メッシュ可視化を更新"""
-        if not hasattr(self, 'vis') or self.vis is None:
+        """メッシュ可視化を更新 (geometry re-use to reduce Open3D queue pressure)"""
+        if self.vis is None:
             return
-        
-        # 既存のメッシュジオメトリを削除
-        for geom in self.mesh_geometries:
-            self.vis.remove_geometry(geom, reset_bounding_box=False)
-        self.mesh_geometries.clear()
-        
-        try:
-            # Open3Dメッシュを作成
-            o3d_mesh = o3d.geometry.TriangleMesh()
-            o3d_mesh.vertices = o3d.utility.Vector3dVector(mesh.vertices)
-            o3d_mesh.triangles = o3d.utility.Vector3iVector(mesh.triangles)
-            
-            # 法線計算
+
+        # -------------------------------------------------------------
+        # 1) 初回生成 – create geometry objects and add to visualizer
+        # -------------------------------------------------------------
+        if not hasattr(self, "_mesh_vis_objs"):
+            self._mesh_vis_objs = {}
+
+        o3d_mesh = self._mesh_vis_objs.get("tri_mesh")  # type: ignore[attr-defined]
+        wireframe = self._mesh_vis_objs.get("wire")     # type: ignore[attr-defined]
+
+        import numpy as _np
+        from open3d import geometry as _o3g, utility as _o3u
+
+        if o3d_mesh is None:
+            # 初回 – create mesh and wireframe, add once
+            o3d_mesh = _o3g.TriangleMesh()
+            o3d_mesh.vertices = _o3u.Vector3dVector(mesh.vertices.copy())
+            o3d_mesh.triangles = _o3u.Vector3iVector(mesh.triangles.copy())
             o3d_mesh.compute_vertex_normals()
-            
-            # 半透明のマテリアル設定
-            o3d_mesh.paint_uniform_color([0.8, 0.8, 0.9])  # 薄青色
-            
-            # ワイヤーフレーム表示
-            wireframe = o3d.geometry.LineSet.create_from_triangle_mesh(o3d_mesh)
-            wireframe.paint_uniform_color([0.3, 0.3, 0.7])  # 青色
-            
-            # ジオメトリを追加
-            self.vis.add_geometry(o3d_mesh, reset_bounding_box=False)
+            o3d_mesh.paint_uniform_color([0.8, 0.8, 0.9])
+
+            wireframe = _o3g.LineSet.create_from_triangle_mesh(o3d_mesh)
+            wireframe.paint_uniform_color([0.3, 0.3, 0.7])
+
+            # Faces hidden: we skip adding o3d_mesh (solid) and add only wireframe
             self.vis.add_geometry(wireframe, reset_bounding_box=False)
-            
-            self.mesh_geometries.extend([o3d_mesh, wireframe])
-            
-            # -- Open3D バッファ更新 (T-MESH-106) --
+
+            self._mesh_vis_objs["wire"] = wireframe
+        else:
+            # ---------------------------------------------------------
+            # 2) 更新 – 既存 geometry の頂点 / 三角形を最新メッシュに差し替え
+            # ---------------------------------------------------------
+            if wireframe is None:
+                wireframe = _o3g.LineSet.create_from_triangle_mesh(o3d_mesh)
+                wireframe.paint_uniform_color([0.3, 0.3, 0.7])
+                self.vis.add_geometry(wireframe, reset_bounding_box=False)
+                self._mesh_vis_objs["wire"] = wireframe
+
             try:
-                self.vis.update_geometry(o3d_mesh)
+                o3d_mesh.vertices = _o3u.Vector3dVector(mesh.vertices.copy())
+                o3d_mesh.triangles = _o3u.Vector3iVector(mesh.triangles.copy())
+                o3d_mesh.compute_vertex_normals()
+
+                # Wireframe – 再生成よりも points/lines 更新の方が高速
+                wireframe.points = o3d_mesh.vertices
+                wireframe.lines = _o3g.LineSet.create_from_triangle_mesh(o3d_mesh).lines
+
+                # Push updates to renderer
                 self.vis.update_geometry(wireframe)
-            except Exception as _exc:  # pylint: disable=broad-except
-                logger.debug("Open3D update_geometry failed: %s", _exc)
-            
-        except Exception as e:
-            logger.error(f"メッシュ可視化エラー: {e}")
+
+                # Reapply uniform blue color (otherwise defaults to black after line update)
+                if len(wireframe.lines) > 0:
+                    import numpy as _np
+                    blue = _np.tile([0.3, 0.3, 0.7], (len(wireframe.lines), 1))
+                    wireframe.colors = _o3u.Vector3dVector(blue)
+            except Exception as exc:  # pylint: disable=broad-except
+                logger.debug("Mesh visualization update failed: %s", exc)
+
+        # Request redraw (non-blocking)
+        try:
+            self.vis.poll_events()
+            self.vis.update_renderer()
+        except Exception:
+            pass
     
     def _update_collision_visualization(self) -> None:
         """衝突可視化を更新"""
@@ -1295,21 +1322,49 @@ class FullPipelineViewer(DualViewer):
         """衝突球を可視化"""
         if self.vis is None:
             return
-        if self.current_tracked_hands:
-            for tracked in self.current_tracked_hands:
-                if tracked.position is not None:
-                    hand_sphere = o3d.geometry.TriangleMesh.create_sphere(
-                        radius=self.sphere_radius
-                    )
-                    hand_sphere.translate(tracked.position)
-                    hand_sphere.paint_uniform_color([0.0, 1.0, 0.0])  # 緑色
-                    
-                    # ワイヤーフレーム表示
-                    wireframe = o3d.geometry.LineSet.create_from_triangle_mesh(hand_sphere)
-                    wireframe.paint_uniform_color([0.0, 0.8, 0.0])
-                    
-                    self.vis.add_geometry(wireframe, reset_bounding_box=False)
-                    self.collision_geometries.append(wireframe)
+
+        # Persistent wireframes representing the collision spheres around each tracked hand.
+        if not hasattr(self, "_hand_wireframes"):
+            self._hand_wireframes = []  # type: ignore[attr-defined]
+
+        # ------------------------------------------------------------------
+        # 1) 追加: 新しい手が検出された分だけワイヤーフレームを生成
+        # ------------------------------------------------------------------
+        while len(self._hand_wireframes) < len(self.current_tracked_hands):
+            sphere_mesh = o3d.geometry.TriangleMesh.create_sphere(radius=self.sphere_radius)
+            wire = o3d.geometry.LineSet.create_from_triangle_mesh(sphere_mesh)
+            wire.paint_uniform_color([0.0, 0.8, 0.0])
+            self.vis.add_geometry(wire, reset_bounding_box=False)
+            self._hand_wireframes.append(wire)
+
+        # ------------------------------------------------------------------
+        # 2) 更新: 既存ワイヤーフレームの位置を手の現在位置へ移動
+        # ------------------------------------------------------------------
+        for idx, tracked in enumerate(self.current_tracked_hands):
+            if tracked.position is None or idx >= len(self._hand_wireframes):
+                continue
+            wire = self._hand_wireframes[idx]
+            try:
+                verts = np.asarray(wire.points)
+                if verts.size == 0:
+                    continue
+                center_old = verts.mean(axis=0)
+                translation = np.array(tracked.position) - center_old
+                wire.translate(translation, relative=True)
+                self.vis.update_geometry(wire)
+            except Exception as exc:  # pylint: disable=broad-except
+                logger.debug("Failed to update hand wireframe: %s", exc)
+
+        # ------------------------------------------------------------------
+        # 3) 削除: 消えた手に対応する余分なワイヤーフレームを除去
+        # ------------------------------------------------------------------
+        if len(self._hand_wireframes) > len(self.current_tracked_hands):
+            for i in range(len(self.current_tracked_hands), len(self._hand_wireframes)):
+                try:
+                    self.vis.remove_geometry(self._hand_wireframes[i], reset_bounding_box=False)
+                except Exception:
+                    pass
+            self._hand_wireframes = self._hand_wireframes[: len(self.current_tracked_hands)]
     
     def _update_visualization(self) -> None:
         """可視化全体を更新"""
@@ -1539,6 +1594,44 @@ class FullPipelineViewer(DualViewer):
                     return False
         
         self.frame_count += 1
+        
+        # ------------------------------------------------------------------
+        # Periodic memory cleanup to prevent long-run memory buildup (M-LEAK-001)
+        # ------------------------------------------------------------------
+        try:
+            if self.frame_count % 300 == 0:  # every ~10s at 30 FPS
+                import gc
+                gc.collect()
+
+                # Release unused CuPy GPU blocks if CuPy is available
+                try:
+                    import cupy as _cp  # pylint: disable=import-error
+                    _cp.get_default_memory_pool().free_all_blocks()
+                    _cp.get_default_pinned_memory_pool().free_all_blocks()
+                except Exception:  # CuPy not installed or other issue – ignore
+                    pass
+
+                # Trim large collision/event caches to fixed size (defensive)
+                if hasattr(self, "event_queue") and self.event_queue is not None:
+                    try:
+                        self.event_queue.pop_processed(max_length=256)
+                    except AttributeError:
+                        # Older versions – manually shrink deque length
+                        if len(self.event_queue.event_queue) > 512:
+                            while len(self.event_queue.event_queue) > 256:
+                                self.event_queue.event_queue.popleft()
+
+                # Prune _last_contact_trigger_time dict beyond 1 k entries
+                if hasattr(self, "_last_contact_trigger_time") and isinstance(self._last_contact_trigger_time, dict):
+                    if len(self._last_contact_trigger_time) > 1000:
+                        for _ in range(len(self._last_contact_trigger_time) - 800):
+                            try:
+                                self._last_contact_trigger_time.pop(next(iter(self._last_contact_trigger_time)))
+                            except Exception:
+                                break
+        except Exception:
+            # Cleanup should never crash the main loop
+            pass
         
         # パフォーマンス統計更新
         frame_time = (time.perf_counter() - frame_start_time) * 1000
@@ -2268,10 +2361,16 @@ class FullPipelineViewer(DualViewer):
             
             # キー入力処理
             key = cv2.waitKey(1) & 0xFF
-            return self.handle_key_event(key)
+            still_running = self.handle_key_event(key)
+
+            # ---- Pump Open3D viewer every frame to keep UI responsive ----
+            self._pump_3d_viewer()
+
+            return still_running
             
         except Exception as e:
             logger.error(f"RGB display error: {e}")
+            self._pump_3d_viewer()  # attempt to keep viewer alive even on error
             return True
     
     def _create_depth_visualization(self, depth_image: np.ndarray) -> np.ndarray:
@@ -2673,6 +2772,19 @@ class FullPipelineViewer(DualViewer):
             # 衝突点を可視化用リストに追加 (ここでやらず後でまとめて)
 
         return infos
+
+    # ------------------------------------------------------------------
+    # Global viewer pump – call every main loop iteration to keep UI alive
+    # ------------------------------------------------------------------
+    def _pump_3d_viewer(self) -> None:
+        """Non-blocking poll of Open3D viewer every frame to avoid freeze."""
+        if hasattr(self, "vis") and self.vis is not None:
+            try:
+                # Even if no geometry changed, poll_events empties the queue
+                self.vis.poll_events()
+                self.vis.update_renderer()
+            except Exception:  # pragma: no cover – ensure never crashes
+                pass
 
 
 # =============================================================================
