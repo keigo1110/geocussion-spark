@@ -439,6 +439,55 @@ class OrbbecCamera(ManagedResource):
                 height=depth_profile.get_height()
             )
             
+        # --- 高FPS用プリセットとハードウェア後処理ブロックを有効化 (ORBBEC-OPT-001) ---
+        # Python バインディングでは set_depth_preset が未公開のため、
+        # Device API で DepthWorkMode を直接指定する実装に切り替える。
+        try:
+            device = self.pipeline.get_device()  # type: ignore[attr-defined]
+            mode_list = device.get_depth_work_mode_list()
+            target_mode = None
+            name_candidates = [
+                "Performance",  # 新しい FW
+                "High Density",  # 一般的に FPS 向上
+                "High FPS",      # まれに採用される名称
+            ]
+
+            for name in name_candidates:
+                for idx in range(mode_list.get_count()):
+                    mode = mode_list.get_depth_work_mode_by_index(idx)
+                    # 一部 FW では .name / .tag のみ公開されている
+                    if hasattr(mode, "name") and name.lower() in mode.name.lower():
+                        target_mode = mode
+                        break
+                if target_mode is not None:
+                    break
+
+            # Fallback: index 3 が High Density であるケースが多い
+            if target_mode is None and mode_list.get_count() >= 4:
+                target_mode = mode_list.get_depth_work_mode_by_index(3)
+
+            if target_mode is not None:
+                device.set_depth_work_mode(target_mode)
+                logger.info(f"Depth work mode applied: {target_mode.name}")
+            else:
+                logger.warning("Depth work mode selection failed – using sensor default mode")
+        except Exception as _wm_exc:  # pylint: disable=broad-except
+            logger.warning(f"Depth work mode configuration failed: {_wm_exc}")
+
+        # ポストプロセッシングブロックは Python API で公開されていない場合があるため、
+        # load_depth_filter_config を使って『ALL_ON』相当を適用する。
+        try:
+            device = self.pipeline.get_device()  # type: ignore[attr-defined]
+            # ベンダー添付の全ブロック有効化プリセットがある場合にロード
+            preset_json_path = os.path.join(os.path.dirname(__file__), "orbbec_all_postproc.json")
+            if os.path.isfile(preset_json_path):
+                device.load_depth_filter_config(preset_json_path)
+                logger.info("Depth post-processing preset loaded: all blocks enabled")
+            else:
+                logger.debug("Preset file for post-processing not found – skipping load_depth_filter_config")
+        except Exception as _pp_exc:
+            logger.warning(f"Depth post-processing configuration skipped/not supported: {_pp_exc}")
+        
         return True
     
     def _setup_color_stream(self) -> None:
