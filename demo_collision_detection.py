@@ -1247,18 +1247,35 @@ class FullPipelineViewer(DualViewer):
                 o3d_mesh.triangles = _o3u.Vector3iVector(mesh.triangles.copy())
                 o3d_mesh.compute_vertex_normals()
 
-                # Wireframe – 再生成よりも points/lines 更新の方が高速
-                wireframe.points = o3d_mesh.vertices
-                wireframe.lines = _o3g.LineSet.create_from_triangle_mesh(o3d_mesh).lines
+                # ----- Update wireframe in-place to prevent geometry accumulation -----
+                try:
+                    temp_wire = _o3g.LineSet.create_from_triangle_mesh(
+                        _o3g.TriangleMesh(
+                            vertices=_o3u.Vector3dVector(mesh.vertices.copy()),
+                            triangles=_o3u.Vector3iVector(mesh.triangles.copy()),
+                        )
+                    )
 
-                # Push updates to renderer
-                self.vis.update_geometry(wireframe)
+                    # Replace the vertex/edge data of the existing wireframe instead of
+                    # removing and adding a brand-new object every time. This avoids the
+                    # gradual increase of geometry objects in the scene and keeps the
+                    # viewer responsive.
+                    wireframe.points = temp_wire.points
+                    wireframe.lines = temp_wire.lines
 
-                # Reapply uniform blue color (otherwise defaults to black after line update)
-                if len(wireframe.lines) > 0:
-                    import numpy as _np
-                    blue = _np.tile([0.3, 0.3, 0.7], (len(wireframe.lines), 1))
-                    wireframe.colors = _o3u.Vector3dVector(blue)
+                    # Ensure uniform colour is preserved after the update
+                    if len(wireframe.lines) > 0:
+                        blue = _np.tile([0.3, 0.3, 0.7], (len(wireframe.lines), 1))
+                        wireframe.colors = _o3u.Vector3dVector(blue)
+
+                    # Register the change with the visualiser
+                    self.vis.update_geometry(wireframe)
+
+                    # Keep reference up-to-date
+                    self._mesh_vis_objs["wire"] = wireframe
+                except Exception as exc:  # pylint: disable=broad-except
+                    logger.debug("Wireframe in-place update failed: %s", exc)
+
             except Exception as exc:  # pylint: disable=broad-except
                 logger.debug("Mesh visualization update failed: %s", exc)
 

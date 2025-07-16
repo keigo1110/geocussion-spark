@@ -661,6 +661,14 @@ class OrbbecCamera(ManagedResource):
             )
             
             self.frame_count += 1
+
+            # Mark resource as active to avoid idle cleanup
+            try:
+                if hasattr(self, "_resource_manager") and self._resource_manager is not None:
+                    self._resource_manager.touch_resource(self.resource_id)
+            except Exception:
+                pass
+
             return frame_data
             
         except OBError as e:
