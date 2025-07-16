@@ -914,6 +914,20 @@ class FullPipelineViewer(DualViewer):
             logger.debug("No collision searcher available")
             return []
         
+        # --------------------------------------------------------------
+        # GPU バッチ衝突検出パス  (複数手を一括で距離計算)
+        # --------------------------------------------------------------
+        batched_gpu_infos: Dict[str, Any] = {}
+        use_gpu_distance_global = (
+            self.gpu_acceleration_enabled and self.gpu_distance_calc is not None
+        )
+        if use_gpu_distance_global and len(tracked_hands) > 1:
+            try:
+                batched_gpu_infos = self._gpu_batch_collision_detection(tracked_hands)
+            except Exception as _exc:
+                logger.warning("Batch GPU collision detection failed: %s", _exc)
+                batched_gpu_infos = {}
+
         events = []
         self.current_collision_points = []
         current_time = time.perf_counter()
@@ -941,15 +955,17 @@ class FullPipelineViewer(DualViewer):
             logger.debug(f"Hand {i} position: ({hand.position[0]:.3f}, {hand.position[1]:.3f}, {hand.position[2]:.3f})")
             
             try:
-                # 連続衝突検出を優先して試行
-                collision_info = None
-                if self.continuous_detector and self.collision_tester:
+                # 1) GPU バッチ結果があれば優先利用
+                collision_info = batched_gpu_infos.get(hand.id) if batched_gpu_infos else None
+
+                # 2) 連続衝突検出
+                if (not collision_info or not collision_info.has_collision) and self.continuous_detector and self.collision_tester:
                     collision_info = self.continuous_detector.detect_continuous_collision(
                         hand, self.collision_searcher, self.collision_tester, current_time
                     )
                 
-                # 連続衝突検出で見つからない場合は従来方式でフォールバック
-                if not collision_info or not collision_info.has_collision:
+                # 3) 従来方式フォールバック
+                if (not collision_info or not collision_info.has_collision):
                     collision_info = self._detect_collision_legacy(hand, use_gpu_distance, i)
                 
                 # 衝突が検出された場合
@@ -2542,6 +2558,110 @@ class FullPipelineViewer(DualViewer):
         except Exception as e:
             logger.error(f"従来方式メッシュ生成エラー: {e}")
             return None
+
+    # ------------------------------------------------------------------
+    # GPU batch collision detection helper
+    # ------------------------------------------------------------------
+    def _gpu_batch_collision_detection(self, tracked_hands: List[TrackedHand]) -> Dict[str, Any]:
+        """複数手をまとめて GPU 距離計算し、衝突判定を行う"""
+        from src.constants import (
+            COLLISION_ADAPTIVE_MAX_RADIUS_EXTENSION,
+            COLLISION_ADAPTIVE_VELOCITY_COEFFICIENT,
+        )
+
+        if self.current_mesh is None:
+            return {}
+
+        # --- 必要コンポーネント安全チェック (mypy対応) ---
+        if self.collision_searcher is None or self.gpu_distance_calc is None:
+            return {}
+
+        assert self.collision_searcher is not None  # for static analysers
+        assert self.gpu_distance_calc is not None
+
+        vertices = np.asarray(self.current_mesh.vertices)
+        triangles = np.asarray(self.current_mesh.triangles)
+
+        batched_points: List[np.ndarray] = []
+        search_results: List[Any] = []
+        radii: List[float] = []
+        hand_refs: List[TrackedHand] = []
+
+        # 検索フェーズ（CPU）
+        for hand in tracked_hands:
+            if hand.position is None:
+                continue
+
+            # 適応半径計算
+            vel_mag = float(np.linalg.norm(getattr(hand, "velocity", np.zeros(3)))) if hasattr(hand, "velocity") else 0.0
+            adaptive_radius = self.sphere_radius + min(
+                COLLISION_ADAPTIVE_MAX_RADIUS_EXTENSION,
+                vel_mag * COLLISION_ADAPTIVE_VELOCITY_COEFFICIENT,
+            )
+
+            # 空間検索
+            res = self.collision_searcher._search_point(np.array(hand.position), adaptive_radius)
+            if not res.triangle_indices:
+                continue  # 近傍に三角形なし -> 衝突なし確定
+
+            batched_points.append(np.array(hand.position))
+            search_results.append(res)
+            radii.append(adaptive_radius)
+            hand_refs.append(hand)
+
+        n_batch = len(batched_points)
+        if n_batch < 2:
+            return {}
+
+        # すべての候補三角形をユニークにまとめる
+        union_tri_indices: List[int] = sorted({idx for res in search_results for idx in res.triangle_indices})
+        if not union_tri_indices:
+            return {}
+
+        # union -> 連番マッピング
+        tri_index_map = {tidx: j for j, tidx in enumerate(union_tri_indices)}
+
+        target_triangles = triangles[union_tri_indices]  # (M, 3)
+
+        # GPU 距離計算
+        import time as _time
+        start_t = _time.perf_counter()
+        # 型チェッカーへのヒント
+        assert self.gpu_distance_calc is not None  # nosec B101 – checked above
+        distances = self.gpu_distance_calc.point_to_triangle_distance_batch(
+            np.vstack(batched_points), target_triangles, vertices
+        )
+        elapsed_ms = (_time.perf_counter() - start_t) * 1000.0
+
+        self.gpu_stats["distance_calculations"] += 1
+        self.gpu_stats["gpu_time_total_ms"] += elapsed_ms
+
+        infos: Dict[str, Any] = {}
+
+        for idx, hand in enumerate(hand_refs):
+            res = search_results[idx]
+            tri_local_indices = [tri_index_map[t] for t in res.triangle_indices]
+            if not tri_local_indices:
+                continue
+
+            dist_sub = distances[idx, tri_local_indices]
+            dist_sub = dist_sub.reshape(1, -1)  # (1, K)
+
+            info = self._create_collision_info_from_distances(
+                dist_sub,
+                batched_points[idx],
+                radii[idx],
+                vertices,
+                triangles,
+                res,
+                elapsed_ms,
+            )
+
+            infos[hand.id] = info
+
+            # 衝突点を可視化用リストに追加 (ここでやらず後でまとめて)
+
+        return infos
 
 
 # =============================================================================
