@@ -27,6 +27,7 @@ except ImportError:
 from ..data_types import CameraIntrinsics, FrameData
 from ..collision.optimization import ArrayPool
 from src import get_logger
+from src.performance.profiler import measure_performance
 
 logger = get_logger(__name__)
 
@@ -250,11 +251,18 @@ class PointCloudConverter:
         """
         start_time = time.perf_counter()
         
-        # 深度データ取得
-        depth_data: np.ndarray = np.frombuffer(depth_frame.get_data(), dtype=np.uint16)
-        depth_image = depth_data.reshape(
-            (self.depth_intrinsics.height, self.depth_intrinsics.width)
-        )
+        # 深度データ取得（ゼロコピー最適化対応）
+        from src.input.zero_copy import get_zero_copy_extractor
+        with measure_performance("depth_processing"):
+            extractor = get_zero_copy_extractor()
+            depth_image = extractor.extract_depth_zero_copy(depth_frame)
+            
+            if depth_image is None:
+                # フォールバック: 従来方式
+                depth_data: np.ndarray = np.frombuffer(depth_frame.get_data(), dtype=np.uint16)
+                depth_image = depth_data.reshape(
+                    (self.depth_intrinsics.height, self.depth_intrinsics.width)
+                )
         
         # numpy配列変換を直接呼び出し（高速化）
         points, colors = self.numpy_to_pointcloud(
