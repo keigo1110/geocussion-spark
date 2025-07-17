@@ -61,7 +61,9 @@ class SphereTriangleCollision:
             self._batch_distance_func = None
 
         # ベクトル化適用閾値（候補三角形数）
-        self._vectorization_threshold = 24  # 24 以上で一括距離計算
+        # perf-TRI-001: lower threshold so that even small candidate sets use
+        # the vectorized JIT path and avoid Python loop overhead
+        self._vectorization_threshold = 3
 
         self.stats = {
             'total_tests': 0,

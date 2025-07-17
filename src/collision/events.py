@@ -65,6 +65,7 @@ class CollisionEvent:
     triangle_index: int
     hand_id: str
     collision_type: CollisionType
+    mountain_id: int = -1  # MOUNT-INS-01: 山クラスタ ID (-1 は未割当て)
     surface_properties: Dict[str, float] = field(default_factory=dict)
     
     @property

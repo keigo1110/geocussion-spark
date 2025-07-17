@@ -385,7 +385,8 @@ class FullPipelineViewer(DualViewer):
         self.use_gpu_mediapipe = kwargs.pop('use_gpu_mediapipe', False)
     
         # 処理対象とする最大距離を制限 (例: 1.1 → 1.1m より奥は無視)
-        self.max_point_depth = kwargs.pop('max_point_depth', None)
+        self.max_point_depth: Optional[float] = kwargs.pop('max_point_depth', None)
+        self.min_point_depth: Optional[float] = kwargs.pop('min_point_depth', None)
     
         # NEW depth-based scale mapping options
         self.drum_depth = kwargs.pop('drum_depth', None)
@@ -398,6 +399,11 @@ class FullPipelineViewer(DualViewer):
         
         # 最適化統計表示オプション（DualViewerに渡さない）
         self.print_optimization_stats = kwargs.pop('print_optimization_stats', False)
+        # 横方向ROI幅 (m)
+        self.roi_width: Optional[float] = kwargs.pop('roi_width', None)
+    
+        # MOUNT-INS-01 mountain instrument feature
+        self.enable_mountain_instrument = kwargs.pop('enable_mountain_instrument', False)
     
     def _initialize_components(self):
         """コンポーネントを初期化"""
@@ -409,10 +415,14 @@ class FullPipelineViewer(DualViewer):
         
         # 地形メッシュ生成コンポーネント
         self.projector = PointCloudProjector(
-            resolution=0.01,  # 1cm解像度
+            resolution=0.01,   # 1cm
             method=ProjectionMethod.MEDIAN_HEIGHT,
             fill_holes=True,
-            plane="xz",  # カメラ座標系に合わせて XZ 平面投影
+            plane="xz",
+            max_height_variation=0.30,   # 垂直面セルを除外 (>=30cm 高さ差)
+            min_points_per_cell=3,       # 信頼できるセルのみ採用
+            height_clip_percentile=0.995,
+            deduplicate_xy=True,
         )
         
         # LODメッシュ生成器
@@ -474,7 +484,11 @@ class FullPipelineViewer(DualViewer):
             adaptive_sampling=True,
             boundary_points=True,
             quality_threshold=0.3,
+            slope_threshold=2.0,
+            z_std_threshold=0.3,         # Z標準偏差30cm超の薄いテント三角形を除去
             use_gpu=True,
+            small_xy_edge_thresh=0.025,
+            height_spike_thresh=0.15,
         )
 
         # 統合 MeshPipeline
@@ -957,6 +971,18 @@ class FullPipelineViewer(DualViewer):
             if mesh_res.needs_refresh or mesh_res.changed:
                 self._update_mesh_visualization(simplified_mesh)
             
+            # MOUNT-INS-01: mountain clustering and instrument table
+            if getattr(self, 'enable_mountain_instrument', False):
+                try:
+                    from src.mesh.mountain_cluster import cluster_mountains, assign_instruments_by_area
+                    tri_to_mnt, mnt_area = cluster_mountains(simplified_mesh)
+                    self.triangle_to_mountain = tri_to_mnt
+                    self.mountain_instrument_table = assign_instruments_by_area(mnt_area)
+                    if self.audio_mapper is not None:
+                        self.audio_mapper.mountain_instrument_table = self.mountain_instrument_table
+                except Exception as exc:  # pylint: disable=broad-except
+                    logger.debug("[MOUNT-INS-01] Clustering failed: %s", exc)
+            
             # 強制更新フラグをリセット
             if hasattr(self, 'force_mesh_update_requested'):
                 self.force_mesh_update_requested = False
@@ -1114,9 +1140,17 @@ class FullPipelineViewer(DualViewer):
         return info
     
     def _create_collision_event(self, hand: TrackedHand, hand_pos: np.ndarray, info: Any) -> Any:
-        """衝突イベントを生成"""
+        """衝突イベントを生成 (mountain_id 付与)"""
         velocity = np.array(hand.velocity) if hasattr(hand, 'velocity') and hand.velocity is not None else np.zeros(3)
-        return self.event_queue.create_event(info, hand.id, hand_pos, velocity)
+        event = self.event_queue.create_event(info, hand.id, hand_pos, velocity)
+        if event is not None and hasattr(self, 'triangle_to_mountain') and getattr(self, 'enable_mountain_instrument', False):
+            try:
+                tri_idx = getattr(event, 'triangle_index', -1)
+                if 0 <= tri_idx < len(self.triangle_to_mountain):
+                    event.mountain_id = int(self.triangle_to_mountain[tri_idx])
+            except Exception:  # pragma: no cover
+                pass
+        return event
     
     def _update_collision_points(self, info: Any) -> None:
         """衝突点を更新（統一形式）"""
@@ -1763,8 +1797,12 @@ class FullPipelineViewer(DualViewer):
         # --------------------------------------------------------------
         # Decide if we need to force mesh update via scheduler
         # --------------------------------------------------------------
-        any_hands_present = prelim_hands_present or self.terrain_deforming
-        force_update = self.mesh_scheduler.should_update(any_hands_present, tracked_hands)
+        # Refined mesh update logic: hands suppress updates but terrain deformation forces update when no hands.
+        hands_present_flag = prelim_hands_present  # True if hands detected/recent
+        force_update = self.mesh_scheduler.should_update(hands_present_flag, tracked_hands)
+        # If terrain is deforming and no hands are present, trigger update immediately.
+        if (not hands_present_flag) and self.terrain_deforming:
+            force_update = True
         
         collision_events = self._process_collision_pipeline(
             points_3d, tracked_hands, force_update=force_update
@@ -2035,6 +2073,7 @@ class FullPipelineViewer(DualViewer):
 
             points_3d, _ = self.pointcloud_converter.numpy_to_pointcloud(
                 depth_image,
+                min_depth=self.min_point_depth if self.min_point_depth is not None else 0.1,
                 max_depth=self.max_point_depth if self.max_point_depth is not None else 10.0,
                 exclude_centers=exc_centers,
                 exclude_radii=exc_radii,
@@ -2043,6 +2082,9 @@ class FullPipelineViewer(DualViewer):
             
             # キャッシュ
             if points_3d is not None:
+                if self.roi_width is not None and len(points_3d) > 0:
+                    half_w = self.roi_width / 2.0
+                    points_3d = points_3d[(points_3d[:, 0] >= -half_w) & (points_3d[:, 0] <= half_w)]
                 self._last_points_3d = points_3d
             
             if need_points_for_mesh and points_3d is not None:
@@ -2626,6 +2668,29 @@ class FullPipelineViewer(DualViewer):
                 # imdecode は BGR で返る
                 color_image = cv2.imdecode(color_data, cv2.IMREAD_COLOR)
                 return color_image
+            else:
+                # Fallback: raw YUY2/YUV422 frames (Orbbec defaults)
+                try:
+                    height, width = (
+                        self.camera.color_resolution  # type: ignore[attr-defined]
+                        if hasattr(self.camera, "color_resolution")
+                        else (720, 1280)
+                    )
+                except Exception:
+                    height, width = 720, 1280  # sensible default
+
+                try:
+                    # Many Orbbec devices provide YUY2 packed 16-bit frames
+                    # → reshape (H, W, 2) then convert to BGR
+                    yuy2 = color_data.reshape((height, width, 2))
+                    bgr = cv2.cvtColor(yuy2, cv2.COLOR_YUV2BGR_YUY2)
+                    return bgr
+                except Exception:
+                    # Unknown format – skip color (hand detection will fail)
+                    logger.debug(
+                        "Unknown color format %s (len=%d) – skipping", color_format, len(color_data)
+                    )
+                    return None
         except Exception as e:
             logger.error(f"Color format conversion error: {e}")
         
@@ -3293,6 +3358,8 @@ def add_basic_arguments(parser: argparse.ArgumentParser):
     parser.add_argument('--no-tracking', action='store_true', help='トラッキングを無効にする')
     parser.add_argument('--gpu-mediapipe', action='store_true', help='MediaPipeでGPUを使用')
     parser.add_argument('--max-depth', type=float, help='最大点群距離 (m)')
+    parser.add_argument('--min-depth', type=float, help='最小点群距離 (m)')
+    parser.add_argument('--width', type=float, help='処理対象の横方向幅 (m)')
 
 
 def add_collision_arguments(parser: argparse.ArgumentParser):
@@ -3333,6 +3400,8 @@ def add_optimization_arguments(parser: argparse.ArgumentParser):
     parser.add_argument('--no-optimized-bvh', action='store_true', help='最適化BVHを無効にする')
     parser.add_argument('--run-speedup-benchmark', action='store_true', help='speedup.md最適化のベンチマークを実行')
     parser.add_argument('--print-optimization-stats', action='store_true', help='最適化統計を定期的に表示')
+    # MOUNT-INS-01: 山サイズ別楽器マッピング
+    parser.add_argument('--enable-mountain-instrument', action='store_true', help='山クラスタ毎に楽器を固定するマッピングを有効化')
 
 
 def add_detection_arguments(parser: argparse.ArgumentParser):
@@ -3408,6 +3477,23 @@ def validate_arguments(args) -> bool:
         if args.drum_depth >= args.max_depth:
             print("Error: --drum-depth must be less than --max-depth")
             return False
+    
+    # Validate --min-depth
+    if getattr(args, 'min_depth', None) is not None and args.min_depth <= 0.0:
+        print("Error: --min-depth must be positive")
+        return False
+    if (
+        getattr(args, 'min_depth', None) is not None
+        and getattr(args, 'max_depth', None) is not None
+        and args.min_depth >= args.max_depth
+    ):
+        print("Error: --min-depth must be less than --max-depth")
+        return False
+    
+    # Validate --width (ROI width)
+    if getattr(args, 'width', None) is not None and args.width <= 0.0:
+        print("Error: --width must be positive")
+        return False
     
     return True
 
@@ -3571,13 +3657,16 @@ def create_viewer(args, audio_scale: ScaleType, audio_instrument: InstrumentType
         headless_duration=args.headless_duration,
         pure_headless_mode=args.headless_pure,
         max_point_depth=args.max_depth,
+        min_point_depth=args.min_depth,
         drum_depth=args.drum_depth,
         scale_depth=args.scale_depth,
         # speedup.md最適化オプション
         enable_zero_copy_optimization=not args.no_zero_copy,
         enable_unified_filter_pipeline=not args.no_unified_filter,
         enable_optimized_bvh=not args.no_optimized_bvh,
-        print_optimization_stats=args.print_optimization_stats
+        print_optimization_stats=args.print_optimization_stats,
+        roi_width=args.width,
+        enable_mountain_instrument=args.enable_mountain_instrument,
     )
 
 

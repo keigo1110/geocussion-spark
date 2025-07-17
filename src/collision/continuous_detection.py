@@ -124,12 +124,17 @@ class ContinuousCollisionDetector:
         velocity = getattr(hand, 'velocity', np.zeros(3))
         vel_magnitude = float(np.linalg.norm(velocity))
         
-        if vel_magnitude > VERY_HIGH_SPEED_VELOCITY_THRESHOLD:
-            num_samples = COLLISION_INTERPOLATION_MAX_SAMPLES
-        elif vel_magnitude > HIGH_SPEED_VELOCITY_THRESHOLD:
+        # --- Revised adaptive sampling strategy (perf-CCD-002) ---
+        if vel_magnitude < 0.5:
+            num_samples = 1  # slow movement – no interpolation
+        elif vel_magnitude < HIGH_SPEED_VELOCITY_THRESHOLD:
+            num_samples = COLLISION_INTERPOLATION_MIN_SAMPLES  # typically 3
+        elif vel_magnitude < VERY_HIGH_SPEED_VELOCITY_THRESHOLD:
+            # medium-high speed – mid value between min and max
             num_samples = (COLLISION_INTERPOLATION_MIN_SAMPLES + COLLISION_INTERPOLATION_MAX_SAMPLES) // 2
         else:
-            num_samples = COLLISION_INTERPOLATION_MIN_SAMPLES
+            # very high speed – maximum safety samples
+            num_samples = COLLISION_INTERPOLATION_MAX_SAMPLES
         
         # 線形補間でサンプル生成
         samples = []

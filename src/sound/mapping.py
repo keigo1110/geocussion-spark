@@ -108,6 +108,7 @@ class AudioMapper:
         depth_max: Optional[float] = None,
         drum_depth: Optional[float] = None,
         scale_depth: Optional[float] = None,
+        mountain_instrument_table: Optional[Dict[int, InstrumentType]] = None,  # MOUNT-INS-01
     ):
         """
         初期化
@@ -128,6 +129,9 @@ class AudioMapper:
         self.spatial_range = spatial_range
         self.default_instrument = default_instrument
         self.enable_adaptive_mapping = enable_adaptive_mapping
+
+        # --- MOUNT-INS-01 mountain mapping --------------------------
+        self.mountain_instrument_table = mountain_instrument_table or {}
 
         # --- depth-based mapping parameters (optional) -----------------
         self.depth_max = depth_max
@@ -347,6 +351,19 @@ class AudioMapper:
     
     def _select_instrument(self, event: CollisionEvent) -> InstrumentType:
         """楽器を選択（優先度ベースで決定）"""
+
+        # ------------------------------------------------------------------
+        # Ⓐ 山クラスタによるマッピングがあれば最優先 (MOUNT-INS-01)
+        # ------------------------------------------------------------------
+        if (
+            self.mountain_instrument_table
+            and hasattr(event, "mountain_id")
+            and isinstance(event.mountain_id, int)
+            and event.mountain_id >= 0
+        ):
+            inst = self.mountain_instrument_table.get(event.mountain_id)
+            if inst is not None:
+                return inst
 
         # ------------------------------------------------------------------
         # ❶ 深度がドラム領域に入っている場合は無条件で DRUM
