@@ -494,9 +494,16 @@ class DelaunayTriangulator:
         if any(length > max_allowed_length for length in edge_lengths):
             return False
         
+        # ----------------------------------------------------------------
+        # Pre-compute height range (vertical difference) once so it is
+        # available for both the slope check and the later spike check.
+        # Without this, height_range would be undefined when
+        # self.slope_threshold is None or <= 0, leading to a NameError.
+        # ----------------------------------------------------------------
+        height_range = float(np.ptp(triangle_vertices[:, 2]))
+
         # ------------------------- 斜度チェック -------------------------
         if self.slope_threshold is not None and self.slope_threshold > 0:
-            height_range = float(np.ptp(triangle_vertices[:, 2]))
             avg_edge = sum(edge_lengths) / 3.0
             if avg_edge > 1e-12:
                 slope_ratio = height_range / avg_edge

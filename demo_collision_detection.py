@@ -402,6 +402,9 @@ class FullPipelineViewer(DualViewer):
         # 横方向ROI幅 (m)
         self.roi_width: Optional[float] = kwargs.pop('roi_width', None)
     
+        # MOUNT-INS-01 mountain instrument feature
+        self.enable_mountain_instrument = kwargs.pop('enable_mountain_instrument', False)
+    
     def _initialize_components(self):
         """コンポーネントを初期化"""
         # ヘルプテキスト
@@ -968,6 +971,18 @@ class FullPipelineViewer(DualViewer):
             if mesh_res.needs_refresh or mesh_res.changed:
                 self._update_mesh_visualization(simplified_mesh)
             
+            # MOUNT-INS-01: mountain clustering and instrument table
+            if getattr(self, 'enable_mountain_instrument', False):
+                try:
+                    from src.mesh.mountain_cluster import cluster_mountains, assign_instruments_by_area
+                    tri_to_mnt, mnt_area = cluster_mountains(simplified_mesh)
+                    self.triangle_to_mountain = tri_to_mnt
+                    self.mountain_instrument_table = assign_instruments_by_area(mnt_area)
+                    if self.audio_mapper is not None:
+                        self.audio_mapper.mountain_instrument_table = self.mountain_instrument_table
+                except Exception as exc:  # pylint: disable=broad-except
+                    logger.debug("[MOUNT-INS-01] Clustering failed: %s", exc)
+            
             # 強制更新フラグをリセット
             if hasattr(self, 'force_mesh_update_requested'):
                 self.force_mesh_update_requested = False
@@ -1125,9 +1140,17 @@ class FullPipelineViewer(DualViewer):
         return info
     
     def _create_collision_event(self, hand: TrackedHand, hand_pos: np.ndarray, info: Any) -> Any:
-        """衝突イベントを生成"""
+        """衝突イベントを生成 (mountain_id 付与)"""
         velocity = np.array(hand.velocity) if hasattr(hand, 'velocity') and hand.velocity is not None else np.zeros(3)
-        return self.event_queue.create_event(info, hand.id, hand_pos, velocity)
+        event = self.event_queue.create_event(info, hand.id, hand_pos, velocity)
+        if event is not None and hasattr(self, 'triangle_to_mountain') and getattr(self, 'enable_mountain_instrument', False):
+            try:
+                tri_idx = getattr(event, 'triangle_index', -1)
+                if 0 <= tri_idx < len(self.triangle_to_mountain):
+                    event.mountain_id = int(self.triangle_to_mountain[tri_idx])
+            except Exception:  # pragma: no cover
+                pass
+        return event
     
     def _update_collision_points(self, info: Any) -> None:
         """衝突点を更新（統一形式）"""
@@ -2645,6 +2668,29 @@ class FullPipelineViewer(DualViewer):
                 # imdecode は BGR で返る
                 color_image = cv2.imdecode(color_data, cv2.IMREAD_COLOR)
                 return color_image
+            else:
+                # Fallback: raw YUY2/YUV422 frames (Orbbec defaults)
+                try:
+                    height, width = (
+                        self.camera.color_resolution  # type: ignore[attr-defined]
+                        if hasattr(self.camera, "color_resolution")
+                        else (720, 1280)
+                    )
+                except Exception:
+                    height, width = 720, 1280  # sensible default
+
+                try:
+                    # Many Orbbec devices provide YUY2 packed 16-bit frames
+                    # → reshape (H, W, 2) then convert to BGR
+                    yuy2 = color_data.reshape((height, width, 2))
+                    bgr = cv2.cvtColor(yuy2, cv2.COLOR_YUV2BGR_YUY2)
+                    return bgr
+                except Exception:
+                    # Unknown format – skip color (hand detection will fail)
+                    logger.debug(
+                        "Unknown color format %s (len=%d) – skipping", color_format, len(color_data)
+                    )
+                    return None
         except Exception as e:
             logger.error(f"Color format conversion error: {e}")
         
@@ -3354,6 +3400,8 @@ def add_optimization_arguments(parser: argparse.ArgumentParser):
     parser.add_argument('--no-optimized-bvh', action='store_true', help='最適化BVHを無効にする')
     parser.add_argument('--run-speedup-benchmark', action='store_true', help='speedup.md最適化のベンチマークを実行')
     parser.add_argument('--print-optimization-stats', action='store_true', help='最適化統計を定期的に表示')
+    # MOUNT-INS-01: 山サイズ別楽器マッピング
+    parser.add_argument('--enable-mountain-instrument', action='store_true', help='山クラスタ毎に楽器を固定するマッピングを有効化')
 
 
 def add_detection_arguments(parser: argparse.ArgumentParser):
@@ -3618,6 +3666,7 @@ def create_viewer(args, audio_scale: ScaleType, audio_instrument: InstrumentType
         enable_optimized_bvh=not args.no_optimized_bvh,
         print_optimization_stats=args.print_optimization_stats,
         roi_width=args.width,
+        enable_mountain_instrument=args.enable_mountain_instrument,
     )
 
 
