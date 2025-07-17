@@ -1774,8 +1774,12 @@ class FullPipelineViewer(DualViewer):
         # --------------------------------------------------------------
         # Decide if we need to force mesh update via scheduler
         # --------------------------------------------------------------
-        any_hands_present = prelim_hands_present or self.terrain_deforming
-        force_update = self.mesh_scheduler.should_update(any_hands_present, tracked_hands)
+        # Refined mesh update logic: hands suppress updates but terrain deformation forces update when no hands.
+        hands_present_flag = prelim_hands_present  # True if hands detected/recent
+        force_update = self.mesh_scheduler.should_update(hands_present_flag, tracked_hands)
+        # If terrain is deforming and no hands are present, trigger update immediately.
+        if (not hands_present_flag) and self.terrain_deforming:
+            force_update = True
         
         collision_events = self._process_collision_pipeline(
             points_3d, tracked_hands, force_update=force_update
