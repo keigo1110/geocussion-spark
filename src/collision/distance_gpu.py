@@ -40,7 +40,7 @@ class GPUDistanceCalculator:
         use_gpu: bool = True,
         batch_size: int = 10000,
         memory_limit_ratio: float = 0.8,
-        fallback_threshold: int = 1000
+        fallback_threshold: int = 0  # 0 = always attempt GPU first
     ):
         """
         初期化

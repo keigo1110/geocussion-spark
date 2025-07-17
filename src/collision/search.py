@@ -273,18 +273,11 @@ class CollisionSearcher:
         mesh_vertices = self.spatial_index.mesh.vertices
         mesh_triangles = self.spatial_index.mesh.triangles
         
-        # バッチ計算が可能な場合はそれを使用
-        if len(triangle_indices) > 3:  # バッチ化の閾値
-            triangle_vertices_batch = mesh_vertices[mesh_triangles[triangle_indices]]  # (M, 3, 3)
-            points_batch = np.array([point])  # (1, 3)
-            distance_matrix = calculator.calculate_batch_distances(points_batch, triangle_vertices_batch)
-            distances = distance_matrix[0].tolist()
-        else:
-            # 少数の場合は従来通り個別計算
-            for tri_idx in triangle_indices:
-                triangle_vertices = mesh_vertices[mesh_triangles[tri_idx]]
-                dist = calculator.calculate_point_triangle_distance(point, triangle_vertices)
-                distances.append(dist)
+        # perf-SEARCH-002: always use vectorized batch path even for small sets
+        triangle_vertices_batch = mesh_vertices[mesh_triangles[triangle_indices]]  # (M, 3, 3)
+        points_batch = np.array([point])  # (1, 3)
+        distance_matrix = calculator.calculate_batch_distances(points_batch, triangle_vertices_batch)
+        distances = distance_matrix[0].tolist()
             
         return distances
     
