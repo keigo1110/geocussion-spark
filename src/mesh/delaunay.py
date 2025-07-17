@@ -93,6 +93,10 @@ class DelaunayTriangulator:
         quality_threshold: float = 0.5,   # 品質閾値（0-1）
         slope_threshold: float = 2.0,      # 高さ差/平均エッジ長 の許容上限 (≈tanθ)。2→約63°
         z_std_threshold: float = 0.5,      # Z標準偏差の許容上限（薄いテント三角形除去）
+        z_mapping: str = "nn1",          # Zマッピング方法: 'nn1' (最近傍1点), 'nn3' (最近傍3点平均)
+        boundary_z_mode: str = "avg",    # 境界点Z決定方法: 'avg' | 'min'
+        small_xy_edge_thresh: float = 0.03,  # XY最大エッジがこの値未満かつ高さ差が大の場合スパイクとみなす
+        height_spike_thresh: float = 0.15,   # 高さ差がこの値を超えるとスパイク判定
         # GPU加速設定
         use_gpu: bool = True,              # GPU使用フラグ
         gpu_fallback_threshold: int = 300  # GPU使用の最小点数（より積極的に）
@@ -116,6 +120,10 @@ class DelaunayTriangulator:
         self.quality_threshold = quality_threshold
         self.slope_threshold = slope_threshold
         self.z_std_threshold = z_std_threshold
+        self.z_mapping = z_mapping
+        self.boundary_z_mode = boundary_z_mode
+        self.small_xy_edge_thresh = small_xy_edge_thresh
+        self.height_spike_thresh = height_spike_thresh
         self.use_gpu = use_gpu
         self.gpu_fallback_threshold = gpu_fallback_threshold
         
@@ -306,6 +314,10 @@ class DelaunayTriangulator:
                 edge_length = np.linalg.norm(p2[:2] - p1[:2])
                 if edge_length > self.max_edge_length:
                     mid_point = (p1 + p2) / 2
+                    # Z座標の決定方法を切替え
+                    if self.boundary_z_mode == "min":
+                        mid_point[2] = min(p1[2], p2[2])
+                    # 'avg' は上記の平均のまま
                     additional_points.append(mid_point)
             
             if additional_points:
@@ -349,13 +361,22 @@ class DelaunayTriangulator:
                         # 元の点群のXY座標でKD-Treeを構築
                         tree = cKDTree(points[:, :2])
                         # GPU結果の2D頂点に対して最近傍の元点を検索
-                        _, nn_indices = tree.query(vertices_2d, k=1)
-                        
+                        if self.z_mapping == "nn3":
+                            dists, nn_indices = tree.query(vertices_2d, k=3)
+                            # 加重平均 (距離の逆数)
+                            weights = 1.0 / (dists + 1e-6)
+                            weights_sum = np.sum(weights, axis=1, keepdims=True)
+                            norm_weights = weights / weights_sum
+                            z_vals = np.sum(points[nn_indices, 2] * norm_weights, axis=1)
+                        else:  # 'nn1'
+                            _, nn_indices = tree.query(vertices_2d, k=1)
+                            z_vals = points[nn_indices, 2]
+
                         # 正しいZ座標で3D頂点を作成
                         vertices_3d = np.column_stack([
                             vertices_2d[:, 0],
                             vertices_2d[:, 1], 
-                            points[nn_indices, 2]  # 最近傍のZ座標を使用
+                            z_vals
                         ])
                         
                         import logging as _logging
@@ -481,6 +502,16 @@ class DelaunayTriangulator:
                 slope_ratio = height_range / avg_edge
                 if slope_ratio > self.slope_threshold:
                     return False  # ほぼ垂直な三角形を除外
+
+        # ------------------------ スパイクチェック ------------------------
+        # XY平面上で極小だが高さ差が大きい三角形を除外（速度効果大）
+        max_xy_edge = max(
+            np.linalg.norm((v1 - v0)[:2]),
+            np.linalg.norm((v2 - v1)[:2]),
+            np.linalg.norm((v0 - v2)[:2]),
+        )
+        if max_xy_edge < self.small_xy_edge_thresh and height_range > self.height_spike_thresh:
+            return False
 
         # 縦横比チェック（より緩い条件）
         min_edge = min(edge_lengths)

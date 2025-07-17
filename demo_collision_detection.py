@@ -385,7 +385,8 @@ class FullPipelineViewer(DualViewer):
         self.use_gpu_mediapipe = kwargs.pop('use_gpu_mediapipe', False)
     
         # 処理対象とする最大距離を制限 (例: 1.1 → 1.1m より奥は無視)
-        self.max_point_depth = kwargs.pop('max_point_depth', None)
+        self.max_point_depth: Optional[float] = kwargs.pop('max_point_depth', None)
+        self.min_point_depth: Optional[float] = kwargs.pop('min_point_depth', None)
     
         # NEW depth-based scale mapping options
         self.drum_depth = kwargs.pop('drum_depth', None)
@@ -398,6 +399,8 @@ class FullPipelineViewer(DualViewer):
         
         # 最適化統計表示オプション（DualViewerに渡さない）
         self.print_optimization_stats = kwargs.pop('print_optimization_stats', False)
+        # 横方向ROI幅 (m)
+        self.roi_width: Optional[float] = kwargs.pop('roi_width', None)
     
     def _initialize_components(self):
         """コンポーネントを初期化"""
@@ -416,6 +419,7 @@ class FullPipelineViewer(DualViewer):
             max_height_variation=0.30,   # 垂直面セルを除外 (>=30cm 高さ差)
             min_points_per_cell=3,       # 信頼できるセルのみ採用
             height_clip_percentile=0.995,
+            deduplicate_xy=True,
         )
         
         # LODメッシュ生成器
@@ -480,6 +484,8 @@ class FullPipelineViewer(DualViewer):
             slope_threshold=2.0,
             z_std_threshold=0.3,         # Z標準偏差30cm超の薄いテント三角形を除去
             use_gpu=True,
+            small_xy_edge_thresh=0.025,
+            height_spike_thresh=0.15,
         )
 
         # 統合 MeshPipeline
@@ -2040,6 +2046,7 @@ class FullPipelineViewer(DualViewer):
 
             points_3d, _ = self.pointcloud_converter.numpy_to_pointcloud(
                 depth_image,
+                min_depth=self.min_point_depth if self.min_point_depth is not None else 0.1,
                 max_depth=self.max_point_depth if self.max_point_depth is not None else 10.0,
                 exclude_centers=exc_centers,
                 exclude_radii=exc_radii,
@@ -2048,6 +2055,9 @@ class FullPipelineViewer(DualViewer):
             
             # キャッシュ
             if points_3d is not None:
+                if self.roi_width is not None and len(points_3d) > 0:
+                    half_w = self.roi_width / 2.0
+                    points_3d = points_3d[(points_3d[:, 0] >= -half_w) & (points_3d[:, 0] <= half_w)]
                 self._last_points_3d = points_3d
             
             if need_points_for_mesh and points_3d is not None:
@@ -3298,6 +3308,8 @@ def add_basic_arguments(parser: argparse.ArgumentParser):
     parser.add_argument('--no-tracking', action='store_true', help='トラッキングを無効にする')
     parser.add_argument('--gpu-mediapipe', action='store_true', help='MediaPipeでGPUを使用')
     parser.add_argument('--max-depth', type=float, help='最大点群距離 (m)')
+    parser.add_argument('--min-depth', type=float, help='最小点群距離 (m)')
+    parser.add_argument('--width', type=float, help='処理対象の横方向幅 (m)')
 
 
 def add_collision_arguments(parser: argparse.ArgumentParser):
@@ -3413,6 +3425,23 @@ def validate_arguments(args) -> bool:
         if args.drum_depth >= args.max_depth:
             print("Error: --drum-depth must be less than --max-depth")
             return False
+    
+    # Validate --min-depth
+    if getattr(args, 'min_depth', None) is not None and args.min_depth <= 0.0:
+        print("Error: --min-depth must be positive")
+        return False
+    if (
+        getattr(args, 'min_depth', None) is not None
+        and getattr(args, 'max_depth', None) is not None
+        and args.min_depth >= args.max_depth
+    ):
+        print("Error: --min-depth must be less than --max-depth")
+        return False
+    
+    # Validate --width (ROI width)
+    if getattr(args, 'width', None) is not None and args.width <= 0.0:
+        print("Error: --width must be positive")
+        return False
     
     return True
 
@@ -3576,13 +3605,15 @@ def create_viewer(args, audio_scale: ScaleType, audio_instrument: InstrumentType
         headless_duration=args.headless_duration,
         pure_headless_mode=args.headless_pure,
         max_point_depth=args.max_depth,
+        min_point_depth=args.min_depth,
         drum_depth=args.drum_depth,
         scale_depth=args.scale_depth,
         # speedup.md最適化オプション
         enable_zero_copy_optimization=not args.no_zero_copy,
         enable_unified_filter_pipeline=not args.no_unified_filter,
         enable_optimized_bvh=not args.no_optimized_bvh,
-        print_optimization_stats=args.print_optimization_stats
+        print_optimization_stats=args.print_optimization_stats,
+        roi_width=args.width,
     )
 
 

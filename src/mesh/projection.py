@@ -83,6 +83,7 @@ class PointCloudProjector:
         plane: Literal["xy", "xz", "yz"] = "xy",  # 投影平面
         max_height_variation: Optional[float] = None,  # 1セル内で許容される高さ差 (m) – 大きすぎる縦面セルを除外
         height_clip_percentile: Optional[float] = None, # 高さ外れ値クリップのパーセンタイル (0-1)
+        deduplicate_xy: bool = False,  # 同一セル内に複数点がある場合に1点へ縮約するか
     ):
         """
         初期化
@@ -103,6 +104,7 @@ class PointCloudProjector:
         self.plane = plane  # 新規: 投影平面
         self.max_height_variation = max_height_variation
         self.height_clip_percentile = height_clip_percentile
+        self.deduplicate_xy = deduplicate_xy
         
         # パフォーマンス統計
         self.stats = {
@@ -142,6 +144,15 @@ class PointCloudProjector:
             axis0, axis1, height_idx = 1, 2, 0  # X が高さ
         else:
             raise ValueError(f"Invalid projection plane: {self.plane}")
+
+        # ------------------------------------------------------------------
+        # XY セル縮約（同一セルに複数 Z がある場合、最初の 1 点を残す）
+        # ------------------------------------------------------------------
+        if self.deduplicate_xy:
+            cell = self.resolution
+            xy_coords = np.round(points[:, [axis0, axis1]] / cell, 3)
+            _, uniq_indices = np.unique(xy_coords, axis=0, return_index=True)
+            points = points[uniq_indices]
 
         # バウンディングボックス計算（選択軸）
         min_axis0, min_axis1 = np.min(points[:, [axis0, axis1]], axis=0)

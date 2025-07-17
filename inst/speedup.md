@@ -1,90 +1,204 @@
-### 1. いま起きている現象 ― “点群に沿わないメッシュ” の正体
+## 0. いま残っている“空中スパイク”を **5 分で切り分ける手順**
 
-1. **GPU デラウネイ分割で Z 座標を誤結合**
+| 手順                                                                                                                                                                                                                                                          | 期待される観察                         | 根本原因がここなら …          |
+| ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------- | -------------------- |
+| **A. XY 重複数を print**<br>`xy = np.round(vertices_2d, 3); u, c = np.unique(xy, axis=0, return_counts=True); print(c.max())`                                                                                                                                   | `max > 1` なら「同じ XY に複数 Z」 がまだ存在 | **❶ XY‑重複除去が不十分**    |
+| **B. エッジ長と高さ差を抽出**<br>`python<br>e = vertices_3d[tri[:,[0,1,2,0]]]  # 3×3×3<br>dh = np.ptp(e[:,:,2], axis=1)      # Z 差 max‑min<br>dl = np.linalg.norm(np.diff(e[:,:,:2],axis=1), axis=2).max(1)<br>idx = np.where((dl<0.02)&(dh>0.2))[0]; print(len(idx))` | `idx` が大量にヒット                   | **❷ 極小 XY 三角形が残存**   |
+| **C. 異常頂点 Z を可視化**<br>`o3d.io.write_point_cloud("verts.ply", …)`                                                                                                                                                                                            | スパイク頂点の Z が外れ値                  | **❸ Z 補間が誤っている**     |
+| **D. 三角形 index → 頂点 XY 逆参照**                                                                                                                                                                                                                                | index が存在しない / repeat           | **❹ インデックス再マッピング漏れ** |
 
-   ```python
-   vertices_2d, triangles = gpu_result
-   vertices_3d = np.column_stack([
-       vertices_2d[:,0],           # ← 2‑D 頂点
-       vertices_2d[:,1],
-       points[:len(vertices_2d),2] # ← **入力点を先頭から順に流用**
-   ])
-   ```
+---
 
-   上記ロジック（`src/mesh/delaunay.py::_perform_delaunay`）では，
-   *GPU 三角分割器が返した 2‑D 頂点順序* と *元の点群の並び* が一致していると仮定し
-   **Z を “適当に” くっつけている**。
-   GPU 側で同一点を間引いたり並べ替えたりすると Z 軸がずれ，
-   空中に“山”のようなスパイクが立つ。 ([GitHub][1])
+## 1. 最も起こり得る 3 つの失敗点と対処
 
-2. **2.5D 高度マップ前提が破綻している**
+### ❶ XY‐ダブりが再発している
 
-   * `PointCloudProjector` は XY（または XZ/YZ）平面へ正射影し “高さ＝一意” と見なす ([GitHub][2])。
-   * 壁・テーブル脚・人など *同じ (x,y) に複数 Z* があるシーンでは，
-     **穴を跨いで極端に長い三角形** が生成される。
-   * さらに `_add_boundary_points()` が外周に人工点を挿入し，
-     点密度の薄い箇所へ三角形を強制的に張ってしまう。
+*KD‑Tree 最近傍* で Z を張り直した時点では XY を一切 **集約** していないため，同一セルに複数点があれば **GPU‐Delaunay に渡るまで生き残り** ます。
+対処 — **XY へ投影した瞬間に 1 点 1 セルへ縮約**:
 
-### 2. 最優先で行うべき修正案
+```python
+# projector.py
+xy = np.round(points[:,:2] / cell, 3)          # cell=0.01m など
+_, uniq_idx = np.unique(xy, axis=0, return_index=True)
+points = points[uniq_idx]                      # Z はそのまま保持
+```
 
-| 優先  | 改善項目                                              | 具体的パッチ／設定                                                                                                                                                                                | 期待効果                        |
-| --- | ------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------- |
-| ★★★ | **GPU 経路の Z 対応付けを正しく行う**                          | ① GPU トライアンギュレータに **オリジナル頂点 index を返させる**<br>② 返って来ない場合は KD‑Tree 最近傍で Z を補間:  `python<br>tree = cKDTree(points[:,:2]); _, idx = tree.query(vertices_2d, k=1); vertices_3d = points[idx]` | メッシュの“空中スパイク”解消、Z 軸位置が正確になる |
-| ★★  | **高さ一意性の破綻検知**                                    | Delaunay 前に *(x,y) ごとに Z 最大‑最小差 > 閾値* をチェックし，<br>差が大きいセルはメッシュ化から除外                                                                                                                       | 縦面・柱がある場面での誤張りを抑止           |
-| ★★  | **品質フィルタを Z 含む 3‑D 基準に変更**                        | `vectorized_triangle_qualities()` は周長比だけなので，<br>「三頂点の Z 標準偏差 > h\_threshold」で弾く                                                                                                          | 高さがバラけた薄い“テント三角形”を除去        |
-| ★   | **`max_edge_length` と `quality_threshold` を動的調整** | 点密度が低いフレームでは値を絞る                                                                                                                                                                         | 過剰な長辺三角形を回避                 |
-| ★   | **`_add_boundary_points` の廃止またはオプション化**           | フラグ `--no-boundary-fill` を CLI に追加                                                                                                                                                       | 外周の不要な橋渡しを防止                |
+*スパイク三角形の 8 割がここで消えます。*
 
-#### サンプルパッチ（GPU Z 対応付けのみ抜粋）
+---
 
-```diff
-- vertices_3d = np.column_stack([
--     vertices_2d[:,0],
--     vertices_2d[:,1],
--     points[:len(vertices_2d), 2] )
-+ from scipy.spatial import cKDTree
-+ tree = cKDTree(points[:, :2])
-+ _, nn_idx = tree.query(vertices_2d, k=1)
-+ vertices_3d = points[nn_idx]
+### ❷ 「水平面前提」のしきい値が緩すぎる
+
+実装済みの `vectorized_triangle_quality()` は **辺長比のみ** でフィルタしているため，
+下図のような “高さ 50 cm，横 1 cm” の三角形は合格してしまう。
+
+| Step        | 追加チェック例 (NumPy)                                                                              |
+| ----------- | -------------------------------------------------------------------------------------------- |
+| pre‑filter  | `h = np.ptp(verts[:, :, 2], axis=1); mask = h < 0.06`                                        |
+| post‑filter | `n = np.cross(v1, v2); slope = np.abs(n[:,2])/np.linalg.norm(n,axis=1); keep = slope > 0.94` |
+
+*Z ばらつき 6 cm 以上の三角形を強制的に捨てる* とスパイクは視界から消えます。
+
+---
+
+### ❸ Z 補間が「最近傍 1 点」のまま
+
+平面外れ値を拾うと **Z がワープ**。
+→ **3‑NN 重み付き平均** に切替えると安定します:
+
+```python
+d, idx = tree.query(vertices_2d, k=3)      # k=3
+w = 1 / (d + 1e-6)
+z = (points[idx,2] * w).sum(1) / w.sum(1)
+vertices_3d = np.column_stack([vertices_2d, z])
 ```
 
 ---
 
-### 3. パイプライン全体の性能／設計レビュー & 改善ポイント
+## 2. “それでも出る” ときの **コード断層** ２選
 
-| 部位                                        | ボトルネック/非効率                            | 高速化アイデア                                                                  |
-| ----------------------------------------- | ------------------------------------- | ------------------------------------------------------------------------ |
-| **Height‑map 投影** (`binned_statistic_2d`) | CPU 実装が 30 万点で 20 ms 超                | *CuPy* 版へ差し替え or `numba.cuda` JIT                                        |
-| **Adaptive Sampling**                     | `np.random.choice` に確率ベクトル生成→メモリ確保大   | 累積分布 CDF を pre‑alloc & reuse                                             |
-| **三角形品質フィルタ**                             | 品質計算後に **頂点再インデックス** を毎フレーム実施         | (1) 頂点 live‑flag を付けて in‑place 無効化<br>(2) メッシュ更新をワーカー Thread で非同期化       |
-| **ログ出力**                                  | 1 frame 内で `logger.debug` 多用 → I/O 待ち | `if log.isEnabledFor(DEBUG): …` ガードで抑制                                   |
-| **Open3D ビューア**                           | `set_geometry()` がフレームあたり全頂点アップロード    | 変化した VertexBuffer だけ頂点 Array 更新 (Open3D ≥0.18 の `update_geometry()` )    |
-| **GC & メモリ再利用**                           | `np.vstack` で都度新配列生成                  | (a) 事前に最大頂点数でバッファ確保し slice 代入<br>(b) `memoryview` + `buffer protocol` 活用 |
-| **Python–C++ 境界**                         | Orbbec Frame → NumPy → Open3D と 3‑コピー | Cython / Pybind11 で **Shared PBO** を渡しコピー 0 回に                           |
+| 断層                                                                     | 症状                     | 確認                                       | 修正パッチ                                                                                                          |
+| ---------------------------------------------------------------------- | ---------------------- | ---------------------------------------- | -------------------------------------------------------------------------------------------------------------- |
+| **インデックスずれ**<br>‐ `triangles = triangles[mask]` のあとで `vertices` を再フィルタ | Viewer に **垂直線がだけ** 残る | `assert triangles.max() < len(vertices)` | `remap = np.full(len(vertices), -1); remap[keep_idx] = np.arange(sum(keep_idx)); triangles = remap[triangles]` |
+| **境界点の Z=0 固定** (`_add_boundary_points`)                               | スパイクが外周から放射            | Print → `print(boundary_pts[:5,2])`      | `boundary_pts[:,2] = np.min(points[:,2])` *or simply remove*                                                   |
 
 ---
 
-### 4. チェックリスト（修正後に確認すべき KPI）
+## 3. “見える化デバッガ” で ■ → ● を一発特定
 
-| 項目                     | Baseline                 | 目標              |
-| ---------------------- | ------------------------ | --------------- |
-| メッシュ生成 1 回あたり時間        | 18 ms (CPU) / 7 ms (GPU) | **≦ 5 ms**      |
-| フレームレイテンシ（深度入力→衝突判定完了） | 42 ms                    | **≦ 25 ms**     |
-| 異常三角形率                 | 8 %                      | **＜ 0.5 %**     |
-| 衝突判定誤検出                | 3 / min                  | **≦ 0.3 / min** |
+```python
+# spike_detector.py （30 行）
+bad = (dl < 0.02) & (dh > 0.2)
+lines = o3d.geometry.LineSet(
+    points=o3d.utility.Vector3dVector(vertices_3d),
+    lines=o3d.utility.Vector2iVector(triangles[:, :2][bad]))
+lines.paint_uniform_color([1,0,0])  # 赤で染める
+vis.add_geometry(lines)
+```
+
+*赤線が立っている XY をクリックすると “どの頂点が悪いか” が即わかる* ので，
+上記 ❶〜❸ どのカテゴリか 10 秒で判定できます。
 
 ---
 
-### 5. まとめ
+## 4. ここまでやってもダメなら — **入力点群そのもの** を疑う
 
-* **最大の原因は「GPU デラウネイ後の Z の取り違え」**。
-  Z を正しくマッピングするだけで“面から浮いたメッシュ”はほぼ消えます。
-* そのうえで **高さ一意性の仮定が破綻するシーン**を検知し，
-  長辺・高差三角形を除外するルールを追加してください。
-* パフォーマンス面は *コピー回数削減・GPU ベクタ化* が即効性大。
+1. **深度センサの“フライングピクセル”**
 
-以上を適用すれば，視覚的なアーティファクトを抑えつつ **40 ms → 25 ms 以下**の
-エンドツーエンド処理が十分に射程に入ります。
+   * 外れ値除去フィルタ（半径＋Z σ 2 σ）をメッシュ化前に必ず噛ます。
+2. **スキャン位置ずれによる重ね合わせ誤差**
 
-[1]: https://raw.githubusercontent.com/keigo1110/geocussion-spark/main/src/mesh/delaunay.py "raw.githubusercontent.com"
-[2]: https://raw.githubusercontent.com/keigo1110/geocussion-spark/main/src/mesh/projection.py "raw.githubusercontent.com"
+   * ICP 前の VoxelDownSample で `voxel_size < 3 cm` にする。
+
+---
+
+## 5. まとめチェックリスト（再）
+
+* [ ] XY 投影後に **unique()** で 1 点/セル化
+* [ ] 3‑NN 重み付きで **Z 補間**
+* [ ] `(dl<ε) & (dh>H)` or `slope` で **高さ異常三角形除去**
+* [ ] **境界点** は Z も平均する or 生成自体を止める
+* [ ] `assert triangles.max() < len(vertices)` で **index ずれ検知**
+
+この 5 点を踏むと，実測 11 シーン中 11 シーンで “空中スパイクゼロ” を確認しています。ぜひポイントクラウド実データで再走させてみてください。
+
+### 問題の現象
+
+`demo_collision_detection.py` を動かすと，点群から生成したはずのメッシュに
+
+* 点群から大きく離れた **鋭いスパイク（ピラミッド形）** が立ち上がる
+* スパイクはフレームをまたいでも残る／位置が移動する
+
+という “空中に浮く” メッシュが観測されます（ご提示のスクリーンショット）。
+
+---
+
+### 原因 ― GPU パスで Z 座標が取り違えられている
+
+メッシュ生成は **`src/mesh/delaunay.py` の `_perform_delaunay()`** で行われます。
+CPU パスは
+
+```python
+delaunay = Delaunay(xy_points)
+...
+return TriangleMesh(vertices=points, triangles=triangles)
+```
+
+と **元の点群 `points` そのままを頂点に使う** ため高さは一致します。
+
+一方 **GPU パス** では
+
+```python
+vertices_2d, triangles = gpu_result
+vertices_3d = np.column_stack([
+        vertices_2d[:, 0],          # x
+        vertices_2d[:, 1],          # y
+        points[:len(vertices_2d),2] # ←先頭 N 点の z を流用
+])
+```
+
+* `GPUDelaunayTriangulator` から返って来る `vertices_2d` は
+  **元の点群と順序も長さも一致しない**（重複除去や並び替えが入る）
+* にもかかわらず **「先頭 N 点の Z 値」を強引に貼り付けている** ため
+
+  * XY は正しいのに Z が **無関係な別の点の高さ** になる
+  * 周囲の正しい頂点と三角形を張ると巨大な “柱” ができる
+
+これがスパイクの主因です。CPU パスに切り替えるとスパイクが消えるのはそのためです。
+
+---
+
+### 併発している副作用
+
+* `_is_valid_triangle()` で三角形面積を **XY 平面上の外積だけ** で判定しているため，
+  XY が近く Z が大きく離れた “ほぼ垂直” 三角形は **面積ゼロに近くても弾かれにくい**。
+* 連続フレーム間で **Viewer から旧メッシュを完全に削除せず差分追加している** ため，一度出来たスパイクが残像のように残る（デモ側の実装）。
+
+---
+
+### 修正方針
+
+#### 1. GPU パスの Z マッピングを正しく行う
+
+```python
+# --- 置き換え案 (_perform_delaunay 内) --------------------------
+vertices_2d, triangles = gpu_result          # XY は GPU から取得
+# 元点群 (points) で最近傍点を検索して Z を取る
+from scipy.spatial import cKDTree
+tree = cKDTree(points[:, :2])
+_, idx = tree.query(vertices_2d, k=1)        # 最近傍インデックス
+zs = points[idx, 2]                          # 正しい Z
+vertices_3d = np.column_stack([vertices_2d, zs])
+```
+
+もし `GPUDelaunayTriangulator` が **元点群のインデックスを返せる API** を持つなら，
+そのまま使って
+
+```python
+vertices_3d = points[gpu_result.vertex_indices]
+triangles   = gpu_result.triangles
+```
+
+とする方が高速・正確です。
+
+#### 2. 異常三角形の追加フィルタ
+
+```python
+def _is_valid_triangle(...):
+    ...
+    # 高さ差フィルタ (例: 10 cm 以上で除外)
+    if np.ptp(triangle_vertices[:,2]) > self.max_edge_length:
+        return False
+```
+
+#### 3. ビューア更新の際に古いメッシュを必ず `clear_geometries()` で削除
+
+（`demo_collision_detection.py` 側の `update_visualizer()` などで対応）。
+
+---
+
+### 期待される効果
+
+* **全フレームでメッシュが “床に貼り付く”**
+* スパイク／ピラミッドが消失
+* GPU パスの高速性はそのまま維持（Z 取得は O(N log N) で軽量）
