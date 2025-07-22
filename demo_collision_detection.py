@@ -335,6 +335,9 @@ class FullPipelineViewer(DualViewer):
         # 初期化完了フラグ
         self._components_initialized = False
         
+        # マウスイベント用フラグ
+        self._should_exit_on_mouse = False
+        
         # 連続衝突検出器を初期化
         self._initialize_continuous_collision_detector()
         
@@ -690,6 +693,7 @@ class FullPipelineViewer(DualViewer):
         help_sections = [
             ("Basic Controls", [
                 "Q/ESC: Exit",
+                "Right Click: Exit",
                 "F: Toggle filter",
                 "H: Toggle hand detection",
                 "T: Toggle tracking",
@@ -801,6 +805,12 @@ class FullPipelineViewer(DualViewer):
             return handler()
         
         return True
+    
+    def _mouse_callback(self, event: int, x: int, y: int, flags: int, param: Any) -> None:
+        """マウスイベント処理（右クリックで終了）"""
+        if event == cv2.EVENT_RBUTTONDOWN:
+            print("右クリックが検出されました - 終了します")
+            self._should_exit_on_mouse = True
     
     # キーハンドラーメソッド群
     def _toggle_filter(self) -> bool:
@@ -971,15 +981,20 @@ class FullPipelineViewer(DualViewer):
             if mesh_res.needs_refresh or mesh_res.changed:
                 self._update_mesh_visualization(simplified_mesh)
             
-            # MOUNT-INS-01: mountain clustering and instrument table
+            # ---------------- MOUNT-INS-01: mountain clustering and instrument table ----------------
             if getattr(self, 'enable_mountain_instrument', False):
                 try:
                     from src.mesh.mountain_cluster import cluster_mountains, assign_instruments_by_area
+
                     tri_to_mnt, mnt_area = cluster_mountains(simplified_mesh)
                     self.triangle_to_mountain = tri_to_mnt
                     self.mountain_instrument_table = assign_instruments_by_area(mnt_area)
+
+                    # AudioMapper にテーブルを連携
                     if self.audio_mapper is not None:
                         self.audio_mapper.mountain_instrument_table = self.mountain_instrument_table
+                    
+                    logger.debug(f"[MOUNT-INS-01] Clustering completed: {len(tri_to_mnt)} triangles -> {len(mnt_area)} mountains")
                 except Exception as exc:  # pylint: disable=broad-except
                     logger.debug("[MOUNT-INS-01] Clustering failed: %s", exc)
             
@@ -1387,10 +1402,9 @@ class FullPipelineViewer(DualViewer):
                 wireframe.points = _o3u.Vector3dVector(verts_np.copy())
                 wireframe.lines  = _o3u.Vector2iVector(edges_unique)
 
-                # Reapply uniform colour (エッジ数が変わる可能性がある)
-                if edges_unique.shape[0] > 0:
-                    blue = _np.tile([0.3, 0.3, 0.7], (edges_unique.shape[0], 1))
-                    wireframe.colors = _o3u.Vector3dVector(blue)
+                # Reapply per-edge colour (mountain visualisation)
+                colours = self._compute_wireframe_colors(edges_unique, tris_np)
+                wireframe.colors = _o3u.Vector3dVector(colours)
 
                 self.vis.update_geometry(wireframe)
                 self._mesh_vis_objs["wire"] = wireframe
@@ -2222,9 +2236,23 @@ class FullPipelineViewer(DualViewer):
                     res.mesh, mesh_attributes=mesh_attr_stub
                 )
 
+            # ---------------- MOUNT-INS-01: mountain clustering ----------------
+            if getattr(self, 'enable_mountain_instrument', False):
+                try:
+                    from src.mesh.mountain_cluster import cluster_mountains, assign_instruments_by_area
+                    tri_to_mnt, mnt_area = cluster_mountains(res.mesh)
+                    self.triangle_to_mountain = tri_to_mnt
+                    self.mountain_instrument_table = assign_instruments_by_area(mnt_area)
+                    if self.audio_mapper is not None:
+                        self.audio_mapper.mountain_instrument_table = self.mountain_instrument_table
+                    logger.debug(f"[MOUNT-INS-01] Clustering completed: {len(tri_to_mnt)} triangles -> {len(mnt_area)} mountains")
+                except Exception as exc:  # pylint: disable=broad-except
+                    logger.debug("[MOUNT-INS-01] Clustering failed in pipeline: %s", exc)
+
             # Only update visualization when mesh geometry actually changes
             if res.changed or res.needs_refresh:
                 logger.debug("[MESH-VIS] Updating mesh visualization due to geometry change")
+                # 山クラスタリング後に可視化を更新（色分けが反映される）
                 self._update_mesh_visualization(res.mesh)
             else:
                 logger.debug("[MESH-VIS] Skipping visualization update - no geometry change")
@@ -2630,9 +2658,18 @@ class FullPipelineViewer(DualViewer):
             
             cv2.imshow("Geocussion-SP Input Viewer", combined_image)
             
+            # マウスコールバックを設定（初回のみ）
+            if not hasattr(self, '_mouse_callback_set'):
+                cv2.setMouseCallback("Geocussion-SP Input Viewer", self._mouse_callback)
+                self._mouse_callback_set = True
+            
             # キー入力処理
             key = cv2.waitKey(1) & 0xFF
             still_running = self.handle_key_event(key)
+            
+            # マウスイベントによる終了チェック
+            if self._should_exit_on_mouse:
+                still_running = False
 
             # ---- Pump Open3D viewer every frame to keep UI responsive ----
             self._pump_3d_viewer()
@@ -3187,6 +3224,80 @@ class FullPipelineViewer(DualViewer):
         except Exception as e:
             logger.error(f"強制クリーンアップ失敗: {e}")
 
+    def _compute_wireframe_colors(self, edges_unique: np.ndarray, tris_np: np.ndarray) -> np.ndarray:
+        """Return (N,3) RGB array for each edge in ``edges_unique``.
+        When mountain-instrument mapping is active, edges inherit the colour of the first
+        triangle that owns them. Otherwise a default blue colour is returned.
+        """
+        import numpy as _np
+        # Default colour (blue-ish) used in legacy viewer
+        default_col = _np.array([0.3, 0.3, 0.7])
+
+        if not getattr(self, 'enable_mountain_instrument', False):
+            return _np.tile(default_col, (edges_unique.shape[0], 1))
+
+        # Require mapping data – otherwise fallback
+        tri_to_mnt = getattr(self, 'triangle_to_mountain', None)
+        mnt_table = getattr(self, 'mountain_instrument_table', None)
+        if tri_to_mnt is None or mnt_table is None:
+            return _np.tile(default_col, (edges_unique.shape[0], 1))
+
+        # Lazy import here to avoid heavy top-level import cost
+        from src.sound.mapping import InstrumentType  # local import
+
+        # 固定パレット（楽器タイプ → RGB）
+        instr_colour = {
+            InstrumentType.MARIMBA: _np.array([1.0, 0.55, 0.0]),   # orange
+            InstrumentType.STRING:  _np.array([0.2, 0.9, 0.2]),    # green
+            InstrumentType.SYNTH_PAD: _np.array([0.6, 0.2, 1.0]),  # purple
+            InstrumentType.DRUM:    _np.array([0.9, 0.1, 0.1]),    # red
+        }
+
+        # Helper: generate distinct colour for each mountain_id (Golden-ratio hash)
+        def _color_from_id(mnt_id: int) -> _np.ndarray:
+            import colorsys as _cs
+            phi = 0.61803398875  # golden ratio conjugate
+            h = (mnt_id * phi) % 1.0
+            s, v = 0.65, 0.95
+            return _np.array(_cs.hsv_to_rgb(h, s, v))
+
+        # Build edge->colour map (take first owner triangle colour)
+        edge_colour_dict = {}
+        for tri_idx, tri in enumerate(tris_np):
+            if tri_idx >= len(tri_to_mnt):
+                continue
+            mnt_id = int(tri_to_mnt[tri_idx])
+            instr = mnt_table.get(mnt_id)
+            # 楽器タイプが無い場合は mountain_id から自動色を生成
+            if instr is None:
+                col = _color_from_id(mnt_id)
+            else:
+                col = instr_colour.get(instr, default_col)
+            e0 = tuple(sorted((int(tri[0]), int(tri[1]))))
+            e1 = tuple(sorted((int(tri[1]), int(tri[2]))))
+            e2 = tuple(sorted((int(tri[2]), int(tri[0]))))
+            for e in (e0, e1, e2):
+                if e not in edge_colour_dict:
+                    edge_colour_dict[e] = col
+
+        # Assign colours per unique edge
+        colours_arr = _np.tile(default_col, (edges_unique.shape[0], 1))
+        for i, e in enumerate(edges_unique):
+            key = tuple(sorted((int(e[0]), int(e[1]))))
+            if key in edge_colour_dict:
+                colours_arr[i] = edge_colour_dict[key]
+            else:
+                # Identify triangles that contain BOTH vertices of the edge (true owners)
+                # A triangle owns the edge iff exactly two of its vertices match the edge's vertices.
+                # Using sum(..., axis=1) avoids expensive Python-level loops while ensuring we only
+                # pick triangles that truly share the complete edge, not just a single vertex.
+                tri_mask = (_np.isin(tris_np, e).sum(axis=1) >= 2)
+                if _np.any(tri_mask):
+                    tri_idx = int(_np.argmax(tri_mask))
+                    if tri_idx < len(tri_to_mnt):
+                        colours_arr[i] = _color_from_id(int(tri_to_mnt[tri_idx]))
+        return colours_arr
+
 
 # =============================================================================
 # メイン関数
@@ -3327,6 +3438,7 @@ def create_help_epilog() -> str:
 操作方法:
     RGB Window:
         Q/ESC: 終了
+        右クリック: 終了
         F: 深度フィルタ ON/OFF
         H: 手検出 ON/OFF
         T: トラッキング ON/OFF

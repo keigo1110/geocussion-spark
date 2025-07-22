@@ -26,12 +26,12 @@
    - DualViewer へ山 ID→色マッピングを渡し、地形ワイヤーフレームを色分け表示 (ON/OFF)。
 
 ### 実装タスク
-- [ ] **MOUNT-INS-01-1**  クラスタリング関数 `cluster_mountains(tri_mesh)` の実装
-- [ ] **MOUNT-INS-01-2**  `triangle_to_mountain: np.ndarray[int32]` をメッシュ属性に保持
-- [ ] **MOUNT-INS-01-3**  楽器割当ヘルパ `assign_instruments_by_area(stats)`
-- [ ] **MOUNT-INS-01-4**  `CollisionEvent.mountain_id` 追加とキュー内での設定
-- [ ] **MOUNT-INS-01-5**  `AudioMapper` へテーブル注入＆ルックアップ処理追加
-- [ ] **MOUNT-INS-01-6**  CLI オプション `--mountain-colors` (optional) / 可視化トグルキー
+- [x] **MOUNT-INS-01-1**  クラスタリング関数 `cluster_mountains(tri_mesh)` の実装
+- [x] **MOUNT-INS-01-2**  `triangle_to_mountain: np.ndarray[int32]` をメッシュ属性に保持
+- [x] **MOUNT-INS-01-3**  楽器割当ヘルパ `assign_instruments_by_area(stats)`
+- [x] **MOUNT-INS-01-4**  `CollisionEvent.mountain_id` 追加とキュー内での設定
+- [x] **MOUNT-INS-01-5**  `AudioMapper` へテーブル注入＆ルックアップ処理追加
+- [x] **MOUNT-INS-01-6**  CLI オプション `--mountain-colors` (optional) / 可視化トグルキー
 - [ ] **MOUNT-INS-01-7**  ユニットテスト & パフォーマンス計測
 - [ ] **MOUNT-INS-01-8**  ドキュメント更新 (README / ヘルプメッセージ)
 

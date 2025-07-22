@@ -167,7 +167,7 @@ HIGH_MEMORY_USAGE_THRESHOLD: Final[float] = 512 * 1024 * 1024  # 512MB
 # =============================================================================
 
 # 衝突デモ用デフォルト値
-DEMO_SPHERE_RADIUS_DEFAULT: Final[float] = 0.05  # 5 cm
+DEMO_SPHERE_RADIUS_DEFAULT: Final[float] = 0.08  # 8 cm
 DEMO_MESH_UPDATE_INTERVAL: Final[int] = 15       # フレーム
 DEMO_MAX_MESH_SKIP_FRAMES: Final[int] = 60       # フレーム
 
