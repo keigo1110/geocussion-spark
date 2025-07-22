@@ -3287,7 +3287,11 @@ class FullPipelineViewer(DualViewer):
             if key in edge_colour_dict:
                 colours_arr[i] = edge_colour_dict[key]
             else:
-                tri_mask = _np.any(_np.isin(tris_np, e), axis=1)
+                # Identify triangles that contain BOTH vertices of the edge (true owners)
+                # A triangle owns the edge iff exactly two of its vertices match the edge's vertices.
+                # Using sum(..., axis=1) avoids expensive Python-level loops while ensuring we only
+                # pick triangles that truly share the complete edge, not just a single vertex.
+                tri_mask = (_np.isin(tris_np, e).sum(axis=1) >= 2)
                 if _np.any(tri_mask):
                     tri_idx = int(_np.argmax(tri_mask))
                     if tri_idx < len(tri_to_mnt):
